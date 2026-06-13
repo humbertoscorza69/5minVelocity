@@ -1,0 +1,30 @@
+# ---- data & large artifacts (NEVER push; VPS only needs the bot) ----
+data/
+data_papertest/
+data_raw/
+*.parquet
+*.tar.zst
+*.zst
+*.jsonl
+*.csv
+archive_listing.txt
+
+# bot runtime logs
+bot.log*
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# local tooling / config
+.claude/
+.vscode/
+.idea/
+
+# os
+.DS_Store
+Thumbs.db
