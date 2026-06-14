@@ -43,14 +43,17 @@ DATA_DIR = os.environ.get("PAPER_DATA_DIR", "data")
 ASSETS = os.environ.get("ASSETS", "btc,eth").split(",")
 STAKE = float(os.environ.get("STAKE", "10"))          # paper $ per trade
 VEL_MIN = float(os.environ.get("VEL_MIN", "4"))       # 2s move, bps (balanced)
-DISP_LO = float(os.environ.get("DISP_LO", "1"))       # displacement band, bps
-DISP_HI = float(os.environ.get("DISP_HI", "15"))
+# Displacement band aligned to the validated backtest sweet spot (disp 2-10bps).
+# v1 defaults (DISP_LO=1, ASK_CEIL=0.97) let in coin-flips + razor deep favorites
+# and lost money in live day-1 paper trading; tightened to the edge zone.
+DISP_LO = float(os.environ.get("DISP_LO", "3"))       # displacement band, bps
+DISP_HI = float(os.environ.get("DISP_HI", "12"))
 TTL_MIN = float(os.environ.get("TTL_MIN", "5"))       # seconds to settle
 TTL_MAX = float(os.environ.get("TTL_MAX", "180"))
-ASK_FLOOR = float(os.environ.get("ASK_FLOOR", "0.30"))
-ASK_CEIL = float(os.environ.get("ASK_CEIL", "0.97"))
+ASK_FLOOR = float(os.environ.get("ASK_FLOOR", "0.45"))
+ASK_CEIL = float(os.environ.get("ASK_CEIL", "0.90"))
 ORDER_LATENCY_MS = int(os.environ.get("ORDER_LATENCY_MS", "300"))
-MAX_SLIP = float(os.environ.get("MAX_SLIP", "0.02"))   # max ask drift signal->fill
+MAX_SLIP = float(os.environ.get("MAX_SLIP", "0.04"))   # max ask drift signal->fill
 SETTLE_DELAY = int(os.environ.get("SETTLE_DELAY", "20"))   # score this long after settle
 STALE_SETTLE_WARN = int(os.environ.get("STALE_SETTLE_WARN", "120"))  # alarm if unscored
 FEE_RATE = 0.07
@@ -285,7 +288,8 @@ async def fill_after_latency(m, sig):
     shares = STAKE / ask
     fee = shares * FEE_RATE * ask * (1 - ask)
     rec.update(filled=True, fill_price=ask, shares=shares, fee=fee,
-               cost=STAKE + fee)
+               cost=STAKE + fee, disp_bps=sig.get("disp_bps"),
+               vel_bps=sig.get("vel_bps"), ttl_s=sig.get("ttl_s"))
     m["position"] = rec
     log_event(rec)
     tag = "TRADE" if would_trade else "SHADOW"
@@ -368,7 +372,8 @@ async def settlement_loop():
                 pnl = (pos["shares"] if won else 0.0) - pos["cost"]
                 row = {
                     "slug": m["slug"], "asset": m["asset"], "side": pos["side"],
-                    "fill_price": pos["fill_price"],
+                    "disp_bps": pos.get("disp_bps"), "vel_bps": pos.get("vel_bps"),
+                    "ttl_s": pos.get("ttl_s"), "fill_price": pos["fill_price"],
                     "shares": round(pos["shares"], 3), "cost": round(pos["cost"], 4),
                     "outcome": outcome, "outcome_source": source,
                     "binance_outcome": bin_out,
