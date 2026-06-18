@@ -30,7 +30,9 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import os
+import statistics
 import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
@@ -42,12 +44,14 @@ import websockets
 DATA_DIR = os.environ.get("PAPER_DATA_DIR", "data")
 ASSETS = os.environ.get("ASSETS", "btc,eth").split(",")
 STAKE = float(os.environ.get("STAKE", "10"))          # paper $ per trade
-VEL_MIN = float(os.environ.get("VEL_MIN", "4"))       # 2s move, bps (balanced)
-# Displacement band aligned to the validated backtest sweet spot (disp 2-10bps).
-# v1 defaults (DISP_LO=1, ASK_CEIL=0.97) let in coin-flips + razor deep favorites
-# and lost money in live day-1 paper trading; tightened to the edge zone.
-DISP_LO = float(os.environ.get("DISP_LO", "3"))       # displacement band, bps
-DISP_HI = float(os.environ.get("DISP_HI", "12"))
+VEL_MIN = float(os.environ.get("VEL_MIN", "4"))       # 2s move, bps (lag trigger)
+# Entry gate is VOL-NORMALIZED displacement: z = disp/(vol*sqrt(ttl)). Backtest
+# (BTC+ETH, thousands of trades) shows z unifies both assets — both lose at z<0.3
+# (move too small vs the asset's noise = coin flip) and are positive & rising
+# above. Raw-bps bands (v2) overfit to one asset/regime; z is the right metric.
+Z_MIN = float(os.environ.get("Z_MIN", "0.5"))         # vol-normalized disp floor
+DISP_LO = float(os.environ.get("DISP_LO", "1.5"))     # small abs floor (anti-noise)
+DISP_HI = float(os.environ.get("DISP_HI", "1000"))    # no upper cap (ASK_CEIL caps)
 TTL_MIN = float(os.environ.get("TTL_MIN", "5"))       # seconds to settle
 TTL_MAX = float(os.environ.get("TTL_MAX", "180"))
 ASK_FLOOR = float(os.environ.get("ASK_FLOOR", "0.45"))
@@ -82,8 +86,8 @@ logger.addHandler(_h)
 logger.addHandler(logging.StreamHandler())
 
 # ----------------------------- STATE -----------------------------
-# per asset: deque of (exch_ms, price)
-spot = {a: deque(maxlen=4000) for a in ASSETS}
+# per asset: deque of (exch_ms, price)  (need ~60s of ticks for vol)
+spot = {a: deque(maxlen=12000) for a in ASSETS}
 markets = {}          # key (asset, epoch) -> dict
 http = None           # aiohttp session
 
@@ -112,6 +116,25 @@ def spot_at(asset, target_ms):
             best = (ts, px)
             break
     return best
+
+
+def local_vol(asset, now_ms_, lb_s=60):
+    """Std of 1-second log returns over the last lb_s seconds, in bps."""
+    d = spot[asset]
+    if len(d) < 25:
+        return None
+    cutoff = now_ms_ - lb_s * 1000
+    persec = {}
+    for ts, px in d:
+        if ts >= cutoff:
+            persec[ts // 1000] = px          # last price in each second
+    if len(persec) < 20:
+        return None
+    prices = [persec[s] for s in sorted(persec)]
+    rets = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
+    if len(rets) < 10:
+        return None
+    return statistics.pstdev(rets) * 1e4
 
 
 # ----------------------------- REST helpers -----------------------------
@@ -238,8 +261,10 @@ async def market_manager():
         await asyncio.sleep(15)
 
 
-def evaluate(m):
-    """Return (side, vel, disp, spot_now_px, spot_2s_px) if signal, else None."""
+def evaluate(m, ttl):
+    """First-signal check. Gate: vel>=VEL_MIN (lag trigger), disp>=DISP_LO (abs
+    floor), and vol-normalized z=disp/(vol*sqrt(ttl))>=Z_MIN.
+    Return (side, vel, disp, p_now, p2, vol, z) or None."""
     a = m["asset"]
     op = m.get("open_px")
     if not op:
@@ -252,12 +277,17 @@ def evaluate(m):
     if not s2:
         return None
     p2 = s2[1]
+    vol = local_vol(a, t0)
+    if not vol or vol <= 0:
+        return None
     ret2 = (p_now / p2 - 1) * 1e4          # bps over 2s (signed: + = up)
     dispU = (p_now / op - 1) * 1e4         # up-side displacement bps
-    if ret2 >= VEL_MIN and DISP_LO <= dispU <= DISP_HI:
-        return ("up", ret2, dispU, p_now, p2)
-    if -ret2 >= VEL_MIN and DISP_LO <= -dispU <= DISP_HI:
-        return ("down", -ret2, -dispU, p_now, p2)
+    denom = vol * math.sqrt(max(ttl, 1))
+    for side, vel, disp in (("up", ret2, dispU), ("down", -ret2, -dispU)):
+        if vel >= VEL_MIN and DISP_LO <= disp <= DISP_HI:
+            z = disp / denom
+            if z >= Z_MIN:
+                return (side, vel, disp, p_now, p2, vol, z)
     return None
 
 
@@ -289,7 +319,8 @@ async def fill_after_latency(m, sig):
     fee = shares * FEE_RATE * ask * (1 - ask)
     rec.update(filled=True, fill_price=ask, shares=shares, fee=fee,
                cost=STAKE + fee, disp_bps=sig.get("disp_bps"),
-               vel_bps=sig.get("vel_bps"), ttl_s=sig.get("ttl_s"))
+               vel_bps=sig.get("vel_bps"), ttl_s=sig.get("ttl_s"),
+               vol_bps=sig.get("vol_bps"), z=sig.get("z"))
     m["position"] = rec
     log_event(rec)
     tag = "TRADE" if would_trade else "SHADOW"
@@ -308,11 +339,11 @@ async def decision_loop():
                 ttl = m["settle"] - tnow
                 if not (TTL_MIN <= ttl <= TTL_MAX):
                     continue
-                sig = evaluate(m)
+                sig = evaluate(m, ttl)
                 if not sig:
                     continue
                 m["signaled"] = True
-                side, vel, disp, p_now, p2 = sig
+                side, vel, disp, p_now, p2, vol, z = sig
                 token = m["token"][side]
                 sn = spot_now(m["asset"])
                 bid, ask = await fetch_book(token)
@@ -322,12 +353,13 @@ async def decision_loop():
                     "t_signal": now_ms(), "spot_exch_ms": sn[0],
                     "feed_latency_ms": now_ms() - sn[0],
                     "ttl_s": round(ttl, 2), "vel_bps": round(vel, 3),
-                    "disp_bps": round(disp, 3), "spot_now": p_now,
+                    "disp_bps": round(disp, 3), "vol_bps": round(vol, 4),
+                    "z": round(z, 3), "spot_now": p_now,
                     "spot_2s_ago": p2, "open_px": m["open_px"],
                     "ask_at_signal": ask, "bid_at_signal": bid}
                 log_event(signal)
                 logger.info(f"SIGNAL {m['slug']} {side} ttl={ttl:.0f}s "
-                            f"vel={vel:.1f} disp={disp:.1f} ask={ask} "
+                            f"vel={vel:.1f} disp={disp:.1f} z={z:.2f} ask={ask} "
                             f"feed_lat={signal['feed_latency_ms']}ms")
                 asyncio.create_task(fill_after_latency(m, signal))
         except Exception as e:
@@ -373,6 +405,7 @@ async def settlement_loop():
                 row = {
                     "slug": m["slug"], "asset": m["asset"], "side": pos["side"],
                     "disp_bps": pos.get("disp_bps"), "vel_bps": pos.get("vel_bps"),
+                    "vol_bps": pos.get("vol_bps"), "z": pos.get("z"),
                     "ttl_s": pos.get("ttl_s"), "fill_price": pos["fill_price"],
                     "shares": round(pos["shares"], 3), "cost": round(pos["cost"], 4),
                     "outcome": outcome, "outcome_source": source,
@@ -431,8 +464,8 @@ async def stats_loop():
 async def main():
     global http
     logger.info(f"PAPER BOT start | assets={ASSETS} stake=${STAKE} "
-                f"vel>={VEL_MIN} disp[{DISP_LO},{DISP_HI}] ttl[{TTL_MIN},{TTL_MAX}] "
-                f"order_latency={ORDER_LATENCY_MS}ms")
+                f"vel>={VEL_MIN} z>={Z_MIN} disp>={DISP_LO} ttl[{TTL_MIN},{TTL_MAX}] "
+                f"ask[{ASK_FLOOR},{ASK_CEIL}] order_latency={ORDER_LATENCY_MS}ms")
     http = aiohttp.ClientSession()
     try:
         await asyncio.gather(binance_ws(), market_manager(), decision_loop(),
