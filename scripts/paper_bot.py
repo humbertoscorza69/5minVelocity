@@ -267,9 +267,11 @@ async def market_manager():
                     markets[key] = info
                     logger.info(f"market {info['slug']} open_px={info['open_px']} "
                                 f"settle={info['settle']}")
-            # prune very old, fully-settled markets from memory
+            # prune any market well past settle (positions are scored at
+            # settle+SETTLE_DELAY, so >1200s past settle is always safe to drop).
+            # Includes no-signal markets that never get a position (avoids leak).
             for k in [k for k, m in markets.items()
-                      if m.get("settled") and time.time() - m["settle"] > 1200]:
+                      if time.time() - m["settle"] > 1200]:
                 markets.pop(k, None)
         except Exception as e:
             logger.warning(f"market_manager: {e}")
