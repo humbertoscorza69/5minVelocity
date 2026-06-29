@@ -100,6 +100,13 @@ pub struct V2Config {
     /// Path for the persisted recalibrator state (survives restarts).
     #[serde(default = "d_recal_path")]
     pub recal_path: String,
+    /// Evaluate the entry on sub-second Binance aggTrades (freshest price) instead
+    /// of only on the 1s bar close. Recovers entry latency. Default false (1s).
+    #[serde(default)]
+    pub tick_driven: bool,
+    /// Min ms between tick-driven evaluations (throttle the aggTrade firehose).
+    #[serde(default = "d_tick_throttle")]
+    pub tick_throttle_ms: i64,
 }
 
 fn d_edge_min() -> f64 { 0.04 }
@@ -110,6 +117,7 @@ fn d_v2_min_ttl() -> i64 { 30 }
 fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
 fn d_recal_path() -> String { "data/v2/recal.json".to_string() }
+fn d_tick_throttle() -> i64 { 200 }
 
 impl Default for V2Config {
     fn default() -> Self {
@@ -123,6 +131,8 @@ impl Default for V2Config {
             recal_capacity: d_recal_capacity(),
             recal_warmup: d_recal_warmup(),
             recal_path: d_recal_path(),
+            tick_driven: false,
+            tick_throttle_ms: d_tick_throttle(),
         }
     }
 }

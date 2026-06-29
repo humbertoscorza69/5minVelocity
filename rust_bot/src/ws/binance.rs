@@ -185,12 +185,37 @@ fn handle_text(txt: &str, state: &Shared, logger: &EventLogger) {
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(0.0);
             let tms = v.get("T").and_then(Value::as_i64).unwrap_or(recv);
+            let mut emit_tick = false;
             {
                 let mut e = state.binance.entry(sym.clone()).or_default();
                 e.symbol = sym.clone();
                 e.last_price = price;
                 e.last_trade_ms = tms;
                 e.updated_ms = recv;
+                // v2 tick-driven: throttle the aggTrade firehose, then fire a
+                // decision trigger with the freshest sub-second price.
+                if state.tick_driven.load(Ordering::Relaxed) && price > 0.0 {
+                    let thr = state.tick_throttle_ms.load(Ordering::Relaxed);
+                    if recv - e.tick_emit_ms >= thr {
+                        e.tick_emit_ms = recv;
+                        emit_tick = true;
+                    }
+                }
+            }
+            // Feed the freshest tick into the decision loop (current second) so the
+            // entry fires on the sub-second move, not the 1s bar close. The 1s
+            // finalized kline still arrives too (authoritative close + vol). The
+            // PriceHistory update-in-place keeps the current second = latest tick.
+            if emit_tick
+                && let Some(tx) = state.kline_tx.get()
+                && let Some(asset) = asset_for_symbol(&sym)
+            {
+                let _ = tx.send(crate::state::KlineClose {
+                    asset,
+                    t_s: recv / 1000,
+                    close: price,
+                    received_at_ms: recv,
+                });
             }
             state.counters.binance_aggtrades.fetch_add(1, Ordering::Relaxed);
             logger.record(EventRecord {

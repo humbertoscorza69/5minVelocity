@@ -790,6 +790,14 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Shared state, event recorder, and the shutdown signal ---------------
     let state = state::SharedState::new();
+    // v2 tick-driven entry: push the config flags into shared state so the Binance
+    // WS emits sub-second decision triggers (throttled) when enabled.
+    state.tick_driven.store(config.v2.tick_driven, std::sync::atomic::Ordering::Relaxed);
+    state.tick_throttle_ms.store(config.v2.tick_throttle_ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    if config.v2.tick_driven {
+        info!(throttle_ms = config.v2.tick_throttle_ms,
+            "v2 TICK-DRIVEN entry ENABLED — decisions fire on sub-second aggTrades");
+    }
     // #3 (dashboard): in trading modes, give the WS reconnect supervisor an oplog
     // sink so connection lifecycle (ws_lost / ws_reconnecting / ws_cooldown /
     // ws_recovered) lands in data/live/oplog.jsonl for the passive Connection/

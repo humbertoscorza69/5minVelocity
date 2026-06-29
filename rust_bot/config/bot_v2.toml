@@ -68,7 +68,15 @@ alert_dir = "alerts"
 # v2 strategy — the validated edge-gate brain.
 [v2]
 enabled = true
-edge_min = 0.04
+# 0.06 (was 0.04): sweep showed total holds (~$3231 vs $3184) with higher EV/trade
+# + better Sharpe — drops the marginal 0.04-0.06 trades. Near-free tune.
+edge_min = 0.06
+# tick_driven: evaluate the entry on sub-second Binance aggTrades (freshest price)
+# instead of waiting for the 1s bar close. Recovers ~+15-25% EV (lumpy, big on
+# fast movers). CANNOT be backtested -> forward-validate live; flip false to revert.
+tick_driven = true
+# min ms between tick-driven evaluations (throttle the aggTrade firehose).
+tick_throttle_ms = 200
 vol_cap = 1.0
 dvr_floor = 0.2
 edge_ref = 0.08

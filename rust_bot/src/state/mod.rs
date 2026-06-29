@@ -92,6 +92,9 @@ pub struct BinanceTick {
     pub kline_final: bool,
     /// Local receive time (ms) of the last update of any kind.
     pub updated_ms: i64,
+    /// Last time (ms) a tick-driven decision trigger was emitted for this symbol
+    /// (throttle for the aggTrade firehose). 0 = never.
+    pub tick_emit_ms: i64,
 }
 
 /// Monotonic ingestion counters. Feed the ±2% message-count gate and stats.
@@ -140,6 +143,11 @@ pub struct SharedState {
     /// startup (after the channel is built). The binance WS `handle_text` emits a
     /// `KlineClose` here on each final 1s bar; `None` until wired (paper/live only).
     pub kline_tx: OnceLock<mpsc::UnboundedSender<KlineClose>>,
+    /// v2 tick-driven entry: when true, the Binance WS emits a throttled decision
+    /// trigger on each aggTrade (freshest sub-second price) in addition to the 1s
+    /// bar close. `tick_throttle_ms` bounds the rate. Set from config at startup.
+    pub tick_driven: AtomicBool,
+    pub tick_throttle_ms: AtomicI64,
     /// Wallet USDC balance in milli-dollars (balance * 1000), refreshed by
     /// `run_positions_refresh` every cycle. `-1` = not yet known (paper mode, or
     /// before the first REST balance fetch). Read by the dashboard.
@@ -176,6 +184,8 @@ impl SharedState {
             health_failed: AtomicBool::new(false),
             active_tokens: AtomicU64::new(0),
             kline_tx: OnceLock::new(),
+            tick_driven: AtomicBool::new(false),
+            tick_throttle_ms: AtomicI64::new(200),
             balance_milli: AtomicI64::new(-1),
             v2_pred: DashMap::new(),
             resolved_tokens: DashMap::new(),
