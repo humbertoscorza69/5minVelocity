@@ -32,6 +32,9 @@ pub async fn run_dashboard(
     store_state: SharedBotState,
     recal: Arc<Mutex<Recalibrator>>,
     controls: Arc<crate::v2::Controls>,
+    mode: String,
+    live_armed_path: String,
+    kill_switch_path: String,
     oplog_path: String,
     bind: String,
     port: u16,
@@ -60,17 +63,33 @@ pub async fn run_dashboard(
                     .unwrap_or("/");
                 let resp = if path.starts_with("/api/control") {
                     apply_control(&controls, path);
+                    // Operator arming buttons → write/remove the gate files the
+                    // guards already enforce. `arm` only has effect in --mode live
+                    // (the live backend is only built then); `kill` halts the
+                    // decision loop in any mode.
+                    let q = path.split('?').nth(1).unwrap_or("");
+                    set_flag_file(q, "arm", &live_armed_path, "armed\n");
+                    set_flag_file(q, "kill", &kill_switch_path, "kill\n");
                     let body = json!({
                         "ok": true,
                         "enabled": controls.enabled(),
                         "base_usd": controls.base_usd(),
                         "max_pos": controls.max_pos_usd(),
+                        "armed": std::path::Path::new(&live_armed_path).exists(),
+                        "kill": std::path::Path::new(&kill_switch_path).exists(),
                     }).to_string();
                     info!(enabled = controls.enabled(), base_usd = controls.base_usd(),
-                        max_pos = controls.max_pos_usd(), "dashboard: controls updated");
+                        max_pos = controls.max_pos_usd(),
+                        armed = std::path::Path::new(&live_armed_path).exists(),
+                        kill = std::path::Path::new(&kill_switch_path).exists(),
+                        "dashboard: controls updated");
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path.starts_with("/api/stats") {
-                    let body = compute_stats(&state, &store_state, &recal, &controls, &oplog_path, started_ms).to_string();
+                    let body = compute_stats(
+                        &state, &store_state, &recal, &controls,
+                        &mode, &live_armed_path, &kill_switch_path,
+                        &oplog_path, started_ms,
+                    ).to_string();
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path == "/" || path.starts_with("/?") || path.starts_with("/index") {
                     http_resp("200 OK", "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes())
@@ -104,6 +123,28 @@ fn outcome_str(o: Outcome) -> &'static str {
     }
 }
 
+/// If `key` is present in the query, `true` → create the gate file (with
+/// `content`), `false` → remove it. Absent key = no change. Backs the arm/kill
+/// buttons via the SAME files the guards already enforce.
+fn set_flag_file(query: &str, key: &str, path: &str, content: &str) {
+    for kv in query.split('&') {
+        let mut it = kv.splitn(2, '=');
+        if it.next() == Some(key) {
+            let v = it.next().unwrap_or("");
+            if matches!(v, "1" | "true" | "on") {
+                if let Some(dir) = std::path::Path::new(path).parent() {
+                    if !dir.as_os_str().is_empty() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                }
+                let _ = std::fs::write(path, content);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// Parse `?enabled=&base_usd=&max_pos=` from the request path and apply to the
 /// live controls. Tolerant: unknown/garbage params are ignored. (Localhost-only
 /// via the tunnel, so query-param control is acceptable here.)
@@ -123,11 +164,15 @@ fn apply_control(controls: &crate::v2::Controls, path: &str) {
 }
 
 /// Compute the full stats payload from live state + the oplog firehose.
+#[allow(clippy::too_many_arguments)]
 fn compute_stats(
     state: &SharedState,
     store_state: &SharedBotState,
     recal: &Arc<Mutex<Recalibrator>>,
     controls: &Arc<crate::v2::Controls>,
+    mode: &str,
+    live_armed_path: &str,
+    kill_switch_path: &str,
     oplog_path: &str,
     started_ms: i64,
 ) -> Value {
@@ -267,6 +312,11 @@ fn compute_stats(
             "base_usd": controls.base_usd(),
             "max_pos": controls.max_pos_usd(),
         },
+        "live": {
+            "mode": mode,
+            "armed": std::path::Path::new(live_armed_path).exists(),
+            "kill": std::path::Path::new(kill_switch_path).exists(),
+        },
         "open_positions": open_rows,
         "recent_trades": recent_trades,
         "curve": curve,
@@ -329,6 +379,10 @@ tbody tr:hover{background:var(--panel2)}
 .btn.on{color:var(--grn);border-color:#1c3a25;background:#0f2417}
 .btn.off{color:var(--red);border-color:#3a1c1c;background:#241010}
 .btn.alt{background:var(--acc);color:#06121f;border-color:var(--acc)}
+.btn.armed{color:#fff;background:var(--red);border-color:var(--red)}
+.btn.kill{color:var(--amb);border-color:#3a2c10;background:#1f1a0a}
+.btn.killon{color:#fff;background:var(--red);border-color:var(--red)}
+#armpanel{border-color:#3a2c10}
 .ctlrow label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:6px}
 .ctlrow input{width:92px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:7px 9px;font-size:13px;font-variant-numeric:tabular-nums}
 </style></head><body>
@@ -350,6 +404,15 @@ tbody tr:hover{background:var(--panel2)}
       <span id="ctl_msg" class="muted"></span>
       <span style="flex:1"></span>
       <span class="muted" style="font-size:11px">edge-proportional sizing scales around “Stake base”, capped by “Max position” &amp; book depth</span>
+    </div>
+  </div>
+  <div class="panel" id="armpanel"><h2>Live arming <span id="modebadge" class="pill">—</span></h2>
+    <div class="ctlrow">
+      <button id="arm" class="btn">—</button>
+      <button id="kill" class="btn kill">KILL SWITCH</button>
+      <span id="arm_msg" class="muted"></span>
+      <span style="flex:1"></span>
+      <span class="muted" style="font-size:11px">ARM writes LIVE_ARMED.txt — real orders post ONLY in --mode live. KILL halts the decision loop (any mode).</span>
     </div>
   </div>
   <div class="grid">
@@ -418,6 +481,10 @@ async function tick(){
   tg.textContent=c.enabled?"● TRADING ON":"○ TRADING OFF";tg.className="btn "+(c.enabled?"on":"off");
   if(document.activeElement!==$("in_base"))$("in_base").value=(+c.base_usd).toFixed(2);
   if(document.activeElement!==$("in_max"))$("in_max").value=(+c.max_pos).toFixed(2);
+  const lv=s.live;
+  $("modebadge").textContent=lv.mode.toUpperCase();$("modebadge").className="pill "+(lv.mode==="live"?"bad":"ok");
+  const ab=$("arm");ab.textContent=lv.armed?"● ARMED — click to DISARM":"○ DISARMED — click to ARM";ab.className="btn "+(lv.armed?"armed":"");
+  const kb=$("kill");kb.textContent=lv.kill?"● KILL ACTIVE — click to CLEAR":"KILL SWITCH";kb.className="btn "+(lv.kill?"killon":"kill");
   $("open_n").textContent=s.open_positions.length;
   $("open_body").innerHTML=s.open_positions.map(p=>`<tr><td class="mono">${p.token}</td><td>${p.side}</td><td class="muted">${p.asset}/${p.interval}</td><td class="mono">${p.entry.toFixed(3)}</td><td class="mono">$${(+p.usd).toFixed(2)}</td><td class="mono">${p.bid.toFixed(3)}</td><td class="mono">${p.shares.toFixed(1)}</td><td class="mono ${cls(p.unreal)}">${money(p.unreal)}</td><td class="muted mono">${fmtAge(p.age_s)}</td></tr>`).join("")||`<tr><td colspan=9 class=muted>none</td></tr>`;
   $("trades_body").innerHTML=s.recent_trades.map(t=>`<tr><td class="muted mono">${fmtTime(t.ts)}</td><td class="mono">${t.token}</td><td>${t.side||""}</td><td class="mono">${t.entry!=null?(+t.entry).toFixed(3):"—"}</td><td class="mono">${t.exit!=null?(+t.exit).toFixed(3):"—"}</td><td class="mono ${cls(t.pnl)}">${money(t.pnl)}</td></tr>`).join("")||`<tr><td colspan=6 class=muted>no closed trades yet</td></tr>`;
@@ -426,5 +493,12 @@ async function tick(){
 }
 $("toggle").onclick=async()=>{const on=$("toggle").classList.contains("on");try{await fetch("/api/control?enabled="+(on?"false":"true"),{method:"POST"})}catch(e){}tick()};
 $("apply").onclick=async()=>{const b=$("in_base").value,m=$("in_max").value;try{await fetch(`/api/control?base_usd=${encodeURIComponent(b)}&max_pos=${encodeURIComponent(m)}`,{method:"POST"})}catch(e){}$("ctl_msg").textContent="applied ✓";setTimeout(()=>$("ctl_msg").textContent="",1800);tick()};
+$("arm").onclick=async()=>{const armed=$("arm").classList.contains("armed");
+  if(!armed && !confirm("ARM live trading?\n\nReal orders will post when the bot is in --mode live and a signal fires. Make sure your stake is set correctly first.")) return;
+  try{await fetch("/api/control?arm="+(armed?"false":"true"),{method:"POST"})}catch(e){}
+  $("arm_msg").textContent=armed?"disarmed":"ARMED";setTimeout(()=>$("arm_msg").textContent="",1800);tick()};
+$("kill").onclick=async()=>{const on=$("kill").classList.contains("killon");
+  if(!on && !confirm("Activate KILL SWITCH?\n\nThis halts the decision loop immediately — no new decisions or entries (any mode).")) return;
+  try{await fetch("/api/control?kill="+(on?"false":"true"),{method:"POST"})}catch(e){}tick()};
 tick();setInterval(tick,3000);window.addEventListener("resize",()=>{});
 </script></body></html>"##;

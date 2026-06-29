@@ -895,6 +895,10 @@ async fn main() -> anyhow::Result<()> {
                 daily_loss_cap = %guard_cfg.daily_loss_cap(),
                 "v2: guard caps derived from config (legacy $1.05 stake_cap overridden)");
         }
+        // Capture the gate-file paths before guard_cfg is moved into Guards — the
+        // dashboard's ARM/KILL buttons write/remove these same files.
+        let kill_switch_path_str = guard_cfg.kill_switch_path.display().to_string();
+        let live_armed_path_str = guards::LIVE_ARMED_PATH.to_string();
         // STARTUP kill-switch check: a present file at launch is a deliberate halt;
         // log it prominently and let the continuous-check latch it on the first pass.
         if guards::kill_switch_active(&guard_cfg.kill_switch_path) {
@@ -1124,6 +1128,9 @@ async fn main() -> anyhow::Result<()> {
                 state_store.state(),
                 recal_shared.clone(),
                 controls_shared.clone(),
+                effective_mode.to_string(),
+                live_armed_path_str.clone(),
+                kill_switch_path_str.clone(),
                 oplog::OPLOG_PATH.to_string(),
                 config.dashboard.bind.clone(),
                 config.dashboard.port,
