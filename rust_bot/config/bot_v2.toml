@@ -11,13 +11,16 @@ default = "paper"
 live_confirmation_required = true
 
 [markets]
-intervals = ["5m", "15m"]
+# v2 (5minSnip) is validated on 5-MINUTE markets ONLY. The pcal(z) calibration
+# + walk-forward were fit on 5m; 15m has different settle dynamics (unvalidated),
+# AND running BTC:5m + BTC:15m at once just doubles correlated BTC exposure.
+# So: 5m only. (Re-add "15m" here to experiment later.)
+intervals = ["5m"]
 assets = ["BTC", "ETH"]
 polymarket_token_ids = []
 discovery_lookahead = 2
 discovery_refresh_secs = 60
-# ETH:15m retired out-of-sample (kept from the legacy findings); v2 also skips it.
-disabled_cells = ["ETH:15m"]
+disabled_cells = []
 
 [stakes]
 # base = stake at the reference edge (v2.edge_ref); edge sizing scales around it,

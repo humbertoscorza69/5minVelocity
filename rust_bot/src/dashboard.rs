@@ -223,6 +223,13 @@ fn compute_stats(
             };
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+            // Session-scope: only count events from THIS run (the oplog is an
+            // append-only firehose that also holds prior paper sessions). Keeps
+            // the dashboard clean after a paper→live restart without deleting
+            // the audit log.
+            if ts < started_ms {
+                continue;
+            }
             let data = v.get("data").cloned().unwrap_or(Value::Null);
             match kind {
                 "v2_intent_open" => entries += 1,
