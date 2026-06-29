@@ -1093,6 +1093,8 @@ async fn main() -> anyhow::Result<()> {
                 config.v2.clone(),                     // v2 strategy config (enabled=false → legacy path)
                 controls_shared.clone(),               // live operator controls (stake / on-off)
                 recal_shared.clone(),
+                // live-arm gate: in --mode live, only enter when ARMED (disarmed = idle)
+                if effective_mode == "live" { Some(live_armed_path_str.clone()) } else { None },
             )),
             tokio::spawn(trading_loop::run_execution_task(
                 state_store.state(),

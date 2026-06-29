@@ -490,6 +490,10 @@ pub async fn run_decision_task(
     vcfg: crate::config::V2Config,
     controls: Arc<crate::v2::Controls>,
     recal: Arc<Mutex<crate::v2::Recalibrator>>,
+    // Live-arm gate: `Some(path)` in --mode live → enter ONLY when that file
+    // exists (ARMED). Disarmed = truly idle (no entries, no phantom paper).
+    // `None` in --mode paper → entries gated only by the ON/OFF control.
+    live_gate: Option<String>,
 ) {
     info!("task started: decision_loop");
     oplog.sys("decision_loop_start", serde_json::json!({}));
@@ -569,6 +573,15 @@ pub async fn run_decision_task(
                     // Operator OFF switch (dashboard): pause NEW entries. Open
                     // positions still exit/redeem; the price history still updates.
                     if !controls.enabled() {
+                        history.push(&kline.asset, kline.t_s, kline.close);
+                        continue;
+                    }
+                    // LIVE-ARM gate: in --mode live, only enter when ARMED. Disarmed
+                    // = truly idle (no phantom paper positions). Paper mode (None)
+                    // skips this check. Keep the price history warm either way.
+                    if let Some(armed_path) = &live_gate
+                        && !std::path::Path::new(armed_path).exists()
+                    {
                         history.push(&kline.asset, kline.t_s, kline.close);
                         continue;
                     }
@@ -2773,6 +2786,7 @@ mod tests {
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
             Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
             Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+            None, // live_gate: paper/legacy path under test
         ));
 
         for off in [-3i64, -2, -1] {
@@ -2874,6 +2888,7 @@ mod tests {
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
             Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
             Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+            None, // live_gate: paper/legacy path under test
         ));
 
         for off in [-3i64, -2, -1] {
@@ -3085,6 +3100,7 @@ mod tests {
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
             Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
             Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+            None, // live_gate: paper/legacy path under test
         ));
 
         // Warm-up klines (flat). The 4th close triggers (+6 bps).
