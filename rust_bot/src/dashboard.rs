@@ -285,9 +285,12 @@ fn compute_stats(
         .map(|r| (r.bias(), r.samples()))
         .unwrap_or((0.0, 0));
 
+    let bal_milli = state.balance_milli.load(std::sync::atomic::Ordering::Relaxed);
+    let balance: Value = if bal_milli < 0 { Value::Null } else { json!(bal_milli as f64 / 1000.0) };
     json!({
         "now_ms": now,
         "uptime_s": (now - started_ms).max(0) / 1000,
+        "balance": balance,
         "health": {
             "binance": state.binance_connected.load(std::sync::atomic::Ordering::Relaxed),
             "polymarket": state.polymarket_connected.load(std::sync::atomic::Ordering::Relaxed),
@@ -424,6 +427,7 @@ tbody tr:hover{background:var(--panel2)}
     </div>
   </div>
   <div class="grid">
+    <div class="card"><div class="lbl">Wallet balance</div><div class="val mono acc" id="balance">—</div><div class="sub">USDC (funder wallet)</div></div>
     <div class="card"><div class="lbl">Total P&L</div><div class="val mono" id="pnl_total">—</div><div class="sub" id="pnl_split"></div></div>
     <div class="card"><div class="lbl">Realized</div><div class="val mono" id="pnl_real">—</div></div>
     <div class="card"><div class="lbl">Unrealized</div><div class="val mono" id="pnl_unreal">—</div></div>
@@ -473,6 +477,7 @@ async function tick(){
   pill($("bn"),s.health.binance,"Binance "+(s.health.binance?"●":"○"));
   pill($("pm"),s.health.polymarket,"Polymarket "+(s.health.polymarket?"●":"○"));
   $("up").textContent="uptime "+fmtAge(s.uptime_s)+" · "+s.health.active_tokens+" mkts · "+s.health.decisions+" dec";
+  $("balance").textContent=(s.balance==null)?"—":"$"+(+s.balance).toFixed(2);
   const t=$("pnl_total");t.textContent=money(s.pnl.total);t.className="val mono "+cls(s.pnl.total);
   $("pnl_split").textContent="real "+money(s.pnl.realized)+" · unrl "+money(s.pnl.unrealized);
   const r=$("pnl_real");r.textContent=money(s.pnl.realized);r.className="val mono "+cls(s.pnl.realized);

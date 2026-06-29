@@ -12,7 +12,7 @@ pub mod store;
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -140,6 +140,10 @@ pub struct SharedState {
     /// startup (after the channel is built). The binance WS `handle_text` emits a
     /// `KlineClose` here on each final 1s bar; `None` until wired (paper/live only).
     pub kline_tx: OnceLock<mpsc::UnboundedSender<KlineClose>>,
+    /// Wallet USDC balance in milli-dollars (balance * 1000), refreshed by
+    /// `run_positions_refresh` every cycle. `-1` = not yet known (paper mode, or
+    /// before the first REST balance fetch). Read by the dashboard.
+    pub balance_milli: AtomicI64,
     /// v2 strategy: predicted win-probability at entry, keyed by bet token id.
     /// Written by the v2 decision path on each Open; drained by the positions-
     /// refresh recal feed when the market resolves (→ `(pred, won)` into the
@@ -172,6 +176,7 @@ impl SharedState {
             health_failed: AtomicBool::new(false),
             active_tokens: AtomicU64::new(0),
             kline_tx: OnceLock::new(),
+            balance_milli: AtomicI64::new(-1),
             v2_pred: DashMap::new(),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),

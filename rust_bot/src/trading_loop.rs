@@ -848,6 +848,14 @@ pub async fn run_positions_refresh(
     loop {
         tokio::select! {
             _ = iv.tick() => {
+                // Wallet USDC balance for the dashboard (best-effort; non-fatal).
+                match rest.get_balance().await {
+                    Ok(b) => state.balance_milli.store(
+                        (b.balance_usdc * 1000.0) as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    ),
+                    Err(e) => warn!(error = %e, "positions_refresh: get_balance failed"),
+                }
                 let t0 = oplog.api_call("data/positions", "GET", serde_json::json!({}));
                 let positions = match rest.get_positions().await {
                     Ok(p) => {
