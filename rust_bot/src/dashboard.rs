@@ -156,8 +156,9 @@ fn apply_control(controls: &crate::v2::Controls, path: &str) {
         let v = it.next().unwrap_or("");
         match k {
             "enabled" => controls.set_enabled(matches!(v, "1" | "true" | "on")),
-            "base_usd" => if let Ok(x) = v.parse::<f64>() { controls.set_base_usd(x) },
-            "max_pos" => if let Ok(x) = v.parse::<f64>() { controls.set_max_pos_usd(x) },
+            // Accept both "1.05" and "1,05" (locale-tolerant) before parsing.
+            "base_usd" => if let Ok(x) = v.replace(',', ".").parse::<f64>() { controls.set_base_usd(x) },
+            "max_pos" => if let Ok(x) = v.replace(',', ".").parse::<f64>() { controls.set_max_pos_usd(x) },
             _ => {}
         }
     }
