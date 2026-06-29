@@ -491,6 +491,7 @@ async function tick(){
   if(document.activeElement!==$("in_max"))$("in_max").value=(+c.max_pos).toFixed(2);
   const lv=s.live;
   $("modebadge").textContent=lv.mode.toUpperCase();$("modebadge").className="pill "+(lv.mode==="live"?"bad":"ok");
+  $("mode").textContent=lv.mode.toUpperCase();$("mode").className="pill "+(lv.mode==="live"?"bad":"ok");
   const ab=$("arm");ab.textContent=lv.armed?"● ARMED — click to DISARM":"○ DISARMED — click to ARM";ab.className="btn "+(lv.armed?"armed":"");
   const kb=$("kill");kb.textContent=lv.kill?"● KILL ACTIVE — click to CLEAR":"KILL SWITCH";kb.className="btn "+(lv.kill?"killon":"kill");
   $("open_n").textContent=s.open_positions.length;
