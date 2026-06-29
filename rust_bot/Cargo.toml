@@ -1,0 +1,60 @@
+[package]
+name = "rust_bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Ethereum primitives + EIP-712 typed-data hashing for Phase 6 order construction
+# (U256/Address/B256, Eip712Domain, SolStruct::eip712_signing_hash). Already in the
+# tree via `polymarket_client_sdk_v2` (alloy 1.6.x); a DIRECT dep with the same
+# version unifies (no second copy) and lets the order/sign-parity path compute the
+# EIP-712 hash the SDK signs. dyn-abi + sol-types are already enabled by the SDK.
+alloy = { version = "1", default-features = false, features = ["dyn-abi", "sol-types"] }
+anyhow = "1.0.102"
+# G5 (auto-redeem): the RelayerApi trait uses async methods, which require
+# async_trait until Rust's native AsyncFn stabilizes for trait objects.
+async-trait = "0.1"
+# G7.4-C2 (Builder HMAC for POST /submit): base64 + hmac + sha2 are all in the
+# tree via the SDK (used by its CLOB L2 auth `crate::auth::hmac`); pinning DIRECT
+# deps at the SAME versions unifies (no extra compile) and lets relayer.rs
+# compute the POLY_BUILDER_SIGNATURE header byte-identical to the SDK's HMAC
+# (gold test in relayer.rs verifies the vector vs the SDK's own gold test).
+base64 = "0.22.1"
+hmac = "0.12.1"
+sha2 = "0.10"
+# Backtest TP: stream-read the recorder's .jsonl.zst files (the 21 days of
+# May 2026 historical book + price_change data are zstandard-compressed).
+# Default = "zstdmt" feature for multi-threaded decompression on large files.
+zstd = "0.13"
+clap = { version = "4.6.1", features = ["derive"] }
+dashmap = "6.1.0"
+dotenvy = "0.15.7"
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink", "async-await"] }
+# Phase 2: enable the clob (price/balance/tick_size/book) + data (positions)
+# API modules — the SDK ships default=[] so these were NOT compiled in Phase 0.
+polymarket_client_sdk_v2 = { version = "=0.6.0-canary.1", features = ["clob", "data"] }
+# REST client for Polymarket market discovery (Gamma + CLOB). rustls + a bundled
+# webpki CA set keep it musl/Dublin-friendly and reuse the single rustls 0.23 in
+# the tree (no second TLS stack). JSON for the Gamma payloads.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Exact decimal arithmetic for money (positions, prices, balance). f64 is an
+# anti-pattern for capital state — Decimal makes the persisted snapshot
+# bit-exact on roundtrip and keeps P&L/sizing/reconciliation precise. Already in
+# the tree via the SDK, so no new transitive cost.
+rust_decimal = { version = "1", features = ["serde"] }
+rust_decimal_macros = "1"
+# Pinned to the rustls 0.23 line (matches the SDK's tokio-rustls 0.26). Direct dep so we
+# can install the aws_lc_rs crypto provider explicitly at startup (defends against future
+# feature drift that could leave rustls without a single default provider).
+rustls = "0.23"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+# 0.26 -> tokio-rustls 0.26 -> rustls 0.23 (single rustls in the tree). webpki-roots gives a
+# bundled CA set so TLS works on a minimal musl image without an OS trust store.
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.7"

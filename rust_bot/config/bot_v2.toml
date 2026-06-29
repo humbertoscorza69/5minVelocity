@@ -1,0 +1,85 @@
+# v2 strategy config (5minSnip port) — paper run.
+# Separate from config/bot.toml (the anti-drift'd legacy config) so the operative
+# bot.toml is never touched. Run: cargo run -- --mode paper --config config/bot_v2.toml
+#
+# v2 = vol-normalized z edge-gate + depth-aware edge-proportional sizing + rolling
+# recalibration. Exits are BASELINE (hold-to-settle): v2 sets exit_ts_s past
+# resolution and the redemption task claims the winner. No per-cell exit rules.
+
+[mode]
+default = "paper"
+live_confirmation_required = true
+
+[markets]
+intervals = ["5m", "15m"]
+assets = ["BTC", "ETH"]
+polymarket_token_ids = []
+discovery_lookahead = 2
+discovery_refresh_secs = 60
+# ETH:15m retired out-of-sample (kept from the legacy findings); v2 also skips it.
+disabled_cells = ["ETH:15m"]
+
+[stakes]
+# base = stake at the reference edge (v2.edge_ref); edge sizing scales around it,
+# capped by max_position_usdc. Paper sizing — bump for live after validation.
+base_usdc = 10.0
+max_position_usdc = 50.0
+max_open_positions = 20
+paper_initial_usdc = 1000.0
+
+[filters]
+h2_enabled = true
+h2_lower = 0.10
+h2_upper = 0.90
+
+[gates]
+book_freshness_ms = 500
+balance_min_usdc = 2.0
+phase_c_threshold_c = 0.10
+
+[rules]
+regla_c_enabled = false
+dca_enabled = false
+max_slippage = 0.04
+
+[connections]
+binance_ws_url = "wss://stream.binance.com:9443/ws"
+polymarket_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws"
+polymarket_rest_url = "https://clob.polymarket.com"
+reconnect_max_attempts_per_60s = 5
+connect_timeout_s = 10
+polymarket_gamma_url = "https://gamma-api.polymarket.com"
+
+[logging]
+level = "info"
+trace_path = "logs"
+rotation = "daily"
+event_logger_enabled = false
+
+[paths]
+state_file = "data/v2/state.json"
+timestamps_file = "data/v2/timestamps.jsonl"
+bot_log_file = "logs/bot_v2.log"
+alert_dir = "alerts"
+
+# v2 strategy — the validated edge-gate brain.
+[v2]
+enabled = true
+edge_min = 0.04
+vol_cap = 1.0
+dvr_floor = 0.2
+edge_ref = 0.08
+min_ttl_s = 30
+recal_capacity = 300
+recal_warmup = 50
+recal_path = "data/v2/recal.json"
+
+# No [exits.cells] → every cell uses Baseline (hold-to-settle). v2 positions
+# carry exit_ts_s past resolution; the redemption task claims the winner.
+
+# Live dashboard. Bound to localhost; view from your PC via an SSH tunnel:
+#   ssh -N -L 8787:127.0.0.1:8787 user@vps    →  http://localhost:8787
+[dashboard]
+enabled = true
+bind = "127.0.0.1"
+port = 8787

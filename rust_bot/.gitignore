@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Runtime data + logs (state, oplog, recal, positions) — machine-local, not source
+/data
+/logs
+/alerts
+
+# Secrets — credentials live in .env (never commit)
+.env
+
+# Live-arming + kill-switch control files
+LIVE_ARMED.txt
+KILL_SWITCH.txt

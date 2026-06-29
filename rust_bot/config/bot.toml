@@ -1,0 +1,174 @@
+# rust_bot configuration — Phase 0 skeleton.
+# Secrets are NOT here; credentials live in .env (read via dotenvy).
+# This file travels with the binary (rsync rust_bot/ to the VPS).
+
+[mode]
+# "paper" | "live". CLI --mode overrides this.
+default = "paper"
+# First-ever live run requires interactive confirmation (defense vs accidental live).
+live_confirmation_required = true
+
+[markets]
+intervals = ["5m", "15m"]
+assets = ["BTC", "ETH"]
+# Polymarket CLOB token ids (asset_ids) for the public `market` WS channel.
+# Phase 1 is strictly WS-only: the token universe is configured here, not
+# discovered via REST. CAVEAT: 5m/15m markets roll continuously, so these go
+# stale within minutes — refresh right before a live verify / 2h baseline run.
+# Empty: the dynamic market-discovery task now populates the active 5m/15m token
+# set at runtime via REST (Gamma), following markets as they roll — same logic as
+# the Python recorder. A non-empty list here is only an initial seed until the
+# first discovery cycle completes.
+polymarket_token_ids = []
+# Market discovery (replicates recorder's current_market_rows):
+discovery_lookahead = 2       # current epoch + 2 future epochs per asset×interval
+discovery_refresh_secs = 60   # REST refresh cadence (recorder uses 60)
+# Cells ("<ASSET>:<INTERVAL>") to DROP at signal time. Each drop emits a
+# `signal_dropped_disabled_cell` oplog event for audit. Empty = no filter
+# (backwards-compat / full bot). REVERSIBLE: clear this list and restart.
+#
+# Rationale (the only entry today): 10-day TP backtest 5/6-5/16 over 1949
+# positions (data/derived/backtest_tp_v1) identified ETH:15m as the ONLY
+# chronically deficitario cell: 519 trades, 51% win, -$0.23/trade, -$118.90
+# total drag. Dropping it lifts baseline P&L from $1242 -> $1361 (+9.6%)
+# without touching the other 3 profitable cells (BTC_5m +$2.05/trade win 76%,
+# BTC_15m +$0.53/trade win 55%, ETH_5m +$0.60/trade win 65% all stay on).
+# Validated by `markets_disabled_cells_*` tests in config.rs + the integration
+# + audit-oplog tests in trading_loop.rs.
+disabled_cells = ["ETH:15m"]
+
+[stakes]
+# D4: $1.05 per order (user-confirmed). guards.rs stake_cap default matches
+# so stake_ok passes; daily-loss-stop = $1.05 * 12 = $12.60.
+base_usdc = 1.05
+# HARD CAP: main asserts max_position_usdc <= 100.0 before spawning any task.
+max_position_usdc = 5.0
+max_open_positions = 3
+paper_initial_usdc = 100.0
+# Phase 6 D3.5 (Piece 6): hard ceiling on TRADES (BUY+SELL closed) per session
+# in --mode live. D4 = 1 (one trade then shutdown); D5 may raise to e.g. 20.
+# Counted on close, not open. Default (omitted) = usize::MAX = no cap.
+#
+# OPERATIVE PRODUCTION = NO CAP (line commented out below).
+# The real brake in production is the daily-loss-stop at -$12.60 (= base_usdc
+# * 12), not a per-session trade count. The `= 1` value was a D4-testing
+# artifact ("one trade and shutdown") that kept leaking back into the VPS
+# via every `git pull`, forcing the operator to re-comment it by hand. Make
+# the repo reflect production: keep it commented here, and the test code in
+# live_backend.rs continues to pass literal max values to gate() directly.
+#
+# To restore a per-session cap (e.g. for a controlled D-series stage):
+# uncomment the line below and set the desired N. The `bot_toml_*` config
+# tests do NOT pin this value (verified 2026-06-04), so toggling is safe.
+# max_trades_per_session = 1
+
+[filters]
+h2_enabled = true
+h2_lower = 0.10
+h2_upper = 0.90
+
+[gates]
+book_freshness_ms = 500
+balance_min_usdc = 2.0
+phase_c_threshold_c = 0.10
+
+[rules]
+# OPERATIVE BASELINE = OFF. The baseline `paper_trade_lagarb_directional.py` does
+# NOT include REGLA C (opposite-side close); the `..._opposite_closes.py` variant
+# does. Live paper 5/25-5/29 @ $10 stake: baseline (regla_c=off) = +$1391.39 on
+# n=2395 (WR 63.2%, +$0.58/trade); opposite_closes (regla_c=on) = +$1163.30 on
+# n=1703 (WR 61.6%, +$0.68/trade). The regla_c-close cohort within opposite_closes
+# was n=524, -$387.04, WR 32.3%, -$0.74/trade -- a net drag. Plus regla_c was the
+# root cause of the D5 Phantom SELL (close fired 43s post-BUY, before /positions
+# could settle on-chain). Test `bot_toml_baseline_has_regla_c_off` in config.rs
+# guards against this flipping back to true silently. See DECISIONS.md (the
+# G1 entry) for full audit.
+regla_c_enabled = false
+dca_enabled = false
+# Max acceptable slippage (USD price units) on a FOK entry before aborting. Separate
+# from the FOK worst-price hard cap — this is "how much slippage is still worth it".
+# 0.02 = 2 cents (~2 ticks at tick 0.01). Phase 6 D2.
+max_slippage = 0.02
+
+[connections]
+binance_ws_url = "wss://stream.binance.com:9443/ws"
+polymarket_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws"
+polymarket_rest_url = "https://clob.polymarket.com"
+reconnect_max_attempts_per_60s = 5
+# Max seconds to wait for a WS connect (TCP + handshake) before treating the
+# attempt as lost. Bounds a hung connect to a dead/silent peer so backoff + the
+# reconnect-storm guard + alerting still fire (instead of the bot freezing on a
+# dead connect while still reporting healthy=true).
+connect_timeout_s = 10
+# Polymarket Gamma API base — REST source for dynamic 5m/15m market discovery.
+polymarket_gamma_url = "https://gamma-api.polymarket.com"
+
+[logging]
+level = "info"
+# Directory for rotating structured JSON logs.
+trace_path = "logs"
+rotation = "daily"
+# WS-message event recorder (writes paths.timestamps_file as JSONL).
+#
+# OFF in production. Originally built for the Phase 1 ±2% baseline gate vs the
+# Python recorder; that gate CLOSED on 2026-04-23 (task #18). A follow-up
+# use case (Binance→Polymarket lag analysis) was planned but NEVER implemented
+# — no consumer exists in src/ or scripts/ that reads timestamps.jsonl.
+#
+# Left on, the recorder writes ~20 GB/day. It already filled the VPS disk once
+# (see the May 2026 incident). When false, the bot does NOT open the file and
+# does NOT create the parent dir; the configured path is left untouched. The
+# 6 .record() call sites in ws/{binance,polymarket}.rs become cheap no-ops.
+#
+# Do NOT flip this to true without wiring a real consumer first; the
+# `bot_toml_event_logger_disabled` test in config.rs will otherwise fail at
+# build time. See rust_bot/src/events.rs for implementation details.
+event_logger_enabled = false
+
+[paths]
+state_file = "data/state.json"
+timestamps_file = "data/timestamps.jsonl"
+bot_log_file = "logs/bot.log"
+alert_dir = "alerts"
+
+# Per-cell exit-rule selection. Cells NOT listed default to Baseline
+# (time-based exit at exit_ts_s). The wiring lives in W1..W4 (commits
+# 2a4affb / 3717d91 / 40b4043 / 0455026); the live evaluator is
+# evaluate_smart_exits in trading_loop.rs, gated per-cell by this map.
+#
+# Schema (validated fail-closed at boot):
+#   { kind = "baseline" }                          time-exit
+#   { kind = "f6_only", y_sec = N }                N must be > 0
+#   { kind = "smart", x_pct = X, y_sec = N }       0 < X <= 100, N > 0
+#   { kind = "b3_maker", delta = D, fallback = F } 0 < D < 1; F = "f2_market"
+#
+# OPERATIVE ACTIVATION (COMBO B3 pre-registration, 2026-06-08). This SUPERSEDES
+# the G15 hypotheses (f6_only/smart). The B3 strategy was validated mechanically
+# on May (exploration + validation + peeked tercer) via the Python analyzer; the
+# per-cell pre-registration lives in memory/prereg_mix5m_2026_06_08.md.
+#   * BTC:5m  -> OMITTED -> Baseline (time-exit). B3 in the fast 5m cell cuts
+#                the big winners short; baseline preserves the tails. Confirmed
+#                across all 3 datasets.
+#   * ETH:5m  -> b3_maker delta=0.10 fallback=f2_market. B3 wins PF across all
+#                3 datasets; the maker first-touch at entry+0.10 with a
+#                break-even market fallback.
+#   * BTC:15m -> b3_maker delta=0.10 fallback=f2_market. HYPOTHESIS (edge robust
+#                in 6/6 window x entry-filter combos with B3; to confirm on
+#                fresh data). Same rule as ETH:5m -- not a new parameter tune.
+#   * ETH:15m -> NOT here; lives in markets.disabled_cells (RETIRED). Edge
+#                falsified out-of-sample. The cell never opens, no exit rule.
+#
+# DEPLOY DISCIPLINE (honest): this strategy is verified MECHANICALLY on May but
+# NOT validated on fresh out-of-sample data. The operator chose to deploy and
+# analyze live. The live maker-order execution (place GTC+post_only, track,
+# cancel-on-timeout, F2_market fallback) is COMBO Phase 3; until those pieces
+# land, a b3_maker cell falls through to time-exit (the evaluate_smart_exits
+# B3Maker arm is a no-op `continue` -- byte-identical to Baseline). mode.default
+# stays "paper": going live needs --mode live + LIVE_ARMED.txt.
+#
+# Anti-deriva: the `bot_toml_operative_exit_cells_match_b3_prereg` test in
+# config.rs pins THESE exact cells + values. Any change to this block without
+# updating that test fails the build.
+[exits.cells]
+"ETH:5m"  = { kind = "b3_maker", delta = 0.10, fallback = "f2_market" }
+"BTC:15m" = { kind = "b3_maker", delta = 0.10, fallback = "f2_market" }
