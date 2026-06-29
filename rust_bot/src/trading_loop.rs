@@ -18,7 +18,7 @@
 
 #![allow(dead_code)] // tasks wired in main.rs (D1); some helpers used by tests / D2+
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 
@@ -511,6 +511,11 @@ pub async fn run_decision_task(
     // v2 price-history ring (Binance 1s closes). 1024 covers a 15m window + the
     // 60s vol lookback + margin. Only consumed on the v2 path.
     let mut history = crate::v2::PriceHistory::new(1024);
+    // v2 dedup: markets (token ids) this process has ALREADY fired an entry for.
+    // Independent of execution lag — the store_state positions snapshot only
+    // updates after the (possibly slow) execution task records the order, so we
+    // cannot rely on it to prevent same-market re-entry within the lag window.
+    let mut v2_entered: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             maybe = klines.recv() => {
@@ -592,6 +597,14 @@ pub async fn run_decision_task(
                     );
                     for (cmd, pred) in cmds {
                         if let ExecCommand::Open { intent, ctx } = &cmd {
+                            // DEDUP: one entry per market, lag-proof. The store_state
+                            // positions check inside process_kline_v2 can be stale
+                            // (execution task lags), so we ALSO gate on a local set of
+                            // already-fired tokens — this is what stops the same market
+                            // being entered N times within the execution lag window.
+                            if v2_entered.contains(&intent.token_id) {
+                                continue;
+                            }
                             let verdict = {
                                 let g = guards.lock().expect("guards mutex poisoned");
                                 eval_guards(&g, &state, &positions, intent, now)
@@ -604,6 +617,13 @@ pub async fn run_decision_task(
                                 }));
                                 continue;
                             }
+                            // Committed to firing this market: mark it so no later kline
+                            // re-enters it while execution catches up. Cap the set so it
+                            // can't grow unbounded over a long session.
+                            if v2_entered.len() > 50_000 {
+                                v2_entered.clear();
+                            }
+                            v2_entered.insert(intent.token_id.clone());
                             // Record predicted-p for the recalibrator (drained on resolution).
                             state.v2_pred.insert(intent.token_id.clone(), pred);
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
