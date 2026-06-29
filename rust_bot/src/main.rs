@@ -960,6 +960,25 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        // CONNECTION WARMUP: the first live order cold-started ~40s (TLS/DNS +
+        // connect-timeout retries to clob.polymarket.com), which let duplicate
+        // entries pile up and killed the lag-edge. Pay that cost ONCE here, before
+        // any order, with a throwaway authenticated CLOB call. The 60s balance
+        // fetch in positions_refresh then keeps the pooled connection warm
+        // (reqwest idle timeout > 60s). Non-fatal if it fails.
+        if let Some(sc) = &rest_ctx {
+            let t0 = std::time::Instant::now();
+            info!("warming CLOB connection (throwaway balance call) to avoid first-order cold-start...");
+            match sc.rest.get_balance().await {
+                Ok(b) => info!(
+                    balance_usdc = b.balance_usdc,
+                    warm_ms = t0.elapsed().as_millis() as u64,
+                    "CLOB connection warm — first real order will not cold-start"
+                ),
+                Err(e) => warn!(error = %e,
+                    "CLOB warmup failed (non-fatal); first order may still stall"),
+            }
+        }
         let shadow_ctx: Option<trading_loop::ShadowCtx> = if cli.d2_shadow {
             rest_ctx.clone()
         } else {
