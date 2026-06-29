@@ -81,6 +81,13 @@ use crate::trade_log::fee_f64;
 /// data, same dir as oplog + redemptions tracker.
 pub const DEFAULT_PNL_RECORDED_LOG: &str = "data/live/pnl_recorded.jsonl";
 
+/// Seconds after a bot position's 5m-window resolution time before we treat a
+/// still-present, non-redeemable position as a confirmed LOSS. Long enough that
+/// a genuine winner would already be `redeemable=true` (and classified as a win),
+/// short enough that the dashboard reflects losses promptly. Resolution time is
+/// `exit_ts_s - 300` (exit_ts_s = resolution + 300, the hold-to-settle convention).
+pub const LOSER_RESOLVE_BUFFER_S: i64 = 90;
+
 // ============================================================================
 // PURE: classification + math (testable byte-for-byte; zero IO).
 // ============================================================================
@@ -313,8 +320,28 @@ pub fn record_resolutions(
     };
 
     for p in positions {
-        // (1a) Resolved? If no, skip.
-        let (resolved, _why) = p.is_resolved_at(today);
+        // (1a) Resolved? is_resolved_at catches winners (redeemable=true) and any
+        // position whose cur_price snapped to 0/1 or whose end_date is in the past.
+        // It MISSES same-day LOSERS: a resolved losing position has redeemable=false,
+        // a stale intermediate cur_price, and end_date==today -> all three checks
+        // fail and the loss is never recorded (fake 100% win rate). So we ALSO treat
+        // a bot position as resolved once its own 5m window resolution time (derived
+        // from the bot lot's exit_ts_s = resolution + 300) has passed by a safety
+        // buffer. A winner would be redeemable=true by then (and classified as a win
+        // via resolved_outcome_price); anything still redeemable=false past the
+        // buffer is a genuine loss.
+        let (mut resolved, _why) = p.is_resolved_at(today);
+        if !resolved {
+            let now_s = now_ms_arg / 1000;
+            let window_resolved = bs_lock
+                .positions
+                .iter()
+                .filter(|bp| bp.token_id == p.token_id)
+                .any(|bp| bp.exit_ts_s > 0 && now_s > bp.exit_ts_s - 300 + LOSER_RESOLVE_BUFFER_S);
+            if window_resolved {
+                resolved = true;
+            }
+        }
         if !resolved {
             stats.skipped_not_resolved += 1;
             continue;
@@ -1036,6 +1063,32 @@ mod tests {
         assert_eq!(stats.classified_by_redeemable, 1);
 
         // LOSS: net = -(1*0.40 + buy_fee) < 0.
+        assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO);
+        assert_eq!(bs.lock().unwrap().positions.len(), 0);
+        assert!(recorder.already_recorded("tok1"));
+    }
+
+    /// g8_pnl_time_based_resolution_records_loss:
+    /// A resolved LOSER that is_resolved_at MISSES (redeemable=false, stale
+    /// cur_price, FUTURE end_date) must still be recorded once the bot's window
+    /// resolution time (exit_ts_s - 300 + buffer) has passed. Without this the
+    /// loss is never booked -> fake 100% win rate.
+    #[test]
+    fn g8_pnl_time_based_resolution_records_loss() {
+        let bs = mk_bs(vec![bot_lot("tok1", dec!(0.40), dec!(1))]); // exit_ts_s = 2_000
+        let guards = mk_guards();
+        let mut recorder = PnlRecorder::load(tmp_path("timeloss")).unwrap();
+        let oplog = mk_oplog();
+        // is_resolved_at == false here: redeemable=false, cur_price 0.4 (not
+        // extreme), end_date 2027 (future). t0() (~1.78e9 s) >> exit_ts_s so the
+        // time-based path resolves it; redeemable=false => LOSS.
+        let pos = vec![position("tok1", "0xcid1", 0.4, false, 1.0)];
+        assert!(!pos[0].is_resolved_at(
+            polymarket_client_sdk_v2::types::Utc::now().date_naive()
+        ).0, "precondition: is_resolved_at must miss this loser");
+
+        let stats = record_resolutions(&pos, &bs, &guards, &mut recorder, &oplog, false, t0());
+        assert_eq!(stats.processed, 1);
         assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO);
         assert_eq!(bs.lock().unwrap().positions.len(), 0);
         assert!(recorder.already_recorded("tok1"));

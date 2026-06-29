@@ -224,13 +224,20 @@ fn compute_stats(
                 "v2_guard_blocked_open" => blocked += 1,
                 _ => {}
             }
+            // NOTE: pnl_recorder_recorded / pnl_recorded_at_redeem are the recorder's
+            // AUDIT mirror of rows it ALSO writes to pnl_recorded.jsonl (read below).
+            // Counting them here too double-counts every resolution. Skip them; the
+            // canonical realized P&L for resolutions comes from the file. The oplog
+            // still supplies paper_close / exit closes (paper mode, not in the file).
             let data = v.get("data").cloned().unwrap_or(Value::Null);
-            if let Some(r) = data.get("realized_pnl").or_else(|| data.get("net_pnl")).or_else(|| data.get("pnl")).and_then(num) {
-                rev.push((ts, r,
-                    short_tok(data.get("token_id").and_then(Value::as_str).unwrap_or("")),
-                    data.get("side").and_then(Value::as_str).unwrap_or("").to_string(),
-                    data.get("entry_price").and_then(num),
-                    data.get("exit_price").and_then(num)));
+            if !matches!(kind, "pnl_recorded_at_redeem" | "pnl_recorder_recorded") {
+                if let Some(r) = data.get("realized_pnl").or_else(|| data.get("net_pnl")).or_else(|| data.get("pnl")).and_then(num) {
+                    rev.push((ts, r,
+                        short_tok(data.get("token_id").and_then(Value::as_str).unwrap_or("")),
+                        data.get("side").and_then(Value::as_str).unwrap_or("").to_string(),
+                        data.get("entry_price").and_then(num),
+                        data.get("exit_price").and_then(num)));
+                }
             }
         }
     }
