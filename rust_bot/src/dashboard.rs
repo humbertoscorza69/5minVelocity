@@ -204,9 +204,56 @@ fn compute_stats(
         }
     }
 
-    // ---- Walk the oplog: entries (v2_intent_open) + closed trades (any
-    //      data.realized_pnl / net_pnl) → realized P&L, PF, win rate, curve. ----
+    // ---- Entries/blocked from the oplog + realized events from BOTH the oplog
+    //      (paper closes / REGLA C) AND the P&L recorder file (LIVE resolutions,
+    //      written to data/live/pnl_recorded.jsonl — a SEPARATE file). Without the
+    //      recorder, live wins (redeemed) never show as closed/realized. ----
     let mut entries = 0u64;
+    let mut blocked = 0u64;
+    // (ts_ms, net_pnl, token, side, entry, exit)
+    let mut rev: Vec<(i64, f64, String, String, Option<f64>, Option<f64>)> = Vec::new();
+
+    if let Ok(text) = std::fs::read_to_string(oplog_path) {
+        for line in text.lines() {
+            let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+            let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+            if ts < started_ms { continue; } // session-scope
+            match kind {
+                "v2_intent_open" => entries += 1,
+                "v2_guard_blocked_open" => blocked += 1,
+                _ => {}
+            }
+            let data = v.get("data").cloned().unwrap_or(Value::Null);
+            if let Some(r) = data.get("realized_pnl").or_else(|| data.get("net_pnl")).or_else(|| data.get("pnl")).and_then(num) {
+                rev.push((ts, r,
+                    short_tok(data.get("token_id").and_then(Value::as_str).unwrap_or("")),
+                    data.get("side").and_then(Value::as_str).unwrap_or("").to_string(),
+                    data.get("entry_price").and_then(num),
+                    data.get("exit_price").and_then(num)));
+            }
+        }
+    }
+    // LIVE resolutions: PnlRecorder "recorded" rows carry net_pnl + resolved_price.
+    if let Ok(text) = std::fs::read_to_string(crate::pnl_recorder::DEFAULT_PNL_RECORDED_LOG) {
+        for line in text.lines() {
+            let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+            if v.get("kind").and_then(Value::as_str) != Some("recorded") { continue; }
+            let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+            if ts < started_ms { continue; }
+            let np = v.get("net_pnl").and_then(num).unwrap_or(0.0);
+            let rp = v.get("resolved_price").and_then(num);
+            let side = match rp { Some(x) if x >= 0.5 => "win", Some(_) => "lose", None => "" };
+            rev.push((ts, np,
+                short_tok(v.get("token_id").and_then(Value::as_str).unwrap_or("")),
+                side.to_string(),
+                v.get("entry_price").and_then(num),
+                rp));
+        }
+    }
+
+    // Merge both sources by time, then aggregate.
+    rev.sort_by_key(|e| e.0);
     let mut closed = 0u64;
     let mut wins = 0u64;
     let mut gross_win = 0.0_f64;
@@ -214,59 +261,16 @@ fn compute_stats(
     let mut realized_total = 0.0_f64;
     let mut curve: Vec<Value> = Vec::new();
     let mut recent_trades: Vec<Value> = Vec::new();
-    let mut blocked = 0u64;
-
-    if let Ok(text) = std::fs::read_to_string(oplog_path) {
-        for line in text.lines() {
-            let v: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
-            let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
-            // Session-scope: only count events from THIS run (the oplog is an
-            // append-only firehose that also holds prior paper sessions). Keeps
-            // the dashboard clean after a paper→live restart without deleting
-            // the audit log.
-            if ts < started_ms {
-                continue;
-            }
-            let data = v.get("data").cloned().unwrap_or(Value::Null);
-            match kind {
-                "v2_intent_open" => entries += 1,
-                "v2_guard_blocked_open" => blocked += 1,
-                _ => {}
-            }
-            // Any event carrying a realized P&L is a closed trade (paper_close,
-            // exit_close, pnl resolution, …) — generic so we don't couple to one name.
-            let r = data
-                .get("realized_pnl")
-                .or_else(|| data.get("net_pnl"))
-                .or_else(|| data.get("pnl"))
-                .and_then(num);
-            if let Some(r) = r {
-                closed += 1;
-                realized_total += r;
-                if r >= 0.0 {
-                    gross_win += r;
-                    wins += 1;
-                } else {
-                    gross_loss += -r;
-                }
-                curve.push(json!({ "t": ts, "pnl": realized_total }));
-                recent_trades.push(json!({
-                    "ts": ts,
-                    "token": short_tok(data.get("token_id").and_then(Value::as_str).unwrap_or("")),
-                    "side": data.get("side").and_then(Value::as_str).unwrap_or(""),
-                    "entry": data.get("entry_price").and_then(num),
-                    "exit": data.get("exit_price").and_then(num),
-                    "pnl": r,
-                }));
-            }
-        }
+    for (ts, r, token, side, entry, exit) in &rev {
+        closed += 1;
+        realized_total += *r;
+        if *r >= 0.0 { gross_win += *r; wins += 1; } else { gross_loss += -*r; }
+        curve.push(json!({ "t": *ts, "pnl": realized_total }));
+        recent_trades.push(json!({
+            "ts": *ts, "token": token.as_str(), "side": side.as_str(),
+            "entry": *entry, "exit": *exit, "pnl": *r,
+        }));
     }
-
-    // Cap arrays for the wire (newest kept).
     let curve = tail(curve, 600);
     let mut recent_trades = tail(recent_trades, 60);
     recent_trades.reverse(); // newest first for the table
