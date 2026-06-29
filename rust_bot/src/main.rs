@@ -1167,6 +1167,11 @@ async fn main() -> anyhow::Result<()> {
                 shutdown_rx.clone(),
             )));
         }
+        // Shared with the redemption task so winners recorded at redeem-time and
+        // losers recorded at poll-time use the SAME recorder set (idempotent).
+        let mut pnl_recorder_for_redeem: Option<
+            std::sync::Arc<std::sync::Mutex<pnl_recorder::PnlRecorder>>,
+        > = None;
         if let Some(rest_arc) = refresh_rest.clone() {
             info!("PIECE 4: spawning positions_refresh (60s period) -- active-only cap reads REST snapshot + G8 P&L hook");
             // G8: build the shared PnlRecorder once from the persisted file. If
@@ -1194,6 +1199,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let pnl_recorder_shared = std::sync::Arc::new(std::sync::Mutex::new(pnl_recorder));
+            pnl_recorder_for_redeem = Some(pnl_recorder_shared.clone());
 
             // G8: initial snapshot pass BEFORE positions_refresh ticks. Catalogs
             // the backlog of already-resolved positions WITHOUT recording P&L.
@@ -1270,6 +1276,11 @@ async fn main() -> anyhow::Result<()> {
                             cfg,
                             oplog_shared.clone(),
                             shutdown_rx.clone(),
+                            // P&L: record WINNERS at redeem-time (they vanish from
+                            // /positions before the poll-based recorder can see them).
+                            state_store.state(),
+                            guards_shared.clone(),
+                            pnl_recorder_for_redeem.clone(),
                         )));
                     }
                     redemption::RedemptionSetup::Disabled { reason } => {

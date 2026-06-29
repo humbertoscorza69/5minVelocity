@@ -485,6 +485,96 @@ pub fn record_resolutions(
     stats
 }
 
+/// Record P&L for a WINNER detected via successful on-chain redemption.
+///
+/// Winners get auto-redeemed and VANISH from `/positions` (often between the
+/// 60s `record_resolutions` polls), so the poll-based path frequently never
+/// sees them as resolved -- the redeem event is their only reliable capture
+/// point. A redeemed position is by definition the WINNING side, so the outcome
+/// price is 1.0 (payout = shares).
+///
+/// IDEMPOTENT against `record_resolutions`: both share the same `recorder` set,
+/// so whichever path fires first records, the other no-ops. Returns true iff a
+/// new row was written. Mirrors the steady-state pipeline exactly
+/// (persist -> counter -> remove).
+pub fn record_redeemed_win(
+    token_id: &str,
+    bs: &SharedBotState,
+    guards: &Arc<Mutex<Guards>>,
+    recorder: &mut PnlRecorder,
+    oplog: &OpLog,
+    now_ms_arg: i64,
+) -> bool {
+    if recorder.already_recorded(token_id) {
+        return false; // record_resolutions (or a prior redeem) already got it.
+    }
+    let mut bs_lock = match bs.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            warn!(token = %token_id, "record_redeemed_win: bs.positions mutex POISONED; skip");
+            return false;
+        }
+    };
+    let bot_lots: Vec<&OpenPosition> = bs_lock
+        .positions
+        .iter()
+        .filter(|bp| bp.token_id == token_id)
+        .collect();
+    if bot_lots.is_empty() {
+        // Already removed (record_resolutions caught it) or a manual position.
+        return false;
+    }
+    let total_shares: f64 = bot_lots.iter().map(|bp| bp.shares.to_f64().unwrap_or(0.0)).sum();
+    let total_cost: f64 = bot_lots
+        .iter()
+        .map(|bp| bp.shares.to_f64().unwrap_or(0.0) * bp.entry_price.to_f64().unwrap_or(0.0))
+        .sum();
+    if total_shares <= 0.0 {
+        return false;
+    }
+    let avg_entry = total_cost / total_shares;
+    let resolved_price = 1.0_f64; // redeemed == winning side.
+    let net = compute_resolution_net_pnl(total_shares, avg_entry, resolved_price);
+
+    // (persist FIRST -- crash barrier)
+    let rec = PnlRecord::Recorded {
+        token_id: token_id.to_string(),
+        ts_ms: now_ms_arg,
+        shares: total_shares,
+        entry_price: avg_entry,
+        resolved_price,
+        net_pnl: net,
+    };
+    if let Err(e) = recorder.record(rec) {
+        warn!(token = %token_id, error = %e,
+            "record_redeemed_win: persist failed; skip counter+remove (retry on next redeem tick)");
+        return false;
+    }
+    // (counter)
+    let net_dec = Decimal::try_from(net).unwrap_or_default();
+    if let Ok(mut g) = guards.lock() {
+        g.record_net_pnl(net_dec, now_ms_arg);
+    } else {
+        warn!(token = %token_id, "record_redeemed_win: guards mutex poisoned -- net persisted but not counted");
+    }
+    // (cleanup)
+    bs_lock.positions.retain(|bp| bp.token_id != token_id);
+    oplog.sys(
+        "pnl_recorded_at_redeem",
+        serde_json::json!({
+            "token_id": token_id,
+            "shares": total_shares,
+            "entry_price": avg_entry,
+            "resolved_price": resolved_price,
+            "net_pnl": net,
+            "ts_ms": now_ms_arg,
+        }),
+    );
+    info!(token = %token_id, shares = total_shares, entry = avg_entry, net_pnl = net,
+        "pnl_recorder: recorded WIN at redeem-time");
+    true
+}
+
 // ============================================================================
 // Startup pass: catalog the backlog WITHOUT inflating today's counter.
 // ============================================================================

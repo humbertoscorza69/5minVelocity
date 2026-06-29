@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alloy::primitives::{Address, B256};
 use anyhow::{Context, Result};
@@ -43,8 +43,11 @@ use crate::relayer::{
     self, ALREADY_REDEEMED_SENTINEL_PREFIX, DEFAULT_GAS_LIMIT, RedeemOutcome, RelayerApi,
     build_redeem_submit_body, classify_outcome, signer_from_key, submit_and_wait,
 };
+use crate::guards::Guards;
+use crate::pnl_recorder::{self, PnlRecorder};
 use crate::rest::{PositionInfo, RestClient};
 use crate::state::now_ms;
+use crate::state::store::SharedBotState;
 
 /// Default cadence between /positions polls in the redemption task. The user
 /// measured ~15-20 s from market close to "Claim winnings" available; 5 s is
@@ -469,12 +472,21 @@ where
 
 /// Spawn this in main.rs's live-mode task set. NOT gated by LIVE_ARMED:
 /// redeeming is post-close cleanup, not new-position exposure.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_redemption_task(
     rest: Arc<RestClient>,
     relayer: Arc<dyn RelayerApi>,
     cfg: RedemptionConfig,
     oplog: Arc<OpLog>,
     mut shutdown: watch::Receiver<bool>,
+    // P&L recording at redeem-time. Winners vanish from /positions before the
+    // poll-based recorder sees them, so a successful redeem is their only
+    // reliable capture point. `recorder` is SHARED with run_positions_refresh
+    // (same Arc) so the two paths are idempotent. None = no recorder wired
+    // (redeem still claims; just no P&L row).
+    store_state: SharedBotState,
+    guards: Arc<Mutex<Guards>>,
+    recorder: Option<Arc<Mutex<PnlRecorder>>>,
 ) {
     info!(
         poll_interval_secs = cfg.poll_interval.as_secs(),
@@ -654,6 +666,16 @@ pub async fn run_redemption_task(
                             }
                             failures.clear(&cid_str);
                             info!(condition_id = %cid_str, "redemption: SUCCESS recorded");
+                            // P&L: a redeemed position is the WINNING side. Record now
+                            // (idempotent vs the poll-based recorder via the shared set).
+                            if let Some(rec_arc) = recorder.as_ref() {
+                                if let Ok(mut r) = rec_arc.lock() {
+                                    pnl_recorder::record_redeemed_win(
+                                        &tgt.token_id, &store_state, &guards, &mut r,
+                                        oplog.as_ref(), now_ms(),
+                                    );
+                                }
+                            }
                         }
                         RedeemOutcome::AlreadyRedeemed { transaction_id, detected_via } => {
                             // G5.1: the safety net. Treat as success, persist a sentinel
@@ -684,6 +706,16 @@ pub async fn run_redemption_task(
                             failures.clear(&cid_str);
                             info!(condition_id = %cid_str, %detected_via,
                                 "redemption: ALREADY-REDEEMED detected -- recorded as idempotent");
+                            // Same as the success path: this condition is a claimed
+                            // winner; record its P&L if not already done.
+                            if let Some(rec_arc) = recorder.as_ref() {
+                                if let Ok(mut r) = rec_arc.lock() {
+                                    pnl_recorder::record_redeemed_win(
+                                        &tgt.token_id, &store_state, &guards, &mut r,
+                                        oplog.as_ref(), now_ms(),
+                                    );
+                                }
+                            }
                         }
                         RedeemOutcome::PermanentFail { reason } => {
                             let (attempts, just_alerted) = failures.record_failure(&cid_str, now_ms());
