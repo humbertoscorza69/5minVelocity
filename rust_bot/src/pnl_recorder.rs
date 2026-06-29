@@ -109,6 +109,23 @@ pub fn resolved_price_for_pnl(cur_price: f64) -> Option<f64> {
     }
 }
 
+/// PURE: outcome price for a position ALREADY CONFIRMED RESOLVED.
+///
+/// Polymarket's `/positions` does NOT snap `cur_price` to 0/1 on resolution --
+/// it returns the STALE last-trade price (e.g. 0.555, 0.375), which
+/// [`resolved_price_for_pnl`] correctly refuses to classify. For a resolved
+/// position the authoritative win/lose signal is the `redeemable` flag: the
+/// wallet holds the WINNING side iff `redeemable == true` (this is the very
+/// signal the redemption task spends gas claiming on). So: prefer a clean
+/// extreme `cur_price`, else fall back to `redeemable`.
+///
+/// MUST only be called once resolution is established (`is_resolved_at`); on an
+/// active market `redeemable` is false and this would wrongly return 0.0.
+#[must_use]
+pub fn resolved_outcome_price(cur_price: f64, redeemable: bool) -> f64 {
+    resolved_price_for_pnl(cur_price).unwrap_or(if redeemable { 1.0 } else { 0.0 })
+}
+
 /// PURE: compute net P&L for a binary resolution.
 ///
 /// Mirrors `feed_guards_net_pnl`'s formula exactly so the resolution path and
@@ -250,9 +267,10 @@ pub struct RecordStats {
     pub skipped_not_in_bs: usize,
     /// Position not resolved per `is_resolved_at(today)` (still active).
     pub skipped_not_resolved: usize,
-    /// Position resolved per is_resolved_at BUT cur_price is ambiguous (not
-    /// near 0 nor 1). The recorder skips + warns; will retry next tick.
-    pub skipped_ambiguous: usize,
+    /// Position resolved per is_resolved_at BUT cur_price was a stale
+    /// intermediate value, so the outcome was classified by the `redeemable`
+    /// flag instead of cur_price. Still recorded (counted in `processed` too).
+    pub classified_by_redeemable: usize,
     /// Self-heal: position was already in recorder set AND still in bs.positions
     /// (a crash between record and the next state.json snapshot). Removed now.
     pub cleanup_removals: usize,
@@ -331,32 +349,34 @@ pub fn record_resolutions(
             continue;
         }
 
-        // (1d) Sanity check on cur_price: binary markets must be 0 or 1
-        // post-resolution. Intermediate values are ambiguous -- skip + warn.
-        let resolved_price = match resolved_price_for_pnl(p.cur_price) {
-            Some(x) => x,
-            None => {
-                warn!(
-                    token = %p.token_id,
-                    cur_price = p.cur_price,
-                    redeemable = p.redeemable,
-                    "pnl_recorder: AMBIGUOUS cur_price on resolved position -- SKIP \
-                     (no P&L recorded, no removal). Will retry next tick. \
-                     Safety brake refuses to register a dubious value."
-                );
-                oplog.sys(
-                    "pnl_recorder_ambiguous_skip",
-                    serde_json::json!({
-                        "token_id": p.token_id,
-                        "cur_price": p.cur_price,
-                        "redeemable": p.redeemable,
-                        "end_date": p.end_date.map(|d| d.to_string()),
-                    }),
-                );
-                stats.skipped_ambiguous += 1;
-                continue;
-            }
-        };
+        // (1d) Outcome price. A clean extreme cur_price (0/1) classifies
+        // directly; otherwise Polymarket returned the STALE last-trade price on
+        // this resolved market, so we fall back to the authoritative
+        // `redeemable` flag (winning side iff redeemable). This is the same
+        // signal the redemption task claims on, so it cannot disagree with what
+        // actually pays out. Previously these were skipped as "ambiguous",
+        // which lost every winner whose cur_price hadn't snapped to 1.0 yet.
+        let resolved_price = resolved_outcome_price(p.cur_price, p.redeemable);
+        if resolved_price_for_pnl(p.cur_price).is_none() {
+            info!(
+                token = %p.token_id,
+                cur_price = p.cur_price,
+                redeemable = p.redeemable,
+                resolved_price,
+                "pnl_recorder: stale cur_price on resolved position -- classified by redeemable flag"
+            );
+            oplog.sys(
+                "pnl_recorder_classified_by_redeemable",
+                serde_json::json!({
+                    "token_id": p.token_id,
+                    "cur_price": p.cur_price,
+                    "redeemable": p.redeemable,
+                    "resolved_price": resolved_price,
+                    "end_date": p.end_date.map(|d| d.to_string()),
+                }),
+            );
+            stats.classified_by_redeemable += 1;
+        }
 
         // (2) Cost basis from bs.positions: aggregate ACROSS LOTS for this
         // token (Polymarket settles one entry per token; multiple buys
@@ -504,7 +524,7 @@ pub async fn snapshot_existing_resolved(
         skipped_already_done = stats.skipped_already_done,
         skipped_not_in_bs = stats.skipped_not_in_bs,
         skipped_not_resolved = stats.skipped_not_resolved,
-        skipped_ambiguous = stats.skipped_ambiguous,
+        classified_by_redeemable = stats.classified_by_redeemable,
         "pnl_recorder: startup snapshot complete -- backlog SKIPPED from daily P&L"
     );
     oplog.sys(
@@ -512,7 +532,7 @@ pub async fn snapshot_existing_resolved(
         serde_json::json!({
             "backlog_marked": stats.processed,
             "cleanup_removals": stats.cleanup_removals,
-            "skipped_ambiguous": stats.skipped_ambiguous,
+            "classified_by_redeemable": stats.classified_by_redeemable,
             "skipped_not_in_bs": stats.skipped_not_in_bs,
         }),
     );
@@ -882,30 +902,53 @@ mod tests {
 
     // ---------- Sanity guard ----------
 
-    /// g8_pnl_skips_ambiguous_cur_price_with_warn:
-    /// Resolved-flagged position with cur_price = 0.5 (intermediate) must be
-    /// SKIPPED -- no record, no removal, position stays in bs.positions for
-    /// next-tick retry. Safety brake refuses dubious P&L.
+    /// g8_pnl_classifies_stale_cur_price_by_redeemable (WIN):
+    /// Resolved position whose cur_price is a STALE intermediate value (0.5)
+    /// must be classified by the `redeemable` flag, NOT skipped. redeemable=true
+    /// => WIN: record positive P&L, remove from bs.positions, add to recorder.
     #[test]
-    fn g8_pnl_skips_ambiguous_cur_price_with_warn() {
+    fn g8_pnl_classifies_stale_cur_price_by_redeemable_win() {
         let bs = mk_bs(vec![bot_lot("tok1", dec!(0.40), dec!(1))]);
         let guards = mk_guards();
-        let mut recorder = PnlRecorder::load(tmp_path("ambig")).unwrap();
+        let mut recorder = PnlRecorder::load(tmp_path("ambig_win")).unwrap();
         let oplog = mk_oplog();
-        // redeemable=true (so is_resolved_at returns true) but cur_price 0.5
-        // (ambiguous). Resolver must refuse to register.
+        // redeemable=true + stale cur_price 0.5 => classify as WIN (1.0).
         let pos = vec![position("tok1", "0xcid1", 0.5, true, 1.0)];
 
         let stats = record_resolutions(&pos, &bs, &guards, &mut recorder, &oplog, false, t0());
-        assert_eq!(stats.processed, 0);
-        assert_eq!(stats.skipped_ambiguous, 1);
+        assert_eq!(stats.processed, 1);
+        assert_eq!(stats.classified_by_redeemable, 1);
 
-        // Counter unchanged.
-        assert_eq!(guards.lock().unwrap().daily_net_pnl(), Decimal::ZERO);
-        // bs.positions UNCHANGED (still has the entry for retry).
-        assert_eq!(bs.lock().unwrap().positions.len(), 1);
-        // Recorder set MUST NOT contain it (we want retries next tick).
-        assert!(!recorder.already_recorded("tok1"));
+        // WIN: net = 1*1 - (1*0.40 + buy_fee) > 0.
+        assert!(guards.lock().unwrap().daily_net_pnl() > Decimal::ZERO);
+        // Resolved + removed from bs.positions; recorder now holds it.
+        assert_eq!(bs.lock().unwrap().positions.len(), 0);
+        assert!(recorder.already_recorded("tok1"));
+    }
+
+    /// g8_pnl_classifies_stale_cur_price_by_redeemable (LOSS):
+    /// Same stale cur_price, but redeemable=false => LOSS (0.0): record the
+    /// negative cost basis and remove. (Resolution established via end_date.)
+    #[test]
+    fn g8_pnl_classifies_stale_cur_price_by_redeemable_loss() {
+        let bs = mk_bs(vec![bot_lot("tok1", dec!(0.40), dec!(1))]);
+        let guards = mk_guards();
+        let mut recorder = PnlRecorder::load(tmp_path("ambig_loss")).unwrap();
+        let oplog = mk_oplog();
+        // redeemable=false + stale cur_price 0.45 => classify as LOSS (0.0).
+        // end_date in the past so is_resolved_at is true without redeemable.
+        let mut p = position("tok1", "0xcid1", 0.45, false, 1.0);
+        p.end_date = NaiveDate::from_ymd_opt(2020, 1, 1);
+        let pos = vec![p];
+
+        let stats = record_resolutions(&pos, &bs, &guards, &mut recorder, &oplog, false, t0());
+        assert_eq!(stats.processed, 1);
+        assert_eq!(stats.classified_by_redeemable, 1);
+
+        // LOSS: net = -(1*0.40 + buy_fee) < 0.
+        assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO);
+        assert_eq!(bs.lock().unwrap().positions.len(), 0);
+        assert!(recorder.already_recorded("tok1"));
     }
 
     /// Loss resolution writes a negative net into the counter.

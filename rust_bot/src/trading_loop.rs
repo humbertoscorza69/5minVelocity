@@ -907,11 +907,13 @@ pub async fn run_positions_refresh(
                         let resolved = state.resolved_tokens.get(&p.token_id).map(|r| *r).unwrap_or(false);
                         if !resolved { continue; }
                         if let Some((_, pred)) = state.v2_pred.remove(&p.token_id) {
-                            if let Some(price) = crate::pnl_recorder::resolved_price_for_pnl(p.cur_price) {
-                                if let Ok(mut r) = recal.lock() {
-                                    r.record(pred, price >= 0.5);
-                                    updated += 1;
-                                }
+                            // Classify by clean cur_price when available, else by the
+                            // authoritative `redeemable` flag (resolved markets return a
+                            // stale cur_price). Same logic as the P&L recorder.
+                            let price = crate::pnl_recorder::resolved_outcome_price(p.cur_price, p.redeemable);
+                            if let Ok(mut r) = recal.lock() {
+                                r.record(pred, price >= 0.5);
+                                updated += 1;
                             }
                         }
                     }
@@ -946,12 +948,12 @@ pub async fn run_positions_refresh(
                         continue;
                     }
                 };
-                if stats.processed > 0 || stats.skipped_ambiguous > 0 {
+                if stats.processed > 0 || stats.classified_by_redeemable > 0 {
                     info!(
                         recorded = stats.processed,
                         skipped_already = stats.skipped_already_done,
                         skipped_not_in_bs = stats.skipped_not_in_bs,
-                        skipped_ambiguous = stats.skipped_ambiguous,
+                        classified_by_redeemable = stats.classified_by_redeemable,
                         "positions_refresh: G8 P&L recorder this tick"
                     );
                 }
@@ -1051,10 +1053,37 @@ pub async fn run_execution_task(
                                         }
                                     }
                                 }
-                                Ok(None) => {} // not posted (refused / slippage abort / shadow no-op)
+                                Ok(None) => {
+                                    // NOT posted (refused / slippage abort). In live mode the
+                                    // optimistic paper_open above is the position shown on the
+                                    // dashboard + tracked for exit — but nothing landed on-chain.
+                                    // Roll it back so we don't carry a PHANTOM position.
+                                    let removed = if let Ok(mut bs) = store_state.lock() {
+                                        let before = bs.positions.len();
+                                        bs.positions.retain(|p| p.token_id != intent.token_id);
+                                        before - bs.positions.len()
+                                    } else { 0 };
+                                    warn!(token = %intent.token_id, removed, "live_open not posted — rolled back phantom position");
+                                    oplog.sys("live_open_rolled_back", serde_json::json!({
+                                        "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                        "reason": "not_posted", "removed": removed,
+                                    }));
+                                }
                                 Err(e) => {
                                     warn!(error = %e, "live_open error");
                                     oplog.err("live_open", &e.to_string(), serde_json::json!({}));
+                                    // Order errored (e.g. FOK kill / 400). Same rollback: the
+                                    // paper_open must not survive an order that never landed.
+                                    let removed = if let Ok(mut bs) = store_state.lock() {
+                                        let before = bs.positions.len();
+                                        bs.positions.retain(|p| p.token_id != intent.token_id);
+                                        before - bs.positions.len()
+                                    } else { 0 };
+                                    warn!(token = %intent.token_id, removed, "live_open errored — rolled back phantom position");
+                                    oplog.sys("live_open_rolled_back", serde_json::json!({
+                                        "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                        "reason": "error", "removed": removed,
+                                    }));
                                 }
                             }
                         }
