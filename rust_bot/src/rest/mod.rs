@@ -295,10 +295,16 @@ impl RestClient {
         let url = format!(
             "https://data-api.polymarket.com/activity?user={user}&limit={limit}&type=TRADE,REDEEM&sortDirection=DESC"
         );
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| anyhow!("activity client build: {e}"))?;
+        // POOLED client (built once): keeps the data-api TLS connection warm so a
+        // cold first-connect doesn't time out (the startup blip), and reuses it
+        // across the 60s ticks. Generous timeout for the cold path.
+        static ACTIVITY_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = ACTIVITY_HTTP.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(25))
+                .build()
+                .unwrap_or_default()
+        });
         let resp = client.get(&url).send().await.map_err(|e| anyhow!("activity GET: {e}"))?;
         let status = resp.status();
         let body: serde_json::Value = resp
