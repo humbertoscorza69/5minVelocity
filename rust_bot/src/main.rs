@@ -1281,6 +1281,8 @@ async fn main() -> anyhow::Result<()> {
                             state_store.state(),
                             guards_shared.clone(),
                             pnl_recorder_for_redeem.clone(),
+                            // shared state: skip redeeming known losers (quota saver).
+                            state.clone(),
                         )));
                     }
                     redemption::RedemptionSetup::Disabled { reason } => {

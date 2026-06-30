@@ -1025,7 +1025,12 @@ pub async fn run_positions_refresh(
                             ),
                             Err(_) => false,
                         };
-                        state.v2_settled.remove(&token);
+                        // Drop WINNERS from v2_settled (redemption claims them via the
+                        // redeemable flag). KEEP LOSERS so the redemption task can see
+                        // them and SKIP the pointless $0 redeem (quota saver).
+                        if won {
+                            state.v2_settled.remove(&token);
+                        }
                         if did {
                             booked += 1;
                             if let Some((_, pred)) = state.v2_pred.remove(&token) {
@@ -1034,6 +1039,11 @@ pub async fn run_positions_refresh(
                                 }
                             }
                         }
+                    }
+                    // Bound v2_settled (mostly residual losers kept for the redeem
+                    // skip-list); clear if it somehow grows unbounded.
+                    if state.v2_settled.len() > 50_000 {
+                        state.v2_settled.clear();
                     }
                     if booked > 0 {
                         let (bias, n) = recal.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));

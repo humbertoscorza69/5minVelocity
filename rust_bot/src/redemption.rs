@@ -493,6 +493,9 @@ pub async fn run_redemption_task(
     _store_state: SharedBotState,
     _guards: Arc<Mutex<Guards>>,
     _recorder: Option<Arc<Mutex<PnlRecorder>>>,
+    // Shared state: read v2_settled (Binance settlement outcome) to SKIP redeeming
+    // known LOSERS -- claiming a $0 loser is a pure waste of the relayer quota.
+    state: crate::state::Shared,
 ) {
     info!(
         poll_interval_secs = cfg.poll_interval.as_secs(),
@@ -576,7 +579,18 @@ pub async fn run_redemption_task(
                     .map(|p| p.condition_id.to_ascii_lowercase()).collect();
                 failures.prune_to(&active_set);
                 let now = now_ms();
-                let targets = find_redeem_targets(&positions, &bot_opened, &tracker, &failures, now);
+                let mut targets = find_redeem_targets(&positions, &bot_opened, &tracker, &failures, now);
+                // QUOTA SAVER: skip redeeming KNOWN LOSERS (Binance settlement said
+                // lost). A losing position redeems for $0 -- claiming it only burns a
+                // relayer unit for nothing. Winners (and any not-yet-classified
+                // position) are left in to redeem normally.
+                let before = targets.len();
+                targets.retain(|t| !matches!(state.v2_settled.get(&t.token_id).map(|v| *v), Some(false)));
+                let skipped_losers = before - targets.len();
+                if skipped_losers > 0 {
+                    info!(skipped_losers, "redemption: skipped $0 loser redeems (saving relayer quota)");
+                    oplog.sys("redeem_skipped_losers", serde_json::json!({ "count": skipped_losers }));
+                }
                 if targets.is_empty() {
                     continue;
                 }
