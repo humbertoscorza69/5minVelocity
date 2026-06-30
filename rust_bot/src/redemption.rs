@@ -52,7 +52,15 @@ use crate::state::store::SharedBotState;
 /// Default cadence between /positions polls in the redemption task. The user
 /// measured ~15-20 s from market close to "Claim winnings" available; 5 s is
 /// brisk without being abusive of the data-api.
-pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
+pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
+
+/// Parse the "resets in N seconds" hint out of a relayer 429 quota body, if present.
+fn parse_resets_in_secs(s: &str) -> Option<i64> {
+    let i = s.find("resets in")?;
+    let rest = s[i + "resets in".len()..].trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<i64>().ok()
+}
 
 /// How long submit_and_wait polls /transaction before giving up on a single
 /// submit. The relayer typically mines within a few blocks (~6-12 s on Polygon).
@@ -525,12 +533,22 @@ pub async fn run_redemption_task(
     };
     // G5.1: per-condition_id failure counter (in-memory; resets on restart).
     let mut failures = FailureCounter::default();
+    // GLOBAL quota brake: the relayer enforces a shared request quota. On a 429
+    // "quota exceeded" we must STOP all redeem attempts until the reset window --
+    // hammering it every poll (per-condition backoff doesn't help a GLOBAL limit)
+    // just keeps the quota pinned at 0. ms wall-clock; 0 = not paused.
+    let mut quota_pause_until_ms: i64 = 0;
 
     let mut tick = tokio::time::interval(cfg.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                // GLOBAL quota brake: skip the whole cycle while the relayer quota
+                // is exhausted (no requests at all -> let it actually reset).
+                if quota_pause_until_ms > 0 && now_ms() < quota_pause_until_ms {
+                    continue;
+                }
                 // 1) Pull the bot-opened token universe FRESH every tick
                 //    (it grows as the bot opens new positions).
                 let bot_opened = match load_bot_opened_tokens(&cfg.intent_log_path) {
@@ -568,6 +586,11 @@ pub async fn run_redemption_task(
                 // 3) Dispatch each redeem sequentially (the relayer queue is
                 //    per-EOA; sequential keeps nonces clean).
                 for tgt in targets {
+                    // Stop the whole cycle the instant the relayer quota is hit
+                    // (set in the TransientFail arm below) -- don't burn the rest.
+                    if quota_pause_until_ms > 0 && now_ms() < quota_pause_until_ms {
+                        break;
+                    }
                     let cid_str = tgt.condition_id.clone();
                     oplog.sys("redeem_attempt", serde_json::json!({
                         "condition_id": cid_str, "token_id": tgt.token_id, "size": tgt.size,
@@ -721,6 +744,21 @@ pub async fn run_redemption_task(
                             }
                         }
                         RedeemOutcome::TransientFail { reason } => {
+                            // GLOBAL quota brake: a 429 "quota exceeded" is not a
+                            // per-condition problem -- the shared budget is spent.
+                            // Pause ALL redeems until the reset (parsed from the
+                            // message, capped 1h) so we stop pinning it at 0.
+                            let low = reason.to_ascii_lowercase();
+                            if low.contains("quota exceeded") || low.contains("429") || low.contains("too many requests") {
+                                let secs = parse_resets_in_secs(&reason).unwrap_or(900).clamp(60, 3600);
+                                quota_pause_until_ms = now_ms() + secs * 1000;
+                                warn!(pause_secs = secs,
+                                    "redemption: relayer QUOTA EXCEEDED -- pausing ALL redeems until reset");
+                                oplog.sys("redeem_quota_paused", serde_json::json!({
+                                    "pause_secs": secs, "reason": reason,
+                                }));
+                                break; // abandon the rest of this cycle
+                            }
                             let (attempts, just_alerted) = failures.record_failure(&cid_str, now_ms());
                             warn!(condition_id = %cid_str, attempts, %reason,
                                 "redemption: TransientFail -- backoff applied");
