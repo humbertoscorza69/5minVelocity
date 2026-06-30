@@ -907,13 +907,15 @@ pub async fn run_positions_refresh(
                         let resolved = state.resolved_tokens.get(&p.token_id).map(|r| *r).unwrap_or(false);
                         if !resolved { continue; }
                         if let Some((_, pred)) = state.v2_pred.remove(&p.token_id) {
-                            // Classify by clean cur_price when available, else by the
-                            // authoritative `redeemable` flag (resolved markets return a
-                            // stale cur_price). Same logic as the P&L recorder.
-                            let price = crate::pnl_recorder::resolved_outcome_price(p.cur_price, p.redeemable);
-                            if let Ok(mut r) = recal.lock() {
-                                r.record(pred, price >= 0.5);
-                                updated += 1;
+                            // Only learn from an UNAMBIGUOUS clean cur_price (0/1).
+                            // `redeemable` cannot tell win from lose (true for both),
+                            // so we do NOT guess here -- mislabeled samples would
+                            // poison the recalibrator.
+                            if let Some(price) = crate::pnl_recorder::resolved_price_for_pnl(p.cur_price) {
+                                if let Ok(mut r) = recal.lock() {
+                                    r.record(pred, price >= 0.5);
+                                    updated += 1;
+                                }
                             }
                         }
                     }

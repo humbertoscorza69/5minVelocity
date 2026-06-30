@@ -44,7 +44,7 @@ use crate::relayer::{
     build_redeem_submit_body, classify_outcome, signer_from_key, submit_and_wait,
 };
 use crate::guards::Guards;
-use crate::pnl_recorder::{self, PnlRecorder};
+use crate::pnl_recorder::PnlRecorder;
 use crate::rest::{PositionInfo, RestClient};
 use crate::state::now_ms;
 use crate::state::store::SharedBotState;
@@ -479,14 +479,12 @@ pub async fn run_redemption_task(
     cfg: RedemptionConfig,
     oplog: Arc<OpLog>,
     mut shutdown: watch::Receiver<bool>,
-    // P&L recording at redeem-time. Winners vanish from /positions before the
-    // poll-based recorder sees them, so a successful redeem is their only
-    // reliable capture point. `recorder` is SHARED with run_positions_refresh
-    // (same Arc) so the two paths are idempotent. None = no recorder wired
-    // (redeem still claims; just no P&L row).
-    store_state: SharedBotState,
-    guards: Arc<Mutex<Guards>>,
-    recorder: Option<Arc<Mutex<PnlRecorder>>>,
+    // Kept wired (the redeem path no longer books P&L -- the activity-feed
+    // reconciler does, since redeem != win -- but these stay in the signature so
+    // re-enabling a redeem-time hook needs no plumbing change).
+    _store_state: SharedBotState,
+    _guards: Arc<Mutex<Guards>>,
+    _recorder: Option<Arc<Mutex<PnlRecorder>>>,
 ) {
     info!(
         poll_interval_secs = cfg.poll_interval.as_secs(),
@@ -666,16 +664,11 @@ pub async fn run_redemption_task(
                             }
                             failures.clear(&cid_str);
                             info!(condition_id = %cid_str, "redemption: SUCCESS recorded");
-                            // P&L: a redeemed position is the WINNING side. Record now
-                            // (idempotent vs the poll-based recorder via the shared set).
-                            if let Some(rec_arc) = recorder.as_ref() {
-                                if let Ok(mut r) = rec_arc.lock() {
-                                    pnl_recorder::record_redeemed_win(
-                                        &tgt.token_id, &store_state, &guards, &mut r,
-                                        oplog.as_ref(), now_ms(),
-                                    );
-                                }
-                            }
+                            // NOTE: P&L is NOT booked here. The bot redeems LOSERS too
+                            // (redeemable is set for both sides; loser redeems pay $0), so a
+                            // redeem event does NOT imply a win. Realized P&L is booked
+                            // solely by the activity-feed reconciler, which reads the real
+                            // payout. (store_state/guards/recorder kept wired for that path.)
                         }
                         RedeemOutcome::AlreadyRedeemed { transaction_id, detected_via } => {
                             // G5.1: the safety net. Treat as success, persist a sentinel
@@ -706,16 +699,7 @@ pub async fn run_redemption_task(
                             failures.clear(&cid_str);
                             info!(condition_id = %cid_str, %detected_via,
                                 "redemption: ALREADY-REDEEMED detected -- recorded as idempotent");
-                            // Same as the success path: this condition is a claimed
-                            // winner; record its P&L if not already done.
-                            if let Some(rec_arc) = recorder.as_ref() {
-                                if let Ok(mut r) = rec_arc.lock() {
-                                    pnl_recorder::record_redeemed_win(
-                                        &tgt.token_id, &store_state, &guards, &mut r,
-                                        oplog.as_ref(), now_ms(),
-                                    );
-                                }
-                            }
+                            // P&L NOT booked here (see SUCCESS arm) -- redeem != win.
                         }
                         RedeemOutcome::PermanentFail { reason } => {
                             let (attempts, just_alerted) = failures.record_failure(&cid_str, now_ms());

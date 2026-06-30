@@ -81,13 +81,6 @@ use crate::trade_log::fee_f64;
 /// data, same dir as oplog + redemptions tracker.
 pub const DEFAULT_PNL_RECORDED_LOG: &str = "data/live/pnl_recorded.jsonl";
 
-/// Seconds after a bot position's 5m-window resolution time before we treat a
-/// still-present, non-redeemable position as a confirmed LOSS. Long enough that
-/// a genuine winner would already be `redeemable=true` (and classified as a win),
-/// short enough that the dashboard reflects losses promptly. Resolution time is
-/// `exit_ts_s - 300` (exit_ts_s = resolution + 300, the hold-to-settle convention).
-pub const LOSER_RESOLVE_BUFFER_S: i64 = 90;
-
 // ============================================================================
 // PURE: classification + math (testable byte-for-byte; zero IO).
 // ============================================================================
@@ -114,23 +107,6 @@ pub fn resolved_price_for_pnl(cur_price: f64) -> Option<f64> {
     } else {
         None
     }
-}
-
-/// PURE: outcome price for a position ALREADY CONFIRMED RESOLVED.
-///
-/// Polymarket's `/positions` does NOT snap `cur_price` to 0/1 on resolution --
-/// it returns the STALE last-trade price (e.g. 0.555, 0.375), which
-/// [`resolved_price_for_pnl`] correctly refuses to classify. For a resolved
-/// position the authoritative win/lose signal is the `redeemable` flag: the
-/// wallet holds the WINNING side iff `redeemable == true` (this is the very
-/// signal the redemption task spends gas claiming on). So: prefer a clean
-/// extreme `cur_price`, else fall back to `redeemable`.
-///
-/// MUST only be called once resolution is established (`is_resolved_at`); on an
-/// active market `redeemable` is false and this would wrongly return 0.0.
-#[must_use]
-pub fn resolved_outcome_price(cur_price: f64, redeemable: bool) -> f64 {
-    resolved_price_for_pnl(cur_price).unwrap_or(if redeemable { 1.0 } else { 0.0 })
 }
 
 /// PURE: compute net P&L for a binary resolution.
@@ -320,28 +296,12 @@ pub fn record_resolutions(
     };
 
     for p in positions {
-        // (1a) Resolved? is_resolved_at catches winners (redeemable=true) and any
-        // position whose cur_price snapped to 0/1 or whose end_date is in the past.
-        // It MISSES same-day LOSERS: a resolved losing position has redeemable=false,
-        // a stale intermediate cur_price, and end_date==today -> all three checks
-        // fail and the loss is never recorded (fake 100% win rate). So we ALSO treat
-        // a bot position as resolved once its own 5m window resolution time (derived
-        // from the bot lot's exit_ts_s = resolution + 300) has passed by a safety
-        // buffer. A winner would be redeemable=true by then (and classified as a win
-        // via resolved_outcome_price); anything still redeemable=false past the
-        // buffer is a genuine loss.
-        let (mut resolved, _why) = p.is_resolved_at(today);
-        if !resolved {
-            let now_s = now_ms_arg / 1000;
-            let window_resolved = bs_lock
-                .positions
-                .iter()
-                .filter(|bp| bp.token_id == p.token_id)
-                .any(|bp| bp.exit_ts_s > 0 && now_s > bp.exit_ts_s - 300 + LOSER_RESOLVE_BUFFER_S);
-            if window_resolved {
-                resolved = true;
-            }
-        }
+        // (1a) Resolved? If no, skip. NOTE: win/lose is NOT decided here -- the
+        // AUTHORITATIVE booking is the activity-feed reconciler (record_from_activity),
+        // which reads the real redeem PAYOUT. This /positions path only books the
+        // unambiguous clean-extreme cur_price case (see 1d); it must never guess from
+        // `redeemable`, which is true for BOTH winners and losers post-resolution.
+        let (resolved, _why) = p.is_resolved_at(today);
         if !resolved {
             stats.skipped_not_resolved += 1;
             continue;
@@ -376,34 +336,19 @@ pub fn record_resolutions(
             continue;
         }
 
-        // (1d) Outcome price. A clean extreme cur_price (0/1) classifies
-        // directly; otherwise Polymarket returned the STALE last-trade price on
-        // this resolved market, so we fall back to the authoritative
-        // `redeemable` flag (winning side iff redeemable). This is the same
-        // signal the redemption task claims on, so it cannot disagree with what
-        // actually pays out. Previously these were skipped as "ambiguous",
-        // which lost every winner whose cur_price hadn't snapped to 1.0 yet.
-        let resolved_price = resolved_outcome_price(p.cur_price, p.redeemable);
-        if resolved_price_for_pnl(p.cur_price).is_none() {
-            info!(
-                token = %p.token_id,
-                cur_price = p.cur_price,
-                redeemable = p.redeemable,
-                resolved_price,
-                "pnl_recorder: stale cur_price on resolved position -- classified by redeemable flag"
-            );
-            oplog.sys(
-                "pnl_recorder_classified_by_redeemable",
-                serde_json::json!({
-                    "token_id": p.token_id,
-                    "cur_price": p.cur_price,
-                    "redeemable": p.redeemable,
-                    "resolved_price": resolved_price,
-                    "end_date": p.end_date.map(|d| d.to_string()),
-                }),
-            );
-            stats.classified_by_redeemable += 1;
-        }
+        // (1d) Outcome price. ONLY a clean extreme cur_price (0/1) is trustworthy
+        // here. An intermediate (stale) cur_price is ambiguous -- and `redeemable`
+        // CANNOT disambiguate (it is true for losers too, which the bot also
+        // redeems for $0). So we SKIP ambiguous ones and let the activity-feed
+        // reconciler book them from the real payout. This prevents booking a
+        // loser as a win.
+        let resolved_price = match resolved_price_for_pnl(p.cur_price) {
+            Some(x) => x,
+            None => {
+                stats.classified_by_redeemable += 1; // (reused as "deferred to activity")
+                continue;
+            }
+        };
 
         // (2) Cost basis from bs.positions: aggregate ACROSS LOTS for this
         // token (Polymarket settles one entry per token; multiple buys
@@ -601,18 +546,6 @@ pub fn record_settled(
     info!(token = %token_id, resolved_price, net_pnl = net, source,
         "pnl_recorder: recorded settled position");
     true
-}
-
-/// Convenience: a redeemed position is by definition the WINNING side.
-pub fn record_redeemed_win(
-    token_id: &str,
-    bs: &SharedBotState,
-    guards: &Arc<Mutex<Guards>>,
-    recorder: &mut PnlRecorder,
-    oplog: &OpLog,
-    now_ms_arg: i64,
-) -> bool {
-    record_settled(token_id, 1.0, "redeem", bs, guards, recorder, oplog, now_ms_arg)
 }
 
 /// AUTHORITATIVE settlement reconciliation from the on-chain activity feed.
@@ -1098,79 +1031,25 @@ mod tests {
 
     // ---------- Sanity guard ----------
 
-    /// g8_pnl_classifies_stale_cur_price_by_redeemable (WIN):
-    /// Resolved position whose cur_price is a STALE intermediate value (0.5)
-    /// must be classified by the `redeemable` flag, NOT skipped. redeemable=true
-    /// => WIN: record positive P&L, remove from bs.positions, add to recorder.
+    /// g8_pnl_ambiguous_cur_price_deferred_to_activity:
+    /// A resolved position with a STALE intermediate cur_price is NOT booked by
+    /// this /positions path (redeemable can't tell win from lose). It is left for
+    /// the activity-feed reconciler. No P&L, no removal, counted as deferred.
     #[test]
-    fn g8_pnl_classifies_stale_cur_price_by_redeemable_win() {
+    fn g8_pnl_ambiguous_cur_price_deferred_to_activity() {
         let bs = mk_bs(vec![bot_lot("tok1", dec!(0.40), dec!(1))]);
         let guards = mk_guards();
-        let mut recorder = PnlRecorder::load(tmp_path("ambig_win")).unwrap();
+        let mut recorder = PnlRecorder::load(tmp_path("ambig")).unwrap();
         let oplog = mk_oplog();
-        // redeemable=true + stale cur_price 0.5 => classify as WIN (1.0).
+        // redeemable=true (=> is_resolved_at true) but stale cur_price 0.5.
         let pos = vec![position("tok1", "0xcid1", 0.5, true, 1.0)];
 
         let stats = record_resolutions(&pos, &bs, &guards, &mut recorder, &oplog, false, t0());
-        assert_eq!(stats.processed, 1);
-        assert_eq!(stats.classified_by_redeemable, 1);
-
-        // WIN: net = 1*1 - (1*0.40 + buy_fee) > 0.
-        assert!(guards.lock().unwrap().daily_net_pnl() > Decimal::ZERO);
-        // Resolved + removed from bs.positions; recorder now holds it.
-        assert_eq!(bs.lock().unwrap().positions.len(), 0);
-        assert!(recorder.already_recorded("tok1"));
-    }
-
-    /// g8_pnl_classifies_stale_cur_price_by_redeemable (LOSS):
-    /// Same stale cur_price, but redeemable=false => LOSS (0.0): record the
-    /// negative cost basis and remove. (Resolution established via end_date.)
-    #[test]
-    fn g8_pnl_classifies_stale_cur_price_by_redeemable_loss() {
-        let bs = mk_bs(vec![bot_lot("tok1", dec!(0.40), dec!(1))]);
-        let guards = mk_guards();
-        let mut recorder = PnlRecorder::load(tmp_path("ambig_loss")).unwrap();
-        let oplog = mk_oplog();
-        // redeemable=false + stale cur_price 0.45 => classify as LOSS (0.0).
-        // end_date in the past so is_resolved_at is true without redeemable.
-        let mut p = position("tok1", "0xcid1", 0.45, false, 1.0);
-        p.end_date = NaiveDate::from_ymd_opt(2020, 1, 1);
-        let pos = vec![p];
-
-        let stats = record_resolutions(&pos, &bs, &guards, &mut recorder, &oplog, false, t0());
-        assert_eq!(stats.processed, 1);
-        assert_eq!(stats.classified_by_redeemable, 1);
-
-        // LOSS: net = -(1*0.40 + buy_fee) < 0.
-        assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO);
-        assert_eq!(bs.lock().unwrap().positions.len(), 0);
-        assert!(recorder.already_recorded("tok1"));
-    }
-
-    /// g8_pnl_time_based_resolution_records_loss:
-    /// A resolved LOSER that is_resolved_at MISSES (redeemable=false, stale
-    /// cur_price, FUTURE end_date) must still be recorded once the bot's window
-    /// resolution time (exit_ts_s - 300 + buffer) has passed. Without this the
-    /// loss is never booked -> fake 100% win rate.
-    #[test]
-    fn g8_pnl_time_based_resolution_records_loss() {
-        let bs = mk_bs(vec![bot_lot("tok1", dec!(0.40), dec!(1))]); // exit_ts_s = 2_000
-        let guards = mk_guards();
-        let mut recorder = PnlRecorder::load(tmp_path("timeloss")).unwrap();
-        let oplog = mk_oplog();
-        // is_resolved_at == false here: redeemable=false, cur_price 0.4 (not
-        // extreme), end_date 2027 (future). t0() (~1.78e9 s) >> exit_ts_s so the
-        // time-based path resolves it; redeemable=false => LOSS.
-        let pos = vec![position("tok1", "0xcid1", 0.4, false, 1.0)];
-        assert!(!pos[0].is_resolved_at(
-            polymarket_client_sdk_v2::types::Utc::now().date_naive()
-        ).0, "precondition: is_resolved_at must miss this loser");
-
-        let stats = record_resolutions(&pos, &bs, &guards, &mut recorder, &oplog, false, t0());
-        assert_eq!(stats.processed, 1);
-        assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO);
-        assert_eq!(bs.lock().unwrap().positions.len(), 0);
-        assert!(recorder.already_recorded("tok1"));
+        assert_eq!(stats.processed, 0, "must NOT book from ambiguous cur_price");
+        assert_eq!(stats.classified_by_redeemable, 1, "counted as deferred");
+        assert_eq!(guards.lock().unwrap().daily_net_pnl(), Decimal::ZERO);
+        assert_eq!(bs.lock().unwrap().positions.len(), 1, "left for activity reconciler");
+        assert!(!recorder.already_recorded("tok1"));
     }
 
     /// Loss resolution writes a negative net into the counter.
