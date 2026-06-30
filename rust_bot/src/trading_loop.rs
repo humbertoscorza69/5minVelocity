@@ -519,6 +519,8 @@ pub async fn run_decision_task(
     // updates after the (possibly slow) execution task records the order, so we
     // cannot rely on it to prevent same-market re-entry within the lag window.
     let mut v2_entered: HashSet<String> = HashSet::new();
+    // Throttle the settlement-booking sweep to once per wall-second.
+    let mut last_settle_sweep_s: i64 = 0;
     loop {
         tokio::select! {
             maybe = klines.recv() => {
@@ -562,6 +564,41 @@ pub async fn run_decision_task(
                 if check.halted.is_some() {
                     // Halt is still active this pass: skip processing.
                     continue;
+                }
+                // SETTLEMENT BOOKING (decoupled from the relayer): the instant a
+                // bet's 5m window has closed, decide win/lose from Binance
+                // open-vs-close (the actual settlement basis) and stash it for
+                // run_positions_refresh to book P&L immediately. This makes the
+                // dashboard reflect realized P&L within ~1 min of resolution
+                // REGARDLESS of redemption (which is rate-limited and only moves
+                // the cash). Runs even when trading is OFF/disarmed (open positions
+                // still resolve). Throttled to once per wall-second.
+                let now_s = now / 1000;
+                if vcfg.enabled && now_s > last_settle_sweep_s {
+                    last_settle_sweep_s = now_s;
+                    let snap: Vec<OpenPosition> = store_state
+                        .lock()
+                        .map(|bs| bs.positions.clone())
+                        .unwrap_or_default();
+                    for p in &snap {
+                        if state.v2_settled.contains_key(&p.token_id) {
+                            continue;
+                        }
+                        let resolution = p.exit_ts_s - 300; // exit_ts_s = resolution + 300
+                        if now_s < resolution + 2 {
+                            continue; // wait for the close (resolution-1) bar to land
+                        }
+                        let epoch = resolution - 300; // 5m window open
+                        let (Some(op), Some(fin)) = (
+                            history.close_at(&p.asset, epoch - 1),
+                            history.close_at(&p.asset, resolution - 1),
+                        ) else {
+                            continue; // ring doesn't have both ends (e.g. post-restart)
+                        };
+                        let up = matches!(p.side, Outcome::Up);
+                        let won = up == (fin >= op);
+                        state.v2_settled.insert(p.token_id.clone(), won);
+                    }
                 }
                 let catalog = snapshot_catalog_for(&state, &kline.asset, kline.t_s);
                 let positions: Vec<OpenPosition> = {
@@ -962,11 +999,58 @@ pub async fn run_positions_refresh(
                         "positions_refresh: G8 P&L recorder this tick"
                     );
                 }
-                // AUTHORITATIVE settlement reconcile from the on-chain activity feed.
-                // /positions drops resolved markets before the poll above can book
-                // them; the activity feed (BUY + REDEEM, ground truth) does not. This
-                // catches every settlement record_resolutions misses. Idempotent with
-                // the redeem-time + poll paths via the shared recorder set.
+                // PRIMARY P&L PATH (decoupled from redemption): book the settlement
+                // outcomes the decision loop computed from Binance open-vs-close.
+                // This makes realized P&L appear within ~1 min of resolution WITHOUT
+                // waiting on the (rate-limited) relayer redeem. The activity feed
+                // below stays as an idempotent audit/fallback (shared recorder set).
+                {
+                    let settled: Vec<(String, bool)> = state
+                        .v2_settled
+                        .iter()
+                        .map(|e| (e.key().clone(), *e.value()))
+                        .collect();
+                    let mut booked = 0u32;
+                    for (token, won) in settled {
+                        let did = match recorder.lock() {
+                            Ok(mut r) => crate::pnl_recorder::record_settled(
+                                &token,
+                                if won { 1.0 } else { 0.0 },
+                                "settlement",
+                                &bs,
+                                &guards,
+                                &mut r,
+                                oplog.as_ref(),
+                                now_ms(),
+                            ),
+                            Err(_) => false,
+                        };
+                        state.v2_settled.remove(&token);
+                        if did {
+                            booked += 1;
+                            if let Some((_, pred)) = state.v2_pred.remove(&token) {
+                                if let Ok(mut r) = recal.lock() {
+                                    r.record(pred, won);
+                                }
+                            }
+                        }
+                    }
+                    if booked > 0 {
+                        let (bias, n) = recal.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
+                        if let Ok(r) = recal.lock() {
+                            let _ = crate::v2::save_recal(&r, &recal_path);
+                        }
+                        oplog.sys("v2_recal_update", serde_json::json!({
+                            "fed": booked, "bias": bias, "samples": n, "source": "settlement",
+                        }));
+                        info!(booked, bias, samples = n,
+                            "positions_refresh: settlements booked from Binance close (decoupled from redeem)");
+                    }
+                }
+                // AUDIT/FALLBACK reconcile from the on-chain activity feed (exact
+                // payout). Idempotent with the settlement path above via the shared
+                // recorder set -- catches anything the Binance path missed (e.g.
+                // positions opened before a restart, when the price ring is cold).
                 match rest.get_activity(300).await {
                     Ok(rows) => {
                         let booked = match recorder.lock() {

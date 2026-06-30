@@ -157,6 +157,11 @@ pub struct SharedState {
     /// refresh recal feed when the market resolves (→ `(pred, won)` into the
     /// rolling recalibrator). Empty when v2 is disabled.
     pub v2_pred: DashMap<String, f64>,
+    /// v2 SETTLEMENT outcome (token id → won), computed by the decision loop from
+    /// Binance open-vs-close the moment a window resolves -- INDEPENDENT of the
+    /// relayer redeem. Drained by `run_positions_refresh` to book P&L immediately,
+    /// so the dashboard never waits on (rate-limited) redemption. Empty when v2 off.
+    pub v2_settled: DashMap<String, bool>,
     /// PIECE 4 (active-only enrichment): per-token RESOLUTION flag derived from
     /// the data-api `/positions` snapshot (redeemable OR cur_price ∈ {0,1} OR
     /// end_date past). Updated periodically by `run_positions_refresh`. Missing
@@ -188,6 +193,7 @@ impl SharedState {
             tick_throttle_ms: AtomicI64::new(200),
             balance_milli: AtomicI64::new(-1),
             v2_pred: DashMap::new(),
+            v2_settled: DashMap::new(),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),
             started_at: Instant::now(),
