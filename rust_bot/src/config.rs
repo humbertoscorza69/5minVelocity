@@ -88,6 +88,12 @@ pub struct V2Config {
     /// Reference edge at which we stake `stakes.base_usdc` (linear edge sizing).
     #[serde(default = "d_edge_ref")]
     pub edge_ref: f64,
+    /// Min vol-normalized displacement `z` to enter. Below this the move is in the
+    /// calibration's near-zero region (win prob ~0.5) and is NOT predictive live --
+    /// the key fix for the bot firing on noise at window open. 0.45 ~= the 0.68
+    /// May-win-rate knot (the backtested edge region).
+    #[serde(default = "d_z_min")]
+    pub z_min: f64,
     /// Min seconds-to-settle for an entry (avoid the last-N-seconds chop).
     #[serde(default = "d_v2_min_ttl")]
     pub min_ttl_s: i64,
@@ -113,6 +119,7 @@ fn d_edge_min() -> f64 { 0.04 }
 fn d_vol_cap() -> f64 { 1.0 }
 fn d_dvr_floor() -> f64 { 0.2 }
 fn d_edge_ref() -> f64 { 0.08 }
+fn d_z_min() -> f64 { 0.45 }
 fn d_v2_min_ttl() -> i64 { 30 }
 fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
@@ -127,6 +134,7 @@ impl Default for V2Config {
             vol_cap: d_vol_cap(),
             dvr_floor: d_dvr_floor(),
             edge_ref: d_edge_ref(),
+            z_min: d_z_min(),
             min_ttl_s: d_v2_min_ttl(),
             recal_capacity: d_recal_capacity(),
             recal_warmup: d_recal_warmup(),

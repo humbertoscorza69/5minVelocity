@@ -556,7 +556,9 @@ pub fn record_settled(
 /// in bs.positions, find its market (condition_id, via the bot's own BUY trade
 /// rows) and, if that market has a REDEEM row, book it: payout>0 => WIN (1.0),
 /// payout==0 => LOSS (0.0). Cost basis still comes from bs (exact bot fills).
-/// Idempotent via the shared recorder set. Returns the number of newly recorded.
+/// Idempotent via the shared recorder set. Returns the (token_id, won) pairs newly
+/// booked this call, so the caller can feed the rolling recalibrator with TRUE
+/// outcomes (its only reliable win/lose source -- the self-heal depends on it).
 pub fn record_from_activity(
     rows: &[crate::rest::ActivityRow],
     bs: &SharedBotState,
@@ -564,17 +566,18 @@ pub fn record_from_activity(
     recorder: &mut PnlRecorder,
     oplog: &OpLog,
     now_ms_arg: i64,
-) -> usize {
+) -> Vec<(String, bool)> {
     use crate::rest::ActivityKind;
     use std::collections::HashMap;
 
+    let mut booked: Vec<(String, bool)> = Vec::new();
     // Bot tokens currently open (the ones we still need to settle).
     let bot_tokens: HashSet<String> = match bs.lock() {
         Ok(g) => g.positions.iter().map(|p| p.token_id.clone()).collect(),
-        Err(_) => return 0,
+        Err(_) => return booked,
     };
     if bot_tokens.is_empty() {
-        return 0;
+        return booked;
     }
 
     // token -> condition (from the bot's own BUY trade rows in the feed).
@@ -599,19 +602,19 @@ pub fn record_from_activity(
         }
     }
 
-    let mut recorded = 0usize;
     for token in &bot_tokens {
         if recorder.already_recorded(token) {
             continue;
         }
         let Some(cond) = tok_cond.get(token) else { continue };
         let Some(payout) = cond_payout.get(cond) else { continue }; // no REDEEM yet => unsettled
-        let resolved_price = if *payout > 1e-9 { 1.0 } else { 0.0 };
+        let won = *payout > 1e-9;
+        let resolved_price = if won { 1.0 } else { 0.0 };
         if record_settled(token, resolved_price, "activity", bs, guards, recorder, oplog, now_ms_arg) {
-            recorded += 1;
+            booked.push((token.clone(), won));
         }
     }
-    recorded
+    booked
 }
 
 // ============================================================================

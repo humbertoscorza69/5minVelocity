@@ -71,9 +71,15 @@ enabled = true
 # 0.06 (was 0.04): sweep showed total holds (~$3231 vs $3184) with higher EV/trade
 # + better Sharpe — drops the marginal 0.04-0.06 trades. Near-free tune.
 edge_min = 0.06
+# z_min: minimum vol-normalized displacement to enter. THE fix for firing on
+# noise at the window open -- live showed the bot entered ~every window at ~0.9bps
+# displacement (z~0.1) where pcal was a bogus ~0.59. 0.45 = the May knot whose
+# win rate is ~0.68 (the real backtested edge region). Sub-second polling stays
+# ON; this gate makes it only fire on a REAL move.
+z_min = 0.45
 # tick_driven: evaluate the entry on sub-second Binance aggTrades (freshest price)
-# instead of waiting for the 1s bar close. Recovers ~+15-25% EV (lumpy, big on
-# fast movers). CANNOT be backtested -> forward-validate live; flip false to revert.
+# instead of waiting for the 1s bar close. KEPT ON (speed is good) -- the z_min
+# gate above is what stops it firing on noise. Flip false to revert to 1s bars.
 tick_driven = true
 # min ms between tick-driven evaluations (throttle the aggTrade firehose).
 tick_throttle_ms = 200

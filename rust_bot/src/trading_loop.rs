@@ -371,12 +371,15 @@ pub fn process_kline_v2(
         else {
             continue;
         };
-        // v2 gate uses edge_min/vol_cap/dvr_floor from config (v2.rs consts are
-        // the defaults; config can override).
+        // v2 gate uses edge_min/vol_cap/dvr_floor/z_min from config (v2.rs consts
+        // are the defaults; config can override). The z_min gate is the fix for
+        // firing on near-zero displacement at the window open: require a REAL
+        // vol-normalized move before betting.
         if f.vol_bps > vcfg.vol_cap
             || f.dvr < vcfg.dvr_floor
             || f.edge < vcfg.edge_min
             || f.disp_bps <= 0.0
+            || f.z < vcfg.z_min
         {
             continue;
         }
@@ -966,17 +969,40 @@ pub async fn run_positions_refresh(
                 // the redeem-time + poll paths via the shared recorder set.
                 match rest.get_activity(300).await {
                     Ok(rows) => {
-                        let n = match recorder.lock() {
+                        let booked = match recorder.lock() {
                             Ok(mut r) => crate::pnl_recorder::record_from_activity(
                                 &rows, &bs, &guards, &mut r, oplog.as_ref(), now_ms(),
                             ),
                             Err(_) => {
                                 warn!("positions_refresh: recorder poisoned; skip activity reconcile");
-                                0
+                                Vec::new()
                             }
                         };
-                        if n > 0 {
-                            info!(recorded = n, "positions_refresh: settlements booked from activity feed");
+                        if !booked.is_empty() {
+                            info!(recorded = booked.len(), "positions_refresh: settlements booked from activity feed");
+                            // Self-heal: feed the recalibrator with TRUE outcomes (the
+                            // activity payout). This is the only reliable win/lose source;
+                            // if live underperforms the May calibration, the rolling bias
+                            // grows and shrinks pcal -> fewer/again-profitable entries.
+                            let mut fed = 0u32;
+                            for (token, won) in &booked {
+                                if let Some((_, pred)) = state.v2_pred.remove(token) {
+                                    if let Ok(mut r) = recal.lock() {
+                                        r.record(pred, *won);
+                                        fed += 1;
+                                    }
+                                }
+                            }
+                            if fed > 0 {
+                                let (bias, n) = recal.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
+                                if let Ok(r) = recal.lock() {
+                                    let _ = crate::v2::save_recal(&r, &recal_path);
+                                }
+                                oplog.sys("v2_recal_update", serde_json::json!({
+                                    "fed": fed, "bias": bias, "samples": n, "source": "activity",
+                                }));
+                                info!(fed, bias, samples = n, "v2 recalibration updated (activity truth)");
+                            }
                         }
                     }
                     Err(e) => warn!(error = %e, "positions_refresh: get_activity failed; will retry next tick"),

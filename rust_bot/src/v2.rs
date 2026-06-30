@@ -36,6 +36,11 @@ pub const EDGE_MIN: f64 = 0.04;
 pub const VOL_CAP: f64 = 1.0;
 /// Light disp/vel floor: drop genuine coin-flip spikes only.
 pub const DVR_FLOOR: f64 = 0.2;
+/// Minimum vol-normalized displacement to enter. Below this the move is in the
+/// calibration's unreliable near-zero region (win prob ~0.5-0.59) and live results
+/// showed it is NOT predictive -- so require a REAL displacement. 0.45 targets the
+/// CAL_Z knot whose May win rate is ~0.68 (the backtested edge region).
+pub const Z_MIN: f64 = 0.45;
 
 /// Frozen win-probability calibration (May, paper_bot.py). `pcal` linearly
 /// interpolates `CAL_W` over `CAL_Z`, clamped at the endpoints.
@@ -46,8 +51,18 @@ pub const CAL_W: [f64; 8] = [0.593, 0.680, 0.780, 0.833, 0.877, 0.923, 0.951, 0.
 /// the frozen calibration, clamped to `[CAL_W.first, CAL_W.last]` outside the knots.
 #[must_use]
 pub fn pcal(z: f64) -> f64 {
-    if z <= CAL_Z[0] {
-        return CAL_W[0];
+    // DRIFTLESS BASELINE (fix): zero vol-normalized displacement => 50/50. The May
+    // knots start at z=0.14 (0.593); the old code CLAMPED everything below 0.14 to
+    // 0.593, so near-zero displacement (z~0.02-0.13, i.e. the window just opened and
+    // nothing moved) was scored ~0.59 win and cleared the edge gate -> the bot fired
+    // on noise every window. We now interpolate the [0, 0.14) region down to
+    // (0.0, 0.5) so a non-move is correctly ~0.5 (negative edge -> no trade).
+    if z <= 0.0 {
+        return 0.5;
+    }
+    if z < CAL_Z[0] {
+        let t = z / CAL_Z[0];
+        return 0.5 + t * (CAL_W[0] - 0.5);
     }
     let n = CAL_Z.len();
     if z >= CAL_Z[n - 1] {
@@ -163,6 +178,9 @@ pub fn gate(f: &Features) -> Gate {
     }
     if f.disp_bps <= 0.0 {
         return Gate::Skip("no_disp"); // displacement must favor our side
+    }
+    if f.z < Z_MIN {
+        return Gate::Skip("z_min"); // displacement too small to be predictive
     }
     if f.dvr < DVR_FLOOR {
         return Gate::Skip("dvr_floor");
@@ -490,13 +508,17 @@ mod tests {
 
     #[test]
     fn pcal_endpoints_and_monotonic() {
-        assert!(approx(pcal(-1.0), CAL_W[0], 1e-12)); // clamp low
+        // DRIFTLESS BASELINE: z<=0 => 0.5 (a non-move is a coin flip), not 0.593.
+        assert!(approx(pcal(-1.0), 0.5, 1e-12));
+        assert!(approx(pcal(0.0), 0.5, 1e-12));
+        // [0, 0.14) interpolates (0,0.5) -> (0.14,0.593): midpoint ~0.5465.
+        assert!(approx(pcal(0.07), 0.5 + 0.5 * (0.593 - 0.5), 1e-9));
         assert!(approx(pcal(0.14), 0.593, 1e-9)); // first knot
         assert!(approx(pcal(10.49), 0.964, 1e-9)); // last knot
         assert!(approx(pcal(99.0), CAL_W[7], 1e-12)); // clamp high
         // strictly increasing across the knots
         let mut prev = pcal(-5.0);
-        for z in [0.0, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 5.0, 11.0] {
+        for z in [0.0, 0.07, 0.3, 0.6, 1.0, 1.5, 2.0, 3.0, 5.0, 11.0] {
             let p = pcal(z);
             assert!(p >= prev - 1e-12, "pcal must be non-decreasing at z={z}");
             prev = p;
