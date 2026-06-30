@@ -27,8 +27,7 @@ use polymarket_client_sdk_v2::clob::types::request::{
 };
 use polymarket_client_sdk_v2::clob::types::{AssetType, SignatureType};
 pub use polymarket_client_sdk_v2::clob::types::Side;
-use polymarket_client_sdk_v2::data::types::request::{ActivityRequest, PositionsRequest};
-use polymarket_client_sdk_v2::data::types::ActivityType;
+use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::{POLYGON, Result as SdkResult, clob, data};
 use tracing::debug;
@@ -287,27 +286,56 @@ impl RestClient {
     /// `/positions` — does NOT drop resolved markets, so it is the reliable basis
     /// for booking settlements. Newest first. `limit` is clamped to [1, 500].
     pub async fn get_activity(&self, limit: i32) -> anyhow::Result<Vec<ActivityRow>> {
+        // We hit the public data-api directly (not the SDK's typed client) and parse
+        // leniently: the SDK's strict B256/U256 field types reject some live rows
+        // with "invalid string length", killing the whole batch. We only need a few
+        // fields, so a tolerant serde_json::Value parse is both simpler and robust.
         let limit = limit.clamp(1, 500);
-        let req = ActivityRequest::builder()
-            .user(self.funder)
-            .activity_types(vec![ActivityType::Trade, ActivityType::Redeem])
-            .limit(limit)
-            .map_err(|e| anyhow!("activity limit: {e}"))?
-            .build();
-        let acts = self.retrying("get_activity", || self.data.activity(&req)).await?;
-        Ok(acts
-            .into_iter()
-            .map(|a| ActivityRow {
-                condition_id: a.condition_id.map(|c| format!("{c:#x}")).unwrap_or_default(),
-                token_id: a.asset.map(|x| x.to_string()),
-                kind: match a.activity_type {
-                    ActivityType::Trade => ActivityKind::Trade,
-                    ActivityType::Redeem => ActivityKind::Redeem,
+        let user = format!("{:#x}", self.funder);
+        let url = format!(
+            "https://data-api.polymarket.com/activity?user={user}&limit={limit}&type=TRADE,REDEEM&sortDirection=DESC"
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| anyhow!("activity client build: {e}"))?;
+        let resp = client.get(&url).send().await.map_err(|e| anyhow!("activity GET: {e}"))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("activity json (status {status}): {e}"))?;
+        let arr = body.as_array().cloned().unwrap_or_default();
+        // number-or-string -> f64
+        fn num(v: &serde_json::Value) -> Option<f64> {
+            v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        }
+        Ok(arr
+            .iter()
+            .map(|v| {
+                let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                let kind = match typ.to_ascii_uppercase().as_str() {
+                    "TRADE" => ActivityKind::Trade,
+                    "REDEEM" => ActivityKind::Redeem,
                     _ => ActivityKind::Other,
-                },
-                is_buy: a.side == Some(polymarket_client_sdk_v2::data::types::Side::Buy),
-                usdc: dec_to_f64(a.usdc_size),
-                ts: a.timestamp,
+                };
+                let side = v.get("side").and_then(|x| x.as_str()).unwrap_or("");
+                ActivityRow {
+                    condition_id: v
+                        .get("conditionId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase(),
+                    token_id: v
+                        .get("asset")
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                    kind,
+                    is_buy: side.eq_ignore_ascii_case("BUY"),
+                    usdc: v.get("usdcSize").and_then(num).unwrap_or(0.0),
+                    ts: v.get("timestamp").and_then(|x| x.as_i64()).unwrap_or(0),
+                }
             })
             .collect())
     }
