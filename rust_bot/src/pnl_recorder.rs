@@ -512,20 +512,19 @@ pub fn record_resolutions(
     stats
 }
 
-/// Record P&L for a WINNER detected via successful on-chain redemption.
+/// Record P&L for a bot position whose market has SETTLED, with the known
+/// outcome `resolved_price` (1.0 = won, 0.0 = lost). Cost basis comes from
+/// bs.positions (the bot's actual fills). `source` labels the trigger in the
+/// oplog (e.g. "redeem", "activity").
 ///
-/// Winners get auto-redeemed and VANISH from `/positions` (often between the
-/// 60s `record_resolutions` polls), so the poll-based path frequently never
-/// sees them as resolved -- the redeem event is their only reliable capture
-/// point. A redeemed position is by definition the WINNING side, so the outcome
-/// price is 1.0 (payout = shares).
-///
-/// IDEMPOTENT against `record_resolutions`: both share the same `recorder` set,
-/// so whichever path fires first records, the other no-ops. Returns true iff a
-/// new row was written. Mirrors the steady-state pipeline exactly
-/// (persist -> counter -> remove).
-pub fn record_redeemed_win(
+/// IDEMPOTENT: the shared `recorder` set is keyed by token_id, so whichever path
+/// (redeem-time, activity reconcile, or the /positions poll) fires first records,
+/// the others no-op. Returns true iff a new row was written. Mirrors the
+/// steady-state pipeline exactly (persist -> counter -> remove).
+pub fn record_settled(
     token_id: &str,
+    resolved_price: f64,
+    source: &str,
     bs: &SharedBotState,
     guards: &Arc<Mutex<Guards>>,
     recorder: &mut PnlRecorder,
@@ -533,12 +532,12 @@ pub fn record_redeemed_win(
     now_ms_arg: i64,
 ) -> bool {
     if recorder.already_recorded(token_id) {
-        return false; // record_resolutions (or a prior redeem) already got it.
+        return false; // another path already recorded it.
     }
     let mut bs_lock = match bs.lock() {
         Ok(g) => g,
         Err(_) => {
-            warn!(token = %token_id, "record_redeemed_win: bs.positions mutex POISONED; skip");
+            warn!(token = %token_id, "record_settled: bs.positions mutex POISONED; skip");
             return false;
         }
     };
@@ -548,7 +547,7 @@ pub fn record_redeemed_win(
         .filter(|bp| bp.token_id == token_id)
         .collect();
     if bot_lots.is_empty() {
-        // Already removed (record_resolutions caught it) or a manual position.
+        // Already removed or a manual (non-bot) position.
         return false;
     }
     let total_shares: f64 = bot_lots.iter().map(|bp| bp.shares.to_f64().unwrap_or(0.0)).sum();
@@ -560,7 +559,6 @@ pub fn record_redeemed_win(
         return false;
     }
     let avg_entry = total_cost / total_shares;
-    let resolved_price = 1.0_f64; // redeemed == winning side.
     let net = compute_resolution_net_pnl(total_shares, avg_entry, resolved_price);
 
     // (persist FIRST -- crash barrier)
@@ -574,7 +572,7 @@ pub fn record_redeemed_win(
     };
     if let Err(e) = recorder.record(rec) {
         warn!(token = %token_id, error = %e,
-            "record_redeemed_win: persist failed; skip counter+remove (retry on next redeem tick)");
+            "record_settled: persist failed; skip counter+remove (retry next tick)");
         return false;
     }
     // (counter)
@@ -582,24 +580,105 @@ pub fn record_redeemed_win(
     if let Ok(mut g) = guards.lock() {
         g.record_net_pnl(net_dec, now_ms_arg);
     } else {
-        warn!(token = %token_id, "record_redeemed_win: guards mutex poisoned -- net persisted but not counted");
+        warn!(token = %token_id, "record_settled: guards mutex poisoned -- net persisted but not counted");
     }
     // (cleanup)
     bs_lock.positions.retain(|bp| bp.token_id != token_id);
+    // Emits "pnl_recorder_recorded" (the dashboard EXCLUDES this kind from its
+    // oplog walk to avoid double-counting the pnl_recorded.jsonl row).
     oplog.sys(
-        "pnl_recorded_at_redeem",
+        "pnl_recorder_recorded",
         serde_json::json!({
             "token_id": token_id,
             "shares": total_shares,
             "entry_price": avg_entry,
             "resolved_price": resolved_price,
             "net_pnl": net,
+            "source": source,
             "ts_ms": now_ms_arg,
         }),
     );
-    info!(token = %token_id, shares = total_shares, entry = avg_entry, net_pnl = net,
-        "pnl_recorder: recorded WIN at redeem-time");
+    info!(token = %token_id, resolved_price, net_pnl = net, source,
+        "pnl_recorder: recorded settled position");
     true
+}
+
+/// Convenience: a redeemed position is by definition the WINNING side.
+pub fn record_redeemed_win(
+    token_id: &str,
+    bs: &SharedBotState,
+    guards: &Arc<Mutex<Guards>>,
+    recorder: &mut PnlRecorder,
+    oplog: &OpLog,
+    now_ms_arg: i64,
+) -> bool {
+    record_settled(token_id, 1.0, "redeem", bs, guards, recorder, oplog, now_ms_arg)
+}
+
+/// AUTHORITATIVE settlement reconciliation from the on-chain activity feed.
+///
+/// `/positions` drops resolved markets before the periodic poll sees them, so
+/// resolutions silently slip through. The activity feed (BUY trades + REDEEMs)
+/// is the ground truth and never drops anything. For each bot token still open
+/// in bs.positions, find its market (condition_id, via the bot's own BUY trade
+/// rows) and, if that market has a REDEEM row, book it: payout>0 => WIN (1.0),
+/// payout==0 => LOSS (0.0). Cost basis still comes from bs (exact bot fills).
+/// Idempotent via the shared recorder set. Returns the number of newly recorded.
+pub fn record_from_activity(
+    rows: &[crate::rest::ActivityRow],
+    bs: &SharedBotState,
+    guards: &Arc<Mutex<Guards>>,
+    recorder: &mut PnlRecorder,
+    oplog: &OpLog,
+    now_ms_arg: i64,
+) -> usize {
+    use crate::rest::ActivityKind;
+    use std::collections::HashMap;
+
+    // Bot tokens currently open (the ones we still need to settle).
+    let bot_tokens: HashSet<String> = match bs.lock() {
+        Ok(g) => g.positions.iter().map(|p| p.token_id.clone()).collect(),
+        Err(_) => return 0,
+    };
+    if bot_tokens.is_empty() {
+        return 0;
+    }
+
+    // token -> condition (from the bot's own BUY trade rows in the feed).
+    let mut tok_cond: HashMap<String, String> = HashMap::new();
+    // condition -> total redeem payout (USDC); presence => the market settled.
+    let mut cond_payout: HashMap<String, f64> = HashMap::new();
+    for r in rows {
+        match r.kind {
+            ActivityKind::Trade => {
+                if let Some(t) = &r.token_id {
+                    if bot_tokens.contains(t) && !r.condition_id.is_empty() {
+                        tok_cond.insert(t.clone(), r.condition_id.clone());
+                    }
+                }
+            }
+            ActivityKind::Redeem => {
+                if !r.condition_id.is_empty() {
+                    *cond_payout.entry(r.condition_id.clone()).or_insert(0.0) += r.usdc;
+                }
+            }
+            ActivityKind::Other => {}
+        }
+    }
+
+    let mut recorded = 0usize;
+    for token in &bot_tokens {
+        if recorder.already_recorded(token) {
+            continue;
+        }
+        let Some(cond) = tok_cond.get(token) else { continue };
+        let Some(payout) = cond_payout.get(cond) else { continue }; // no REDEEM yet => unsettled
+        let resolved_price = if *payout > 1e-9 { 1.0 } else { 0.0 };
+        if record_settled(token, resolved_price, "activity", bs, guards, recorder, oplog, now_ms_arg) {
+            recorded += 1;
+        }
+    }
+    recorded
 }
 
 // ============================================================================

@@ -957,6 +957,28 @@ pub async fn run_positions_refresh(
                         "positions_refresh: G8 P&L recorder this tick"
                     );
                 }
+                // AUTHORITATIVE settlement reconcile from the on-chain activity feed.
+                // /positions drops resolved markets before the poll above can book
+                // them; the activity feed (BUY + REDEEM, ground truth) does not. This
+                // catches every settlement record_resolutions misses. Idempotent with
+                // the redeem-time + poll paths via the shared recorder set.
+                match rest.get_activity(300).await {
+                    Ok(rows) => {
+                        let n = match recorder.lock() {
+                            Ok(mut r) => crate::pnl_recorder::record_from_activity(
+                                &rows, &bs, &guards, &mut r, oplog.as_ref(), now_ms(),
+                            ),
+                            Err(_) => {
+                                warn!("positions_refresh: recorder poisoned; skip activity reconcile");
+                                0
+                            }
+                        };
+                        if n > 0 {
+                            info!(recorded = n, "positions_refresh: settlements booked from activity feed");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "positions_refresh: get_activity failed; will retry next tick"),
+                }
             }
             _ = shutdown.changed() => if *shutdown.borrow() {
                 info!("positions_refresh: shutdown");

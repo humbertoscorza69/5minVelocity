@@ -27,7 +27,8 @@ use polymarket_client_sdk_v2::clob::types::request::{
 };
 use polymarket_client_sdk_v2::clob::types::{AssetType, SignatureType};
 pub use polymarket_client_sdk_v2::clob::types::Side;
-use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::data::types::request::{ActivityRequest, PositionsRequest};
+use polymarket_client_sdk_v2::data::types::ActivityType;
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::{POLYGON, Result as SdkResult, clob, data};
 use tracing::debug;
@@ -46,6 +47,35 @@ pub struct BalanceInfo {
     pub balance_raw: f64,
     /// Number of spender contracts with an allowance set.
     pub allowance_contracts: usize,
+}
+
+/// Activity kind we care about for P&L (from data-api `/activity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// A BUY/SELL of outcome tokens (we record cost from BUYs).
+    Trade,
+    /// Redeeming a resolved position for collateral (payout > 0 = win, 0 = loss).
+    Redeem,
+    /// Split / merge / reward / etc. — ignored for P&L.
+    Other,
+}
+
+/// One on-chain activity row (simplified from data-api `/activity`). The feed is
+/// the GROUND TRUTH for realized P&L and never drops resolved markets, so it is
+/// the reliable basis for booking settlements that `/positions` loses.
+#[derive(Debug, Clone)]
+pub struct ActivityRow {
+    /// CTF condition_id, `"0x"`-prefixed lowercase hex. May be "" for some kinds.
+    pub condition_id: String,
+    /// Outcome token id (decimal string), when present (Trade rows carry it).
+    pub token_id: Option<String>,
+    pub kind: ActivityKind,
+    /// For a Trade: true if BUY (cost), false if SELL.
+    pub is_buy: bool,
+    /// USDC value of the activity (payout for Redeem, notional for Trade).
+    pub usdc: f64,
+    /// Unix seconds.
+    pub ts: i64,
 }
 
 /// One open position (from data-api `/positions`).
@@ -247,6 +277,37 @@ impl RestClient {
                 end_date: p.end_date,
                 // G5: B256 -> "0x..." lowercase hex (32 bytes = 64 hex chars).
                 condition_id: format!("{:#x}", p.condition_id),
+            })
+            .collect())
+    }
+
+    /// On-chain activity (BUY trades + REDEEMs) for the funder/proxy wallet, from
+    /// the public data-api `/activity`. This is the GROUND TRUTH for realized P&L
+    /// (the same source as a Polymarket history CSV export) and — unlike
+    /// `/positions` — does NOT drop resolved markets, so it is the reliable basis
+    /// for booking settlements. Newest first. `limit` is clamped to [1, 500].
+    pub async fn get_activity(&self, limit: i32) -> anyhow::Result<Vec<ActivityRow>> {
+        let limit = limit.clamp(1, 500);
+        let req = ActivityRequest::builder()
+            .user(self.funder)
+            .activity_types(vec![ActivityType::Trade, ActivityType::Redeem])
+            .limit(limit)
+            .map_err(|e| anyhow!("activity limit: {e}"))?
+            .build();
+        let acts = self.retrying("get_activity", || self.data.activity(&req)).await?;
+        Ok(acts
+            .into_iter()
+            .map(|a| ActivityRow {
+                condition_id: a.condition_id.map(|c| format!("{c:#x}")).unwrap_or_default(),
+                token_id: a.asset.map(|x| x.to_string()),
+                kind: match a.activity_type {
+                    ActivityType::Trade => ActivityKind::Trade,
+                    ActivityType::Redeem => ActivityKind::Redeem,
+                    _ => ActivityKind::Other,
+                },
+                is_buy: a.side == Some(polymarket_client_sdk_v2::data::types::Side::Buy),
+                usdc: dec_to_f64(a.usdc_size),
+                ts: a.timestamp,
             })
             .collect())
     }
