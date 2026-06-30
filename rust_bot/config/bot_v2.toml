@@ -77,10 +77,13 @@ edge_min = 0.06
 # win rate is ~0.68 (the real backtested edge region). Sub-second polling stays
 # ON; this gate makes it only fire on a REAL move.
 z_min = 0.45
-# tick_driven: evaluate the entry on sub-second Binance aggTrades (freshest price)
-# instead of waiting for the 1s bar close. KEPT ON (speed is good) -- the z_min
-# gate above is what stops it firing on noise. Flip false to revert to 1s bars.
-tick_driven = true
+# tick_driven: OFF. Live diagnosis (Jun 30) showed the edge is ALIVE in the
+# recorder (~70% win every day on 1s bars) but live only got 57-59% even on
+# zero-slippage fills -- because tick-driven computes z from NOISY sub-second
+# aggTrade prices and fires on transient spikes a 1s bar would smooth away. The
+# 70% backtest IS the 1s-bar (tick_driven=false) path, so this should recover the
+# edge. Sub-second speed turned out to HURT (noisier entries), not help.
+tick_driven = false
 # min ms between tick-driven evaluations (throttle the aggTrade firehose).
 tick_throttle_ms = 200
 vol_cap = 1.0
