@@ -152,7 +152,16 @@ pub enum PnlRecord {
         entry_price: f64, // average across lots, if multiple
         resolved_price: f64, // exactly 0.0 or 1.0 post-sanity-check
         net_pnl: f64,
+        /// Which market interval this trade was ("5m" | "15m"). Lets the dashboard
+        /// break P&L / win-rate / PF out per strategy. Defaults to "5m" for old
+        /// rows written before per-interval trading existed.
+        #[serde(default = "d_interval_5m")]
+        interval: String,
     },
+}
+
+fn d_interval_5m() -> String {
+    "5m".to_string()
 }
 
 impl PnlRecord {
@@ -371,6 +380,7 @@ pub fn record_resolutions(
             continue;
         }
         let avg_entry = total_cost / total_shares;
+        let interval = bot_lots.first().map(|b| b.interval.clone()).unwrap_or_else(d_interval_5m);
 
         if initial_pass {
             // STARTUP path: write InitialSnapshot row, remove from bs.positions,
@@ -407,6 +417,7 @@ pub fn record_resolutions(
             entry_price: avg_entry,
             resolved_price,
             net_pnl: net,
+            interval: interval.clone(),
         };
         if let Err(e) = recorder.record(rec) {
             warn!(error = %e, token = %p.token_id,
@@ -441,6 +452,7 @@ pub fn record_resolutions(
                 "resolved_price": resolved_price,
                 "net_pnl": net,
                 "ts_ms": now_ms_arg,
+                "interval": interval,
             }),
         );
         info!(
@@ -504,6 +516,7 @@ pub fn record_settled(
         return false;
     }
     let avg_entry = total_cost / total_shares;
+    let interval = bot_lots.first().map(|b| b.interval.clone()).unwrap_or_else(d_interval_5m);
     let net = compute_resolution_net_pnl(total_shares, avg_entry, resolved_price);
 
     // (persist FIRST -- crash barrier)
@@ -514,6 +527,7 @@ pub fn record_settled(
         entry_price: avg_entry,
         resolved_price,
         net_pnl: net,
+        interval: interval.clone(),
     };
     if let Err(e) = recorder.record(rec) {
         warn!(token = %token_id, error = %e,
@@ -541,9 +555,10 @@ pub fn record_settled(
             "net_pnl": net,
             "source": source,
             "ts_ms": now_ms_arg,
+            "interval": interval,
         }),
     );
-    info!(token = %token_id, resolved_price, net_pnl = net, source,
+    info!(token = %token_id, resolved_price, net_pnl = net, source, %interval,
         "pnl_recorder: recorded settled position");
     true
 }
@@ -934,6 +949,7 @@ mod tests {
             entry_price: 0.4,
             resolved_price: 0.0,
             net_pnl: -0.4168,
+            interval: "5m".to_string(),
         };
         r.record(rec.clone()).unwrap();
         assert!(r.already_recorded("0xabc"));
@@ -1104,6 +1120,7 @@ mod tests {
                 entry_price: 0.4,
                 resolved_price: 0.0,
                 net_pnl: -0.4168,
+                interval: "5m".to_string(),
             })
             .unwrap();
         let oplog = mk_oplog();

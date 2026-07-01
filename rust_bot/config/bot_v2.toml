@@ -11,11 +11,11 @@ default = "paper"
 live_confirmation_required = true
 
 [markets]
-# v2 (5minSnip) is validated on 5-MINUTE markets ONLY. The pcal(z) calibration
-# + walk-forward were fit on 5m; 15m has different settle dynamics (unvalidated),
-# AND running BTC:5m + BTC:15m at once just doubles correlated BTC exposure.
-# So: 5m only. (Re-add "15m" here to experiment later.)
-intervals = ["5m"]
+# 5m + 15m. 15m runs as its OWN strategy (see [v2.i15m]): late-entry only, higher
+# z_min, price cap, and its OWN calibration curve + recalibrator. The 15m late-entry
+# edge (+0.10 EV/$1 in the June recorder) is distinct from the 5m edge; the two
+# never share a recal so they can't cross-bias.
+intervals = ["5m", "15m"]
 assets = ["BTC", "ETH"]
 polymarket_token_ids = []
 discovery_lookahead = 2
@@ -93,6 +93,30 @@ min_ttl_s = 30
 recal_capacity = 300
 recal_warmup = 50
 recal_path = "data/v2/recal.json"
+
+# 15-MINUTE market as its own strategy. Defaults encode the validated 15m spec
+# (interval_15m_study, June recorder OOS):
+#   * enabled: turn 15m trading on/off independently of 5m.
+#   * z_min 0.80: 15m wins ~75% at z>=0.80 (vs ~67% at 0.45) — stricter than 5m.
+#   * late_entry_max_ttl_s 360: only enter in the last 6 min of the 900s window,
+#     where the edge lives (+0.10 EV/$1 vs +0.003 early).
+#   * max_ask 0.70: quality cap — EV/$1 climbs from +0.12 (no cap) to +0.16 at 0.70.
+#   * its OWN recal file + its own 15m calibration curve (v2.rs CAL_*_15M).
+# These are BACKTEST-informed; the recalibrator self-heals live drift. Set
+# enabled=false to instantly revert to 5m-only.
+[v2.i15m]
+enabled = true
+z_min = 0.80
+edge_min = 0.06
+max_ask = 0.70
+late_entry_max_ttl_s = 360
+recal_path = "data/v2/recal_15m.json"
+recal_capacity = 300
+recal_warmup = 50
+vol_cap = 1.0
+dvr_floor = 0.2
+edge_ref = 0.08
+min_ttl_s = 30
 
 # No [exits.cells] → every cell uses Baseline (hold-to-settle). v2 positions
 # carry exit_ts_s past resolution; the redemption task claims the winner.

@@ -1093,12 +1093,28 @@ async fn main() -> anyhow::Result<()> {
             warn!("====================================================================");
             warn!("");
         }
-        let recal_shared: std::sync::Arc<std::sync::Mutex<v2::Recalibrator>> =
-            std::sync::Arc::new(std::sync::Mutex::new(v2::load_recal(
+        // Per-interval rolling recalibrators (5m + 15m), each loaded from its own
+        // file. 5m is the original; 15m has its own so the two never cross-bias.
+        if config.v2.enabled && config.v2.i15m.enabled {
+            warn!("  15m MARKET ACTIVE: z_min={} max_ask={} late<=~{}s edge>={} recal={}",
+                config.v2.i15m.z_min, config.v2.i15m.max_ask,
+                config.v2.i15m.late_entry_max_ttl_s, config.v2.i15m.edge_min,
+                config.v2.i15m.recal_path);
+        }
+        let recal_shared = v2::RecalSet {
+            m5: std::sync::Arc::new(std::sync::Mutex::new(v2::load_recal(
                 &config.v2.recal_path,
                 config.v2.recal_capacity,
                 config.v2.recal_warmup,
-            )));
+            ))),
+            m15: std::sync::Arc::new(std::sync::Mutex::new(v2::load_recal(
+                &config.v2.i15m.recal_path,
+                config.v2.i15m.recal_capacity,
+                config.v2.i15m.recal_warmup,
+            ))),
+            path_m5: config.v2.recal_path.clone(),
+            path_m15: config.v2.i15m.recal_path.clone(),
+        };
         // Live operator controls (dashboard-adjustable): stake + on/off. Start
         // with trading ENABLED and the config stakes; the dashboard can change
         // both at runtime without a restart. (LIVE_ARMED still gates live POSTs.)
@@ -1235,8 +1251,7 @@ async fn main() -> anyhow::Result<()> {
                 state_store.state(),
                 guards_shared.clone(),
                 pnl_recorder_shared,
-                recal_shared.clone(),          // v2 rolling recalibrator (fed on resolution)
-                config.v2.recal_path.clone(),
+                recal_shared.clone(),          // v2 per-interval recalibrators (fed on resolution)
             )));
         }
         // G5-wire: auto-redeem task. ONLY in live mode AND ONLY if the

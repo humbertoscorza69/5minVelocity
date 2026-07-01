@@ -113,6 +113,10 @@ pub struct V2Config {
     /// Min ms between tick-driven evaluations (throttle the aggTrade firehose).
     #[serde(default = "d_tick_throttle")]
     pub tick_throttle_ms: i64,
+    /// 15-minute market as its OWN strategy (late-entry, higher z_min, price cap,
+    /// its own recalibrator). Absent/disabled = 5m-only (no behavior change).
+    #[serde(default)]
+    pub i15m: Interval15mCfg,
 }
 
 fn d_edge_min() -> f64 { 0.04 }
@@ -125,6 +129,113 @@ fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
 fn d_recal_path() -> String { "data/v2/recal.json".to_string() }
 fn d_tick_throttle() -> i64 { 200 }
+
+// 15-minute overrides. Defaults encode the validated 15m spec (interval_15m_study):
+// LATE entries only (last 6 min), z_min 0.80, price cap 0.70, own recal file.
+fn d_i15m_z_min() -> f64 { 0.80 }
+fn d_i15m_edge_min() -> f64 { 0.06 }
+fn d_i15m_max_ask() -> f64 { 0.70 }
+fn d_i15m_late_ttl() -> i64 { 360 }
+fn d_i15m_recal_path() -> String { "data/v2/recal_15m.json".to_string() }
+
+/// Per-interval override for the 15-minute market. Only the fields that differ from
+/// the 5m base live here; sizing (`stakes`) and vol/dvr/edge_ref are shared unless
+/// set. `enabled=false` (default) keeps the bot 5m-only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Interval15mCfg {
+    /// Trade 15m at all. Default false — must be turned on explicitly.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "d_i15m_z_min")]
+    pub z_min: f64,
+    #[serde(default = "d_i15m_edge_min")]
+    pub edge_min: f64,
+    /// Skip when `ask > max_ask` (quality cap). `>=1.0` disables the cap.
+    #[serde(default = "d_i15m_max_ask")]
+    pub max_ask: f64,
+    /// Only enter when `ttl <= late_entry_max_ttl_s` (the late-entry edge). `0` = off.
+    #[serde(default = "d_i15m_late_ttl")]
+    pub late_entry_max_ttl_s: i64,
+    /// Own rolling recalibrator (separate from 5m).
+    #[serde(default = "d_i15m_recal_path")]
+    pub recal_path: String,
+    #[serde(default = "d_recal_capacity")]
+    pub recal_capacity: usize,
+    #[serde(default = "d_recal_warmup")]
+    pub recal_warmup: usize,
+    /// Shared with 5m unless overridden.
+    #[serde(default = "d_vol_cap")]
+    pub vol_cap: f64,
+    #[serde(default = "d_dvr_floor")]
+    pub dvr_floor: f64,
+    #[serde(default = "d_edge_ref")]
+    pub edge_ref: f64,
+    #[serde(default = "d_v2_min_ttl")]
+    pub min_ttl_s: i64,
+}
+
+impl Default for Interval15mCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            z_min: d_i15m_z_min(),
+            edge_min: d_i15m_edge_min(),
+            max_ask: d_i15m_max_ask(),
+            late_entry_max_ttl_s: d_i15m_late_ttl(),
+            recal_path: d_i15m_recal_path(),
+            recal_capacity: d_recal_capacity(),
+            recal_warmup: d_recal_warmup(),
+            vol_cap: d_vol_cap(),
+            dvr_floor: d_dvr_floor(),
+            edge_ref: d_edge_ref(),
+            min_ttl_s: d_v2_min_ttl(),
+        }
+    }
+}
+
+impl V2Config {
+    /// Build the 5-minute strategy (byte-identical to the pre-15m behavior) with the
+    /// given current recal de-bias.
+    #[must_use]
+    pub fn strat_5m(&self, recal_bias: f64) -> crate::v2::IntervalStrat {
+        crate::v2::IntervalStrat {
+            enabled: self.enabled,
+            z_min: self.z_min,
+            edge_min: self.edge_min,
+            vol_cap: self.vol_cap,
+            dvr_floor: self.dvr_floor,
+            edge_ref: self.edge_ref,
+            min_ttl_s: self.min_ttl_s,
+            late_entry_max_ttl_s: 0, // 5m: no late gate
+            max_ask: 0.0,            // 5m: no price cap (its live edge includes cheap)
+            cal_z: crate::v2::CAL_Z.to_vec(),
+            cal_w: crate::v2::CAL_W.to_vec(),
+            recal_bias,
+        }
+    }
+}
+
+impl Interval15mCfg {
+    /// Build the 15-minute strategy with the given current recal de-bias. Gated by
+    /// BOTH the master `v2.enabled` and this section's `enabled`.
+    #[must_use]
+    pub fn strat(&self, master_enabled: bool, recal_bias: f64) -> crate::v2::IntervalStrat {
+        crate::v2::IntervalStrat {
+            enabled: master_enabled && self.enabled,
+            z_min: self.z_min,
+            edge_min: self.edge_min,
+            vol_cap: self.vol_cap,
+            dvr_floor: self.dvr_floor,
+            edge_ref: self.edge_ref,
+            min_ttl_s: self.min_ttl_s,
+            late_entry_max_ttl_s: self.late_entry_max_ttl_s,
+            max_ask: self.max_ask,
+            cal_z: crate::v2::CAL_Z_15M.to_vec(),
+            cal_w: crate::v2::CAL_W_15M.to_vec(),
+            recal_bias,
+        }
+    }
+}
 
 impl Default for V2Config {
     fn default() -> Self {
@@ -141,6 +252,7 @@ impl Default for V2Config {
             recal_path: d_recal_path(),
             tick_driven: false,
             tick_throttle_ms: d_tick_throttle(),
+            i15m: Interval15mCfg::default(),
         }
     }
 }

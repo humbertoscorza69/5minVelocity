@@ -47,37 +47,62 @@ pub const Z_MIN: f64 = 0.45;
 pub const CAL_Z: [f64; 8] = [0.14, 0.45, 0.80, 1.24, 1.74, 2.46, 3.82, 10.49];
 pub const CAL_W: [f64; 8] = [0.593, 0.680, 0.780, 0.833, 0.877, 0.923, 0.951, 0.964];
 
-/// Win probability for a vol-normalized displacement `z`. Linear interpolation of
-/// the frozen calibration, clamped to `[CAL_W.first, CAL_W.last]` outside the knots.
+/// 15-MINUTE win-probability calibration (its own curve — 15m settles differently
+/// than 5m). Fit from the June recorder win-by-z (interval_15m_study, section D):
+///   z[0.45,0.7)=0.603  z[0.7,1.0)=0.703  z[1.0,1.5)=0.761  z[1.5,2.5)=0.782.
+/// Knots placed at each bucket's mid; the noisy z>=2.5 tail (0.727, n=172) is held
+/// flat at 0.782 to keep the curve monotone. Below 0.45 interpolates toward 0.5
+/// (the 15m z_min gate is 0.80, so that region is never actually traded — it only
+/// exists for interpolation continuity). The 15m rolling recalibrator (its own
+/// instance) self-heals any residual bias, exactly as the 5m one does.
+pub const CAL_Z_15M: [f64; 4] = [0.57, 0.83, 1.20, 1.90];
+pub const CAL_W_15M: [f64; 4] = [0.603, 0.703, 0.761, 0.782];
+
+/// Win probability for a vol-normalized displacement `z` under an arbitrary
+/// calibration curve (`cal_z` ascending knots, `cal_w` win rates). Linear
+/// interpolation; below the first knot interpolates toward (0.0, 0.5) so a non-move
+/// is ~0.5; clamped to the last knot above the range. See `pcal` for the 5m curve.
 #[must_use]
-pub fn pcal(z: f64) -> f64 {
-    // DRIFTLESS BASELINE (fix): zero vol-normalized displacement => 50/50. The May
-    // knots start at z=0.14 (0.593); the old code CLAMPED everything below 0.14 to
-    // 0.593, so near-zero displacement (z~0.02-0.13, i.e. the window just opened and
-    // nothing moved) was scored ~0.59 win and cleared the edge gate -> the bot fired
-    // on noise every window. We now interpolate the [0, 0.14) region down to
-    // (0.0, 0.5) so a non-move is correctly ~0.5 (negative edge -> no trade).
+pub fn pcal_with(z: f64, cal_z: &[f64], cal_w: &[f64]) -> f64 {
+    let n = cal_z.len();
+    if n == 0 || cal_w.len() != n {
+        return 0.5;
+    }
+    // DRIFTLESS BASELINE: zero vol-normalized displacement => 50/50 (see the 5m
+    // note below — near-zero z must score ~0.5 so noise never clears the edge gate).
     if z <= 0.0 {
         return 0.5;
     }
-    if z < CAL_Z[0] {
-        let t = z / CAL_Z[0];
-        return 0.5 + t * (CAL_W[0] - 0.5);
+    if z < cal_z[0] {
+        let t = z / cal_z[0];
+        return 0.5 + t * (cal_w[0] - 0.5);
     }
-    let n = CAL_Z.len();
-    if z >= CAL_Z[n - 1] {
-        return CAL_W[n - 1];
+    if z >= cal_z[n - 1] {
+        return cal_w[n - 1];
     }
-    // Find the segment [i, i+1] with CAL_Z[i] <= z < CAL_Z[i+1].
     for i in 0..n - 1 {
-        if z < CAL_Z[i + 1] {
-            let (z0, z1) = (CAL_Z[i], CAL_Z[i + 1]);
-            let (w0, w1) = (CAL_W[i], CAL_W[i + 1]);
+        if z < cal_z[i + 1] {
+            let (z0, z1) = (cal_z[i], cal_z[i + 1]);
+            let (w0, w1) = (cal_w[i], cal_w[i + 1]);
             let t = (z - z0) / (z1 - z0);
             return w0 + t * (w1 - w0);
         }
     }
-    CAL_W[n - 1]
+    cal_w[n - 1]
+}
+
+/// Win probability for a vol-normalized displacement `z` under the frozen 5-MINUTE
+/// May calibration. Linear interpolation of `CAL_W` over `CAL_Z`.
+///
+/// DRIFTLESS BASELINE (fix): zero vol-normalized displacement => 50/50. The May
+/// knots start at z=0.14 (0.593); the old code CLAMPED everything below 0.14 to
+/// 0.593, so near-zero displacement (z~0.02-0.13, i.e. the window just opened and
+/// nothing moved) was scored ~0.59 win and cleared the edge gate -> the bot fired
+/// on noise every window. We now interpolate the [0, 0.14) region down to
+/// (0.0, 0.5) so a non-move is correctly ~0.5 (negative edge -> no trade).
+#[must_use]
+pub fn pcal(z: f64) -> f64 {
+    pcal_with(z, &CAL_Z, &CAL_W)
 }
 
 /// Rolling realized volatility in bps-per-second: population std of consecutive
@@ -404,6 +429,8 @@ impl PriceHistory {
         up: bool,
         ask: f64,
         recal_bias: f64,
+        cal_z: &[f64],
+        cal_w: &[f64],
     ) -> Option<Features> {
         let open = self.close_at(asset, epoch_sec - 1)?; // close just before window open
         let cur = self.close_at(asset, now_sec)?;
@@ -411,7 +438,7 @@ impl PriceHistory {
         let vel = self.vel_bps(asset, now_sec, 2, up).unwrap_or(0.0);
         let d = disp_bps(open, cur, up);
         let z = zscore(d, vol, ttl_s)?;
-        let p = (pcal(z) - recal_bias).clamp(0.0, 1.0);
+        let p = (pcal_with(z, cal_z, cal_w) - recal_bias).clamp(0.0, 1.0);
         Some(Features {
             disp_bps: d,
             vel_bps: vel,
@@ -496,6 +523,67 @@ pub fn save_recal(r: &Recalibrator, path: &str) -> std::io::Result<()> {
     let json = serde_json::to_string(r)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     std::fs::write(path, json)
+}
+
+/// Resolved per-interval strategy parameters for the decision loop. Built once per
+/// kline from `V2Config` (5m base) and the optional 15m override, so `process_kline_v2`
+/// can apply DIFFERENT gates + calibration per interval without touching the pure fn.
+/// The 5m strat is byte-for-byte the old behavior; 15m carries its own curve, recal
+/// bias, late-entry gate (`late_entry_max_ttl_s`), and price cap (`max_ask`).
+#[derive(Debug, Clone)]
+pub struct IntervalStrat {
+    /// Trade this interval at all (lets 15m be toggled independently of 5m).
+    pub enabled: bool,
+    pub z_min: f64,
+    pub edge_min: f64,
+    pub vol_cap: f64,
+    pub dvr_floor: f64,
+    pub edge_ref: f64,
+    pub min_ttl_s: i64,
+    /// Only enter when `ttl <= late_entry_max_ttl_s` (the 15m late-entry edge).
+    /// `0` = no late gate (5m).
+    pub late_entry_max_ttl_s: i64,
+    /// Skip when `ask > max_ask` (quality cap). `0` (or `>=1`) = no cap.
+    pub max_ask: f64,
+    /// Win-prob calibration knots for this interval.
+    pub cal_z: Vec<f64>,
+    pub cal_w: Vec<f64>,
+    /// Current rolling-recalibrator de-bias for this interval.
+    pub recal_bias: f64,
+}
+
+/// Per-interval rolling recalibrators. 5m and 15m have different base win rates, so
+/// a shared recal would cross-contaminate — each interval self-heals independently.
+#[derive(Clone)]
+pub struct RecalSet {
+    pub m5: std::sync::Arc<std::sync::Mutex<Recalibrator>>,
+    pub m15: std::sync::Arc<std::sync::Mutex<Recalibrator>>,
+    pub path_m5: String,
+    pub path_m15: String,
+}
+
+impl RecalSet {
+    /// The recalibrator for an interval string (anything != "15m" → 5m).
+    #[must_use]
+    pub fn for_interval(&self, interval: &str) -> &std::sync::Arc<std::sync::Mutex<Recalibrator>> {
+        if interval == "15m" { &self.m15 } else { &self.m5 }
+    }
+
+    /// Persist both recalibrators to their paths (best-effort; logs nothing here).
+    pub fn save_both(&self) {
+        if let Ok(r) = self.m5.lock() {
+            let _ = save_recal(&r, &self.path_m5);
+        }
+        if let Ok(r) = self.m15.lock() {
+            let _ = save_recal(&r, &self.path_m15);
+        }
+    }
+
+    /// Current de-bias for each interval (locks briefly; 0.0 if poisoned).
+    #[must_use]
+    pub fn bias(&self, interval: &str) -> f64 {
+        self.for_interval(interval).lock().map(|r| r.bias()).unwrap_or(0.0)
+    }
 }
 
 #[cfg(test)]
@@ -680,7 +768,7 @@ mod tests {
         let now = 1080;
         let ttl = 120.0;
         let f = h
-            .features("BTC", 1000, now, ttl, /*up=*/ true, /*ask=*/ 0.60, /*bias=*/ 0.0)
+            .features("BTC", 1000, now, ttl, /*up=*/ true, /*ask=*/ 0.60, /*bias=*/ 0.0, &CAL_Z, &CAL_W)
             .expect("features computable");
         assert!(f.disp_bps > 0.0, "up-move → positive displacement");
         assert!(f.vol_bps > 0.0 && f.vol_bps.is_finite());
@@ -688,6 +776,6 @@ mod tests {
         assert!((f.p - pcal(f.z)).abs() < 1e-12); // bias=0 → p == pcal(z)
         // Cold start: window-open is BEFORE any history (earliest bar = 999) →
         // can't price the open → None (the correct skip).
-        assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0).is_none());
+        assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0, &CAL_Z, &CAL_W).is_none());
     }
 }

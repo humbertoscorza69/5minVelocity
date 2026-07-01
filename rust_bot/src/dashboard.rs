@@ -11,7 +11,7 @@
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
@@ -23,14 +23,13 @@ use tracing::{info, warn};
 use crate::state::SharedState;
 use crate::state::persist::Outcome;
 use crate::state::store::SharedBotState;
-use crate::v2::Recalibrator;
 
 /// Spawnable dashboard task. `started_ms` is the wall clock at spawn (for uptime).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dashboard(
     state: Arc<SharedState>,
     store_state: SharedBotState,
-    recal: Arc<Mutex<Recalibrator>>,
+    recal: crate::v2::RecalSet,
     controls: Arc<crate::v2::Controls>,
     mode: String,
     live_armed_path: String,
@@ -169,7 +168,7 @@ fn apply_control(controls: &crate::v2::Controls, path: &str) {
 fn compute_stats(
     state: &SharedState,
     store_state: &SharedBotState,
-    recal: &Arc<Mutex<Recalibrator>>,
+    recal: &crate::v2::RecalSet,
     controls: &Arc<crate::v2::Controls>,
     mode: &str,
     live_armed_path: &str,
@@ -210,8 +209,8 @@ fn compute_stats(
     //      recorder, live wins (redeemed) never show as closed/realized. ----
     let mut entries = 0u64;
     let mut blocked = 0u64;
-    // (ts_ms, net_pnl, token, side, entry, exit)
-    let mut rev: Vec<(i64, f64, String, String, Option<f64>, Option<f64>)> = Vec::new();
+    // (ts_ms, net_pnl, token, side, entry, exit, interval)
+    let mut rev: Vec<(i64, f64, String, String, Option<f64>, Option<f64>, String)> = Vec::new();
 
     if let Ok(text) = std::fs::read_to_string(oplog_path) {
         for line in text.lines() {
@@ -236,7 +235,8 @@ fn compute_stats(
                         short_tok(data.get("token_id").and_then(Value::as_str).unwrap_or("")),
                         data.get("side").and_then(Value::as_str).unwrap_or("").to_string(),
                         data.get("entry_price").and_then(num),
-                        data.get("exit_price").and_then(num)));
+                        data.get("exit_price").and_then(num),
+                        data.get("interval").and_then(Value::as_str).unwrap_or("5m").to_string()));
                 }
             }
         }
@@ -255,46 +255,65 @@ fn compute_stats(
                 short_tok(v.get("token_id").and_then(Value::as_str).unwrap_or("")),
                 side.to_string(),
                 v.get("entry_price").and_then(num),
-                rp));
+                rp,
+                v.get("interval").and_then(Value::as_str).unwrap_or("5m").to_string()));
         }
     }
 
-    // Merge both sources by time, then aggregate.
+    // Merge both sources by time, then aggregate — GLOBAL and PER-INTERVAL. Each
+    // curve/trade point carries its interval so the UI can filter (All / 5m / 15m)
+    // and recompute the cumulative P&L client-side from the per-trade deltas.
+    #[derive(Default, Clone, Copy)]
+    struct Agg { closed: u64, wins: u64, gross_win: f64, gross_loss: f64, realized: f64 }
+    fn pf_value(gw: f64, gl: f64) -> Value {
+        if gl > 0.0 { json!(gw / gl) } else if gw > 0.0 { json!("∞") } else { json!(0.0) }
+    }
+    fn stat_obj(a: &Agg) -> Value {
+        let wr = if a.closed > 0 { a.wins as f64 / a.closed as f64 } else { 0.0 };
+        json!({
+            "closed": a.closed, "wins": a.wins, "losses": a.closed.saturating_sub(a.wins),
+            "win_rate": wr, "profit_factor": pf_value(a.gross_win, a.gross_loss),
+            "gross_win": a.gross_win, "gross_loss": a.gross_loss, "realized": a.realized,
+        })
+    }
     rev.sort_by_key(|e| e.0);
-    let mut closed = 0u64;
-    let mut wins = 0u64;
-    let mut gross_win = 0.0_f64;
-    let mut gross_loss = 0.0_f64;
-    let mut realized_total = 0.0_f64;
+    let mut g = Agg::default();
+    let mut per: std::collections::HashMap<String, Agg> = std::collections::HashMap::new();
     let mut curve: Vec<Value> = Vec::new();
     let mut recent_trades: Vec<Value> = Vec::new();
-    for (ts, r, token, side, entry, exit) in &rev {
-        closed += 1;
-        realized_total += *r;
-        if *r >= 0.0 { gross_win += *r; wins += 1; } else { gross_loss += -*r; }
-        curve.push(json!({ "t": *ts, "pnl": realized_total }));
+    for (ts, r, token, side, entry, exit, iv) in &rev {
+        let a = per.entry(iv.clone()).or_default();
+        g.closed += 1; a.closed += 1;
+        g.realized += *r; a.realized += *r;
+        if *r >= 0.0 {
+            g.gross_win += *r; g.wins += 1; a.gross_win += *r; a.wins += 1;
+        } else {
+            g.gross_loss += -*r; a.gross_loss += -*r;
+        }
+        curve.push(json!({ "t": *ts, "d": *r, "iv": iv.as_str() }));
         recent_trades.push(json!({
             "ts": *ts, "token": token.as_str(), "side": side.as_str(),
-            "entry": *entry, "exit": *exit, "pnl": *r,
+            "entry": *entry, "exit": *exit, "pnl": *r, "iv": iv.as_str(),
         }));
     }
     let curve = tail(curve, 600);
     let mut recent_trades = tail(recent_trades, 60);
     recent_trades.reverse(); // newest first for the table
 
+    // Global scalars (the "All" view + the top-line P&L cards).
+    let closed = g.closed;
+    let wins = g.wins;
+    let gross_win = g.gross_win;
+    let gross_loss = g.gross_loss;
+    let realized_total = g.realized;
     let win_rate = if closed > 0 { wins as f64 / closed as f64 } else { 0.0 };
-    let profit_factor: Value = if gross_loss > 0.0 {
-        json!(gross_win / gross_loss)
-    } else if gross_win > 0.0 {
-        json!("∞")
-    } else {
-        json!(0.0)
-    };
+    let profit_factor: Value = pf_value(gross_win, gross_loss);
+    let m5 = per.get("5m").copied().unwrap_or_default();
+    let m15 = per.get("15m").copied().unwrap_or_default();
+    let by_interval = json!({ "5m": stat_obj(&m5), "15m": stat_obj(&m15) });
 
-    let (recal_bias, recal_samples) = recal
-        .lock()
-        .map(|r| (r.bias(), r.samples()))
-        .unwrap_or((0.0, 0));
+    let (b5, n5) = recal.m5.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
+    let (b15, n15) = recal.m15.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
 
     let bal_milli = state.balance_milli.load(std::sync::atomic::Ordering::Relaxed);
     let balance: Value = if bal_milli < 0 { Value::Null } else { json!(bal_milli as f64 / 1000.0) };
@@ -328,7 +347,12 @@ fn compute_stats(
             "gross_loss": gross_loss,
             "blocked": blocked,
         },
-        "recal": { "bias": recal_bias, "samples": recal_samples },
+        "by_interval": by_interval,
+        "recal": {
+            "bias": b5, "samples": n5,
+            "m5": { "bias": b5, "samples": n5 },
+            "m15": { "bias": b15, "samples": n15 },
+        },
         "controls": {
             "enabled": controls.enabled(),
             "base_usd": controls.base_usd(),
@@ -407,6 +431,8 @@ tbody tr:hover{background:var(--panel2)}
 #armpanel{border-color:#3a2c10}
 .ctlrow label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:6px}
 .ctlrow input{width:92px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:7px 9px;font-size:13px;font-variant-numeric:tabular-nums}
+.btn.seg{padding:6px 15px;font-size:12px;font-weight:600}
+.btn.seg.sel{color:var(--acc);border-color:var(--acc);background:#0d1b2e}
 </style></head><body>
 <header>
   <h1>⚡ v2 bot <span class="muted" style="font-weight:400">— Polymarket lag-arb (5minSnip)</span></h1>
@@ -437,6 +463,13 @@ tbody tr:hover{background:var(--panel2)}
       <span class="muted" style="font-size:11px">ARM writes LIVE_ARMED.txt — real orders post ONLY in --mode live. KILL halts the decision loop (any mode).</span>
     </div>
   </div>
+  <div class="ctlrow" style="margin-bottom:12px">
+    <span class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.6px">Strategy</span>
+    <button class="btn seg sel" data-f="all">All</button>
+    <button class="btn seg" data-f="5m">5m</button>
+    <button class="btn seg" data-f="15m">15m</button>
+    <span id="filt_note" class="muted" style="font-size:11px"></span>
+  </div>
   <div class="grid">
     <div class="card"><div class="lbl">Wallet balance</div><div class="val mono acc" id="balance">—</div><div class="sub">USDC (funder wallet)</div></div>
     <div class="card"><div class="lbl">Total P&L</div><div class="val mono" id="pnl_total">—</div><div class="sub" id="pnl_split"></div></div>
@@ -452,7 +485,7 @@ tbody tr:hover{background:var(--panel2)}
     <table><thead><tr><th>Token</th><th>Side</th><th>Iv</th><th>Entry</th><th>USD</th><th>Bid</th><th>Shares</th><th>Unreal</th><th>Age</th></tr></thead>
     <tbody id="open_body"></tbody></table></div>
   <div class="panel"><h2>Recent trades</h2>
-    <table><thead><tr><th>Time</th><th>Token</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead>
+    <table><thead><tr><th>Time</th><th>Token</th><th>Side</th><th>Iv</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead>
     <tbody id="trades_body"></tbody></table></div>
   <div class="foot" id="foot"></div>
 </div>
@@ -463,6 +496,7 @@ const cls=x=>x>=0?"pos":"neg";
 function fmtAge(s){if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m";return Math.floor(s/3600)+"h"}
 function fmtTime(ms){const d=new Date(ms);return d.toLocaleTimeString()}
 function pill(el,ok,label){el.textContent=label;el.className="pill "+(ok?"ok":"bad")}
+let FILT="all",LAST=null;
 function drawChart(curve){
   const c=$("chart"),dpr=window.devicePixelRatio||1;
   const w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
@@ -489,18 +523,7 @@ async function tick(){
   pill($("pm"),s.health.polymarket,"Polymarket "+(s.health.polymarket?"●":"○"));
   $("up").textContent="uptime "+fmtAge(s.uptime_s)+" · "+s.health.active_tokens+" mkts · "+s.health.decisions+" dec";
   $("balance").textContent=(s.balance==null)?"—":"$"+(+s.balance).toFixed(2);
-  const t=$("pnl_total");t.textContent=money(s.pnl.total);t.className="val mono "+cls(s.pnl.total);
-  $("pnl_split").textContent="real "+money(s.pnl.realized)+" · unrl "+money(s.pnl.unrealized);
-  const r=$("pnl_real");r.textContent=money(s.pnl.realized);r.className="val mono "+cls(s.pnl.realized);
-  const u=$("pnl_unreal");u.textContent=money(s.pnl.unrealized);u.className="val mono "+cls(s.pnl.unrealized);
-  $("pf").textContent=(typeof s.stats.profit_factor==="number")?s.stats.profit_factor.toFixed(2):s.stats.profit_factor;
-  $("pf_sub").textContent="W $"+s.stats.gross_win.toFixed(0)+" / L $"+s.stats.gross_loss.toFixed(0);
-  $("wr").textContent=(s.stats.win_rate*100).toFixed(1)+"%";
-  $("wr_sub").textContent=s.stats.wins+"W / "+s.stats.losses+"L";
-  $("trades").textContent=s.stats.entries;
-  $("trades_sub").textContent=s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.blocked+" blocked";
-  $("recal").textContent=(s.recal.bias>=0?"+":"")+s.recal.bias.toFixed(3);
-  $("recal_sub").textContent=s.recal.samples+" samples";
+  LAST=s;render();
   const c=s.controls;const tg=$("toggle");
   tg.textContent=c.enabled?"● TRADING ON":"○ TRADING OFF";tg.className="btn "+(c.enabled?"on":"off");
   if(document.activeElement!==$("in_base"))$("in_base").value=(+c.base_usd).toFixed(2);
@@ -510,12 +533,44 @@ async function tick(){
   $("mode").textContent=lv.mode.toUpperCase();$("mode").className="pill "+(lv.mode==="live"?"bad":"ok");
   const ab=$("arm");ab.textContent=lv.armed?"● ARMED — click to DISARM":"○ DISARMED — click to ARM";ab.className="btn "+(lv.armed?"armed":"");
   const kb=$("kill");kb.textContent=lv.kill?"● KILL ACTIVE — click to CLEAR":"KILL SWITCH";kb.className="btn "+(lv.kill?"killon":"kill");
-  $("open_n").textContent=s.open_positions.length;
-  $("open_body").innerHTML=s.open_positions.map(p=>`<tr><td class="mono">${p.token}</td><td>${p.side}</td><td class="muted">${p.asset}/${p.interval}</td><td class="mono">${p.entry.toFixed(3)}</td><td class="mono">$${(+p.usd).toFixed(2)}</td><td class="mono">${p.bid.toFixed(3)}</td><td class="mono">${p.shares.toFixed(1)}</td><td class="mono ${cls(p.unreal)}">${money(p.unreal)}</td><td class="muted mono">${fmtAge(p.age_s)}</td></tr>`).join("")||`<tr><td colspan=9 class=muted>none</td></tr>`;
-  $("trades_body").innerHTML=s.recent_trades.map(t=>`<tr><td class="muted mono">${fmtTime(t.ts)}</td><td class="mono">${t.token}</td><td>${t.side||""}</td><td class="mono">${t.entry!=null?(+t.entry).toFixed(3):"—"}</td><td class="mono">${t.exit!=null?(+t.exit).toFixed(3):"—"}</td><td class="mono ${cls(t.pnl)}">${money(t.pnl)}</td></tr>`).join("")||`<tr><td colspan=6 class=muted>no closed trades yet</td></tr>`;
-  drawChart(s.curve);
   $("foot").textContent="updated "+new Date(s.now_ms).toLocaleTimeString();
 }
+// Render the FILTER-dependent widgets (P&L cards, PF, win rate, trades, recal,
+// open positions, trades table, chart) for the selected strategy (all/5m/15m).
+function render(){
+  const s=LAST;if(!s)return;
+  const st=(FILT==="all")?s.stats:(s.by_interval[FILT]||{closed:0,wins:0,losses:0,win_rate:0,profit_factor:0,gross_win:0,gross_loss:0,realized:0});
+  const realized=(FILT==="all")?s.pnl.realized:st.realized;
+  const opens=(FILT==="all")?s.open_positions:s.open_positions.filter(p=>p.interval===FILT);
+  const unreal=opens.reduce((a,p)=>a+(+p.unreal),0);
+  const total=realized+unreal;
+  const rc=(FILT==="15m")?s.recal.m15:s.recal.m5;
+  $("filt_note").textContent=(FILT==="all")?"combined 5m + 15m":(FILT+" only");
+  const t=$("pnl_total");t.textContent=money(total);t.className="val mono "+cls(total);
+  $("pnl_split").textContent="real "+money(realized)+" · unrl "+money(unreal);
+  const r=$("pnl_real");r.textContent=money(realized);r.className="val mono "+cls(realized);
+  const u=$("pnl_unreal");u.textContent=money(unreal);u.className="val mono "+cls(unreal);
+  $("pf").textContent=(typeof st.profit_factor==="number")?st.profit_factor.toFixed(2):st.profit_factor;
+  $("pf_sub").textContent="W $"+st.gross_win.toFixed(0)+" / L $"+st.gross_loss.toFixed(0);
+  $("wr").textContent=(st.win_rate*100).toFixed(1)+"%";
+  $("wr_sub").textContent=st.wins+"W / "+st.losses+"L";
+  $("trades").textContent=(FILT==="all")?s.stats.entries:st.closed;
+  $("trades_sub").textContent=(FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed");
+  $("recal").textContent=(rc.bias>=0?"+":"")+rc.bias.toFixed(3);
+  $("recal_sub").textContent=rc.samples+" samples ("+(FILT==="15m"?"15m":"5m")+")";
+  $("open_n").textContent=opens.length;
+  $("open_body").innerHTML=opens.map(p=>`<tr><td class="mono">${p.token}</td><td>${p.side}</td><td class="muted">${p.asset}/${p.interval}</td><td class="mono">${p.entry.toFixed(3)}</td><td class="mono">$${(+p.usd).toFixed(2)}</td><td class="mono">${p.bid.toFixed(3)}</td><td class="mono">${p.shares.toFixed(1)}</td><td class="mono ${cls(p.unreal)}">${money(p.unreal)}</td><td class="muted mono">${fmtAge(p.age_s)}</td></tr>`).join("")||`<tr><td colspan=9 class=muted>none</td></tr>`;
+  const trs=(FILT==="all")?s.recent_trades:s.recent_trades.filter(x=>x.iv===FILT);
+  $("trades_body").innerHTML=trs.map(t=>`<tr><td class="muted mono">${fmtTime(t.ts)}</td><td class="mono">${t.token}</td><td>${t.side||""}</td><td class="muted">${t.iv||"5m"}</td><td class="mono">${t.entry!=null?(+t.entry).toFixed(3):"—"}</td><td class="mono">${t.exit!=null?(+t.exit).toFixed(3):"—"}</td><td class="mono ${cls(t.pnl)}">${money(t.pnl)}</td></tr>`).join("")||`<tr><td colspan=7 class=muted>no closed trades yet</td></tr>`;
+  // Cumulative curve from per-trade deltas, filtered by strategy.
+  const pts=(FILT==="all")?s.curve:s.curve.filter(p=>p.iv===FILT);
+  let run=0;drawChart(pts.map(p=>({t:p.t,pnl:(run+=p.d)})));
+}
+document.querySelectorAll(".btn.seg").forEach(b=>b.onclick=()=>{
+  FILT=b.getAttribute("data-f");
+  document.querySelectorAll(".btn.seg").forEach(x=>x.classList.toggle("sel",x===b));
+  render();
+});
 $("toggle").onclick=async()=>{const on=$("toggle").classList.contains("on");try{await fetch("/api/control?enabled="+(on?"false":"true"),{method:"POST"})}catch(e){}tick()};
 $("apply").onclick=async()=>{const b=$("in_base").value,m=$("in_max").value;try{await fetch(`/api/control?base_usd=${encodeURIComponent(b)}&max_pos=${encodeURIComponent(m)}`,{method:"POST"})}catch(e){}$("ctl_msg").textContent="applied ✓";setTimeout(()=>$("ctl_msg").textContent="",1800);tick()};
 $("arm").onclick=async()=>{const armed=$("arm").classList.contains("armed");

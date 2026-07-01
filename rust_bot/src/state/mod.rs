@@ -152,11 +152,12 @@ pub struct SharedState {
     /// `run_positions_refresh` every cycle. `-1` = not yet known (paper mode, or
     /// before the first REST balance fetch). Read by the dashboard.
     pub balance_milli: AtomicI64,
-    /// v2 strategy: predicted win-probability at entry, keyed by bet token id.
-    /// Written by the v2 decision path on each Open; drained by the positions-
-    /// refresh recal feed when the market resolves (→ `(pred, won)` into the
-    /// rolling recalibrator). Empty when v2 is disabled.
-    pub v2_pred: DashMap<String, f64>,
+    /// v2 strategy: `(interval, predicted win-probability)` at entry, keyed by bet
+    /// token id. Written by the v2 decision path on each Open; drained by the
+    /// positions-refresh recal feed when the market resolves (→ `(pred, won)` into
+    /// the PER-INTERVAL rolling recalibrator, routed by the stored interval).
+    /// Empty when v2 is disabled.
+    pub v2_pred: DashMap<String, (String, f64)>,
     /// v2 SETTLEMENT outcome (token id → won), computed by the decision loop from
     /// Binance open-vs-close the moment a window resolves -- INDEPENDENT of the
     /// relayer redeem. Drained by `run_positions_refresh` to book P&L immediately,

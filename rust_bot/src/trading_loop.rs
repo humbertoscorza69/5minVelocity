@@ -324,10 +324,9 @@ pub fn process_kline_v2(
     kline: &KlineClose,
     catalog: &dyn MarketCatalog,
     book: &dyn BookProvider,
-    vcfg: &crate::config::V2Config,
+    strats: &std::collections::HashMap<&'static str, crate::v2::IntervalStrat>,
     base_usd: f64,
     max_pos_usd: f64,
-    recal_bias: f64,
     positions: &[OpenPosition],
     now_ms: i64,
     disabled: &[String],
@@ -335,6 +334,12 @@ pub fn process_kline_v2(
     history.push(&kline.asset, kline.t_s, kline.close);
     let mut out = Vec::new();
     for (interval, secs) in crate::signal::INTERVALS {
+        // Per-interval strategy: 5m uses the base config; 15m uses its own gates,
+        // calibration curve, and recal bias. A missing/disabled strat = skip.
+        let Some(s) = strats.get(interval) else { continue };
+        if !s.enabled {
+            continue;
+        }
         // Respect the same retired-cell list as the legacy path (e.g. ETH:15m).
         let cell = format!("{}:{}", kline.asset, interval);
         if disabled.iter().any(|c| c == &cell) {
@@ -343,7 +348,11 @@ pub fn process_kline_v2(
         let epoch = (kline.t_s / secs) * secs;
         let resolution = epoch + secs;
         let ttl = resolution - kline.t_s;
-        if ttl < vcfg.min_ttl_s || ttl > secs {
+        if ttl < s.min_ttl_s || ttl > secs {
+            continue;
+        }
+        // Late-entry gate (the 15m edge lives in the last few minutes). 0 = no gate.
+        if s.late_entry_max_ttl_s > 0 && ttl > s.late_entry_max_ttl_s {
             continue;
         }
         let Some(m) = catalog.active_market(&kline.asset, interval, epoch) else { continue };
@@ -366,20 +375,31 @@ pub fn process_kline_v2(
             Some(a) if a > 0.0 => a,
             _ => continue,
         };
-        let Some(f) =
-            history.features(&kline.asset, epoch, kline.t_s, ttl as f64, up, ask, recal_bias)
-        else {
+        // Max-ask quality cap (15m: 0.70). 0.0 (or >=1.0) = no cap (5m).
+        if s.max_ask > 0.0 && ask > s.max_ask {
+            continue;
+        }
+        let Some(f) = history.features(
+            &kline.asset,
+            epoch,
+            kline.t_s,
+            ttl as f64,
+            up,
+            ask,
+            s.recal_bias,
+            &s.cal_z,
+            &s.cal_w,
+        ) else {
             continue;
         };
-        // v2 gate uses edge_min/vol_cap/dvr_floor/z_min from config (v2.rs consts
-        // are the defaults; config can override). The z_min gate is the fix for
-        // firing on near-zero displacement at the window open: require a REAL
-        // vol-normalized move before betting.
-        if f.vol_bps > vcfg.vol_cap
-            || f.dvr < vcfg.dvr_floor
-            || f.edge < vcfg.edge_min
+        // v2 gate uses edge_min/vol_cap/dvr_floor/z_min PER INTERVAL (5m base vs 15m
+        // override). The z_min gate is the fix for firing on near-zero displacement
+        // at the window open: require a REAL vol-normalized move before betting.
+        if f.vol_bps > s.vol_cap
+            || f.dvr < s.dvr_floor
+            || f.edge < s.edge_min
             || f.disp_bps <= 0.0
-            || f.z < vcfg.z_min
+            || f.z < s.z_min
         {
             continue;
         }
@@ -389,7 +409,7 @@ pub fn process_kline_v2(
         let stake = crate::v2::edge_stake(
             f.edge,
             base_usd,
-            vcfg.edge_ref,
+            s.edge_ref,
             base_usd.min(1.05),
             max_pos_usd,
             max_pos_usd,
@@ -492,7 +512,7 @@ pub async fn run_decision_task(
     // the 5bps strategy for each kline.
     vcfg: crate::config::V2Config,
     controls: Arc<crate::v2::Controls>,
-    recal: Arc<Mutex<crate::v2::Recalibrator>>,
+    recal: crate::v2::RecalSet,
     // Live-arm gate: `Some(path)` in --mode live → enter ONLY when that file
     // exists (ARMED). Disarmed = truly idle (no entries, no phantom paper).
     // `None` in --mode paper → entries gated only by the ON/OFF control.
@@ -588,7 +608,8 @@ pub async fn run_decision_task(
                         if now_s < resolution + 2 {
                             continue; // wait for the close (resolution-1) bar to land
                         }
-                        let epoch = resolution - 300; // 5m window open
+                        let win_secs = interval_secs(&p.interval).max(1);
+                        let epoch = resolution - win_secs; // window open (5m=300s, 15m=900s)
                         let (Some(op), Some(fin)) = (
                             history.close_at(&p.asset, epoch - 1),
                             history.close_at(&p.asset, resolution - 1),
@@ -630,10 +651,16 @@ pub async fn run_decision_task(
                         history.push(&kline.asset, kline.t_s, kline.close);
                         continue;
                     }
-                    let bias = recal.lock().map(|r| r.bias()).unwrap_or(0.0);
+                    // Per-interval strategies, rebuilt each kline with the CURRENT
+                    // per-interval recal de-bias. 5m = base config (unchanged); 15m =
+                    // its own gates + curve + recal, gated by v2.i15m.enabled.
+                    let mut strats: std::collections::HashMap<&'static str, crate::v2::IntervalStrat> =
+                        std::collections::HashMap::with_capacity(2);
+                    strats.insert("5m", vcfg.strat_5m(recal.bias("5m")));
+                    strats.insert("15m", vcfg.i15m.strat(vcfg.enabled, recal.bias("15m")));
                     let cmds = process_kline_v2(
-                        &mut history, &kline, &catalog, &book, &vcfg,
-                        controls.base_usd(), controls.max_pos_usd(), bias, &positions, now, &disabled_cells,
+                        &mut history, &kline, &catalog, &book, &strats,
+                        controls.base_usd(), controls.max_pos_usd(), &positions, now, &disabled_cells,
                     );
                     for (cmd, pred) in cmds {
                         if let ExecCommand::Open { intent, ctx } = &cmd {
@@ -664,8 +691,9 @@ pub async fn run_decision_task(
                                 v2_entered.clear();
                             }
                             v2_entered.insert(intent.token_id.clone());
-                            // Record predicted-p for the recalibrator (drained on resolution).
-                            state.v2_pred.insert(intent.token_id.clone(), pred);
+                            // Record (interval, predicted-p) for the recalibrator
+                            // (drained on resolution, routed to the interval's recal).
+                            state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred));
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
                             oplog.sys("v2_intent_open", serde_json::json!({
                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,
@@ -896,10 +924,10 @@ pub async fn run_positions_refresh(
     bs: crate::state::store::SharedBotState,
     guards: Arc<Mutex<crate::guards::Guards>>,
     recorder: Arc<Mutex<crate::pnl_recorder::PnlRecorder>>,
-    // v2 rolling recalibrator: fed (predicted_p, won) when a v2 bet resolves,
-    // then persisted to `recal_path`. Inert when v2 is disabled (v2_pred empty).
-    recal: Arc<Mutex<crate::v2::Recalibrator>>,
-    recal_path: String,
+    // v2 rolling recalibrators (per interval): fed (predicted_p, won) when a v2 bet
+    // resolves — routed to the bet's interval — then both persisted. Inert when v2
+    // is disabled (v2_pred empty).
+    recal: crate::v2::RecalSet,
 ) {
     info!(period_secs = period.as_secs(), "task started: positions_refresh (G8 wired)");
     oplog.sys("positions_refresh_start", serde_json::json!({ "period_secs": period.as_secs() }));
@@ -946,13 +974,13 @@ pub async fn run_positions_refresh(
                     for p in &positions {
                         let resolved = state.resolved_tokens.get(&p.token_id).map(|r| *r).unwrap_or(false);
                         if !resolved { continue; }
-                        if let Some((_, pred)) = state.v2_pred.remove(&p.token_id) {
+                        if let Some((_, (iv, pred))) = state.v2_pred.remove(&p.token_id) {
                             // Only learn from an UNAMBIGUOUS clean cur_price (0/1).
                             // `redeemable` cannot tell win from lose (true for both),
                             // so we do NOT guess here -- mislabeled samples would
                             // poison the recalibrator.
                             if let Some(price) = crate::pnl_recorder::resolved_price_for_pnl(p.cur_price) {
-                                if let Ok(mut r) = recal.lock() {
+                                if let Ok(mut r) = recal.for_interval(&iv).lock() {
                                     r.record(pred, price >= 0.5);
                                     updated += 1;
                                 }
@@ -960,14 +988,9 @@ pub async fn run_positions_refresh(
                         }
                     }
                     if updated > 0 {
-                        let (bias, n) = recal.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
-                        if let Ok(r) = recal.lock() {
-                            let _ = crate::v2::save_recal(&r, &recal_path);
-                        }
-                        oplog.sys("v2_recal_update", serde_json::json!({
-                            "fed": updated, "bias": bias, "samples": n,
-                        }));
-                        info!(fed = updated, bias, samples = n, "v2 recalibration updated");
+                        recal.save_both();
+                        oplog.sys("v2_recal_update", serde_json::json!({ "fed": updated }));
+                        info!(fed = updated, "v2 recalibration updated");
                     }
                 }
                 info!(
@@ -1033,8 +1056,8 @@ pub async fn run_positions_refresh(
                         }
                         if did {
                             booked += 1;
-                            if let Some((_, pred)) = state.v2_pred.remove(&token) {
-                                if let Ok(mut r) = recal.lock() {
+                            if let Some((_, (iv, pred))) = state.v2_pred.remove(&token) {
+                                if let Ok(mut r) = recal.for_interval(&iv).lock() {
                                     r.record(pred, won);
                                 }
                             }
@@ -1046,14 +1069,11 @@ pub async fn run_positions_refresh(
                         state.v2_settled.clear();
                     }
                     if booked > 0 {
-                        let (bias, n) = recal.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
-                        if let Ok(r) = recal.lock() {
-                            let _ = crate::v2::save_recal(&r, &recal_path);
-                        }
+                        recal.save_both();
                         oplog.sys("v2_recal_update", serde_json::json!({
-                            "fed": booked, "bias": bias, "samples": n, "source": "settlement",
+                            "fed": booked, "source": "settlement",
                         }));
-                        info!(booked, bias, samples = n,
+                        info!(booked,
                             "positions_refresh: settlements booked from Binance close (decoupled from redeem)");
                     }
                 }
@@ -1080,22 +1100,19 @@ pub async fn run_positions_refresh(
                             // grows and shrinks pcal -> fewer/again-profitable entries.
                             let mut fed = 0u32;
                             for (token, won) in &booked {
-                                if let Some((_, pred)) = state.v2_pred.remove(token) {
-                                    if let Ok(mut r) = recal.lock() {
+                                if let Some((_, (iv, pred))) = state.v2_pred.remove(token) {
+                                    if let Ok(mut r) = recal.for_interval(&iv).lock() {
                                         r.record(pred, *won);
                                         fed += 1;
                                     }
                                 }
                             }
                             if fed > 0 {
-                                let (bias, n) = recal.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
-                                if let Ok(r) = recal.lock() {
-                                    let _ = crate::v2::save_recal(&r, &recal_path);
-                                }
+                                recal.save_both();
                                 oplog.sys("v2_recal_update", serde_json::json!({
-                                    "fed": fed, "bias": bias, "samples": n, "source": "activity",
+                                    "fed": fed, "source": "activity",
                                 }));
-                                info!(fed, bias, samples = n, "v2 recalibration updated (activity truth)");
+                                info!(fed, "v2 recalibration updated (activity truth)");
                             }
                         }
                     }
@@ -2986,7 +3003,12 @@ mod tests {
             vec![],   // disabled_cells: default OFF = no production filter
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
             Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
-            Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+            crate::v2::RecalSet {
+                m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+                m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+                path_m5: std::env::temp_dir().join("recal5_test.json").to_string_lossy().into_owned(),
+                path_m15: std::env::temp_dir().join("recal15_test.json").to_string_lossy().into_owned(),
+            },
             None, // live_gate: paper/legacy path under test
         ));
 
@@ -3088,7 +3110,12 @@ mod tests {
             vec![],   // disabled_cells: default OFF = no production filter
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
             Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
-            Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+            crate::v2::RecalSet {
+                m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+                m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+                path_m5: std::env::temp_dir().join("recal5_test.json").to_string_lossy().into_owned(),
+                path_m15: std::env::temp_dir().join("recal15_test.json").to_string_lossy().into_owned(),
+            },
             None, // live_gate: paper/legacy path under test
         ));
 
@@ -3300,7 +3327,12 @@ mod tests {
             disabled.clone(), // PRODUCTION filter: drop ETH:15m
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
             Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
-            Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+            crate::v2::RecalSet {
+                m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+                m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
+                path_m5: std::env::temp_dir().join("recal5_test.json").to_string_lossy().into_owned(),
+                path_m15: std::env::temp_dir().join("recal15_test.json").to_string_lossy().into_owned(),
+            },
             None, // live_gate: paper/legacy path under test
         ));
 
