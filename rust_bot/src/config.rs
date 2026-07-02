@@ -97,6 +97,14 @@ pub struct V2Config {
     /// Min seconds-to-settle for an entry (avoid the last-N-seconds chop).
     #[serde(default = "d_v2_min_ttl")]
     pub min_ttl_s: i64,
+    /// MAX seconds-to-settle for a 5m entry (skip the first minute of the window).
+    /// Live + recorder both show early-window entries (ttl>~240s) are a −EV drag:
+    /// small displacement rides a noisy z, the 60s vol still spans the prior window,
+    /// and 4+ min of remaining time gives the move max room to revert. The recorder
+    /// backtests that validated the strategy never held a ttl>180s trade, so this
+    /// closes an un-validated envelope. `0` = off (pre-July-2 behavior).
+    #[serde(default = "d_v2_max_ttl")]
+    pub max_ttl_s: i64,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -125,6 +133,7 @@ fn d_dvr_floor() -> f64 { 0.2 }
 fn d_edge_ref() -> f64 { 0.08 }
 fn d_z_min() -> f64 { 0.45 }
 fn d_v2_min_ttl() -> i64 { 30 }
+fn d_v2_max_ttl() -> i64 { 0 } // 0 = off (opt-in via config); set 240 for the 5m late gate
 fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
 fn d_recal_path() -> String { "data/v2/recal.json".to_string() }
@@ -206,7 +215,7 @@ impl V2Config {
             dvr_floor: self.dvr_floor,
             edge_ref: self.edge_ref,
             min_ttl_s: self.min_ttl_s,
-            late_entry_max_ttl_s: 0, // 5m: no late gate
+            late_entry_max_ttl_s: self.max_ttl_s, // 5m late gate (0 = off)
             max_ask: 0.0,            // 5m: no price cap (its live edge includes cheap)
             cal_z: crate::v2::CAL_Z.to_vec(),
             cal_w: crate::v2::CAL_W.to_vec(),
@@ -247,6 +256,7 @@ impl Default for V2Config {
             edge_ref: d_edge_ref(),
             z_min: d_z_min(),
             min_ttl_s: d_v2_min_ttl(),
+            max_ttl_s: d_v2_max_ttl(),
             recal_capacity: d_recal_capacity(),
             recal_warmup: d_recal_warmup(),
             recal_path: d_recal_path(),

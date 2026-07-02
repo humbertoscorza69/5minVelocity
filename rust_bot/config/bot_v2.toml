@@ -90,6 +90,14 @@ vol_cap = 1.0
 dvr_floor = 0.2
 edge_ref = 0.08
 min_ttl_s = 30
+# max_ttl_s: skip the first minute of the 5m window (only enter when ttl <= 240s).
+# Live (Jul 2, 452 trades) + recorder both show early-window entries are the −EV
+# drag: ttl<=240 booked +$20.96 vs ttl>240 −$8.62 on the same day; and the (240,270]
+# bucket alone was −$17 across two independent days + both assets. The recorder
+# backtests that validated the strategy never held a ttl>180s trade, so this closes
+# an un-validated envelope. This DOMINATES an ask floor (a proxy for the same thing)
+# and keeps more volume. 0 = off.
+max_ttl_s = 240
 recal_capacity = 300
 recal_warmup = 50
 recal_path = "data/v2/recal.json"
