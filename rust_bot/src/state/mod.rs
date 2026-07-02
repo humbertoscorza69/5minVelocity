@@ -168,6 +168,17 @@ pub struct SharedState {
     /// 15m paper-log). Dedup so the per-second sweep fires each stop at most once;
     /// a failed FOK sell stays marked and the position simply holds to settlement.
     pub v2_stopped: DashMap<String, bool>,
+    /// Recent (ts_ms, mid) samples per token, ~last 6s. Feeds the "book-asleep"
+    /// flag logged at entry: asleep = the mid did not move over the prior ~3s, the
+    /// direct observation that the book has not yet repriced (our edge, and — unlike
+    /// confirmation features — NOT priced into the ask). LOG-only for now.
+    pub mid_ring: DashMap<String, std::collections::VecDeque<(i64, f64)>>,
+    /// Tokens whose settlement was a PHOTO FINISH (|Binance close-open| < ~2bps).
+    /// The Binance-derived win label flips ~20% of the time exactly here, so we do
+    /// NOT feed these into the recalibrator from the Binance settlement path — we
+    /// leave them for the activity-feed TRUE payout to label. P&L still books
+    /// normally (and self-corrects via activity). Prevents recal poisoning at ties.
+    pub v2_photofinish: DashMap<String, bool>,
     /// PIECE 4 (active-only enrichment): per-token RESOLUTION flag derived from
     /// the data-api `/positions` snapshot (redeemable OR cur_price ∈ {0,1} OR
     /// end_date past). Updated periodically by `run_positions_refresh`. Missing
@@ -201,6 +212,8 @@ impl SharedState {
             v2_pred: DashMap::new(),
             v2_settled: DashMap::new(),
             v2_stopped: DashMap::new(),
+            mid_ring: DashMap::new(),
+            v2_photofinish: DashMap::new(),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),
             started_at: Instant::now(),

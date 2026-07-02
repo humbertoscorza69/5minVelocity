@@ -332,6 +332,15 @@ fn update_bbo(
     state
         .bbo
         .insert(token.to_string(), EventBbo { best_ask, best_bid, ts_ms });
+    // Feed the mid-ring for the book-asleep flag (LOG-only). Keep ~6s / 64 samples.
+    if let Some(mid) = mid_of(best_ask, best_bid) {
+        let mut r = state.mid_ring.entry(token.to_string()).or_default();
+        r.push_back((ts_ms, mid));
+        let cutoff = ts_ms - 6000;
+        while r.front().map(|(t, _)| *t < cutoff).unwrap_or(false) || r.len() > 64 {
+            r.pop_front();
+        }
+    }
 }
 
 /// Mid price when both sides are present.

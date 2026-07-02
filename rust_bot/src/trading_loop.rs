@@ -104,6 +104,27 @@ fn signal_id(asset: &str, trigger_ts: i64, interval: &str, dir: Direction) -> St
     format!("{asset}-{trigger_ts}-{interval}-{}", dir.as_str())
 }
 
+/// Book-asleep flag at entry (LOG-only): `Some(true)` if the token's mid did NOT
+/// move over the prior ~3s (the book has not repriced — the direct observation of
+/// our lag edge, and unlike confirmation features it is NOT priced into the ask),
+/// `Some(false)` if it moved, `None` if there is < 2.5s of mid history (unknown).
+fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<bool> {
+    let r = state.mid_ring.get(token)?;
+    let (mut oldest, mut mn, mut mx, mut n) = (i64::MAX, f64::MAX, f64::MIN, 0u32);
+    for (t, m) in r.iter() {
+        if now_ms - t <= 3000 {
+            oldest = oldest.min(*t);
+            mn = mn.min(*m);
+            mx = mx.max(*m);
+            n += 1;
+        }
+    }
+    if n < 2 || now_ms - oldest < 2500 {
+        return None; // not enough coverage to claim "unchanged for 3s"
+    }
+    Some((mx - mn).abs() < 1e-9)
+}
+
 fn interval_secs(interval: &str) -> i64 {
     crate::signal::INTERVALS.iter().find(|(iv, _)| *iv == interval).map(|(_, s)| *s).unwrap_or(0)
 }
@@ -674,7 +695,13 @@ pub async fn run_decision_task(
                             continue; // ring doesn't have both ends (e.g. post-restart)
                         };
                         let up = matches!(p.side, Outcome::Up);
-                        let won = up == (fin >= op);
+                        let won = up == (fin >= op); // tie (fin==op) => Up wins
+                        // Photo-finish: |close-open| < ~2bps -> Binance label is
+                        // unreliable (flips ~20%). Flag so the recal feed skips it
+                        // (activity truth labels it instead). P&L still books.
+                        if op > 0.0 && (fin / op - 1.0).abs() * 1e4 < 2.0 {
+                            state.v2_photofinish.insert(p.token_id.clone(), true);
+                        }
                         state.v2_settled.insert(p.token_id.clone(), won);
                     }
                 }
@@ -758,6 +785,7 @@ pub async fn run_decision_task(
                                 "fill_price": intent.fill_price, "shares": intent.shares,
                                 "disp_bps": ctx.binance_ret_bps, "p": pred,
                                 "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
+                                "asleep": book_asleep(&state, &intent.token_id, now),
                                 "exit_ts_s": intent.exit_ts_s,
                             }));
                             info!(token = %intent.token_id, p = pred, stake = ctx.stake_usd,
@@ -1114,9 +1142,14 @@ pub async fn run_positions_refresh(
                         }
                         if did {
                             booked += 1;
-                            if let Some((_, (iv, pred))) = state.v2_pred.remove(&token) {
-                                if let Ok(mut r) = recal.for_interval(&iv).lock() {
-                                    r.record(pred, won);
+                            // Photo-finish (near-tie): DON'T feed the Binance label to
+                            // the recal (it flips ~20%); leave v2_pred so the activity
+                            // feed labels it with the TRUE payout below.
+                            if !state.v2_photofinish.contains_key(&token) {
+                                if let Some((_, (iv, pred))) = state.v2_pred.remove(&token) {
+                                    if let Ok(mut r) = recal.for_interval(&iv).lock() {
+                                        r.record(pred, won);
+                                    }
                                 }
                             }
                         }
@@ -1126,6 +1159,8 @@ pub async fn run_positions_refresh(
                     if state.v2_settled.len() > 50_000 {
                         state.v2_settled.clear();
                     }
+                    if state.v2_photofinish.len() > 50_000 { state.v2_photofinish.clear(); }
+                    if state.mid_ring.len() > 50_000 { state.mid_ring.clear(); }
                     if booked > 0 {
                         recal.save_both();
                         oplog.sys("v2_recal_update", serde_json::json!({
