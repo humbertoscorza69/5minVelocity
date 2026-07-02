@@ -24,9 +24,10 @@ disabled_cells = []
 
 [stakes]
 # base = stake at the reference edge (v2.edge_ref); edge sizing scales around it,
-# capped by max_position_usdc. Paper sizing — bump for live after validation.
-base_usdc = 10.0
-max_position_usdc = 50.0
+# capped by max_position_usdc. STARTUP defaults only — the dashboard overrides both
+# live (per-interval). Set to the live $1 size so a restart never jumps to big stakes.
+base_usdc = 1.05
+max_position_usdc = 5.0
 max_open_positions = 20
 paper_initial_usdc = 1000.0
 
