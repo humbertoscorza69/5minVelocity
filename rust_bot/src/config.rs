@@ -129,6 +129,13 @@ pub struct V2Config {
     /// breakeven fill haircut 8-11c. Default false (inert) — arm consciously.
     #[serde(default)]
     pub inval_stop_enabled: bool,
+    /// DRY-RUN the invalidation stop: when true, would-fires are computed + logged
+    /// (oplog "inval_stop" with dry_run=true) but NO sell is ever sent — even for
+    /// 5m while armed. This is the safe first phase: run it dry for ~1 day, confirm
+    /// the trigger fires on ~55% of positions like the backtest, THEN set false to
+    /// go live. Default true so enabling the stop can't sell until you opt in.
+    #[serde(default = "d_true")]
+    pub inval_stop_dry_run: bool,
     /// 15-minute market as its OWN strategy (late-entry, higher z_min, price cap,
     /// its own recalibrator). Absent/disabled = 5m-only (no behavior change).
     #[serde(default)]
@@ -142,6 +149,7 @@ fn d_edge_ref() -> f64 { 0.08 }
 fn d_z_min() -> f64 { 0.45 }
 fn d_v2_min_ttl() -> i64 { 30 }
 fn d_v2_max_ttl() -> i64 { 0 } // 0 = off (opt-in via config); set 240 for the 5m late gate
+fn d_true() -> bool { true }
 fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
 fn d_recal_path() -> String { "data/v2/recal.json".to_string() }
@@ -271,6 +279,7 @@ impl Default for V2Config {
             tick_driven: false,
             tick_throttle_ms: d_tick_throttle(),
             inval_stop_enabled: false,
+            inval_stop_dry_run: true,
             i15m: Interval15mCfg::default(),
         }
     }

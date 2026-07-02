@@ -108,6 +108,10 @@ max_ttl_s = 240
 # Graduation: BTC-15m -> live once paper dEV over >=150 stops confirms at real
 # fills; ETH-15m needs that AND a non-negative late-window split. Default false.
 inval_stop_enabled = false
+# inval_stop_dry_run: when the stop is enabled, DRY-RUN first — compute + log every
+# would-fire (oplog "inval_stop" dry_run=true) but send NO sell, even 5m while armed.
+# Run ~1 day, confirm trigger fires on ~55% of positions, THEN set false to go live.
+inval_stop_dry_run = true
 recal_capacity = 300
 recal_warmup = 50
 recal_path = "data/v2/recal.json"

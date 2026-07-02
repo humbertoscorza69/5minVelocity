@@ -682,9 +682,13 @@ pub async fn run_decision_task(
                                         Some(pth) => std::path::Path::new(pth).exists(),
                                         None => true, // paper mode: simulated sell
                                     };
-                                    // 5m sells for real (armed + a bid to hit); 15m
-                                    // and disarmed/no-bid = paper-log only.
-                                    let do_sell = p.interval == "5m" && armed && bid.is_some();
+                                    // 5m sells for real (armed + a bid to hit) UNLESS
+                                    // dry-run; 15m, disarmed, no-bid, or dry-run =
+                                    // paper-log only (would-fire, no sell).
+                                    let do_sell = p.interval == "5m"
+                                        && armed
+                                        && bid.is_some()
+                                        && !vcfg.inval_stop_dry_run;
                                     oplog.sys("inval_stop", serde_json::json!({
                                         "token_id": p.token_id, "asset": p.asset,
                                         "interval": p.interval, "side": if up {"up"} else {"down"},
@@ -692,6 +696,7 @@ pub async fn run_decision_task(
                                         "entry_ask": p.entry_price.to_f64().unwrap_or(0.0),
                                         "sec_in": now_s - epoch, "ttl": resolution - now_s,
                                         "action": if do_sell { "sell" } else { "paper" },
+                                        "dry_run": vcfg.inval_stop_dry_run,
                                     }));
                                     if do_sell {
                                         let _ = exec_tx.send(ExecCommand::CloseToken {
