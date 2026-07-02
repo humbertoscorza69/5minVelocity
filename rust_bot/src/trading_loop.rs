@@ -104,11 +104,14 @@ fn signal_id(asset: &str, trigger_ts: i64, interval: &str, dir: Direction) -> St
     format!("{asset}-{trigger_ts}-{interval}-{}", dir.as_str())
 }
 
-/// Book-asleep flag at entry (LOG-only): `Some(true)` if the token's mid did NOT
-/// move over the prior ~3s (the book has not repriced — the direct observation of
-/// our lag edge, and unlike confirmation features it is NOT priced into the ask),
-/// `Some(false)` if it moved, `None` if there is < 2.5s of mid history (unknown).
-fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<bool> {
+/// Book-asleep observation at entry (LOG-only). Returns `Some((asleep, mid_move,
+/// age_ms))`: `asleep` = mid did NOT move over the prior ~3s (the book hasn't
+/// repriced — the direct, UNPRICED observation of our lag edge); `mid_move` = the
+/// raw max-min mid range over that window (so the threshold can be re-tuned
+/// offline); `age_ms` = age of the oldest sample used (staleness coverage). `None`
+/// if < 2.5s of mid history (unknown). The raw fields are logged too so the flag
+/// is never a black box.
+fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<(bool, f64, i64)> {
     let r = state.mid_ring.get(token)?;
     let (mut oldest, mut mn, mut mx, mut n) = (i64::MAX, f64::MAX, f64::MIN, 0u32);
     for (t, m) in r.iter() {
@@ -122,7 +125,8 @@ fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<bool> {
     if n < 2 || now_ms - oldest < 2500 {
         return None; // not enough coverage to claim "unchanged for 3s"
     }
-    Some((mx - mn).abs() < 1e-9)
+    let move_ = (mx - mn).abs();
+    Some((move_ < 1e-9, move_, now_ms - oldest))
 }
 
 fn interval_secs(interval: &str) -> i64 {
@@ -549,7 +553,26 @@ pub async fn run_decision_task(
     live_gate: Option<String>,
 ) {
     info!("task started: decision_loop");
-    oplog.sys("decision_loop_start", serde_json::json!({}));
+    // Config-hash + self-describing era: every later analysis session-filters by
+    // this so config drift can't silently contaminate a difference-in-means. The
+    // string lists the era-DEFINING knobs (anything that changes which trades fire
+    // or how they're priced); the hash is the compact filter key.
+    let era = format!(
+        "en={} edge={} vol={} dvr={} eref={} zmin={} minttl={} maxttl={} tick={} inval={} i15en={} i15z={} i15ttl={} i15cap={}",
+        vcfg.enabled, vcfg.edge_min, vcfg.vol_cap, vcfg.dvr_floor, vcfg.edge_ref,
+        vcfg.z_min, vcfg.min_ttl_s, vcfg.max_ttl_s, vcfg.tick_driven, vcfg.inval_stop_enabled,
+        vcfg.i15m.enabled, vcfg.i15m.z_min, vcfg.i15m.late_entry_max_ttl_s, vcfg.i15m.max_ask,
+    );
+    let config_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        era.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    info!(%config_hash, %era, "decision_loop: config era");
+    oplog.sys("decision_loop_start", serde_json::json!({
+        "config_hash": config_hash, "era": era,
+    }));
     if vcfg.enabled {
         info!(edge_min = vcfg.edge_min, vol_cap = vcfg.vol_cap, dvr_floor = vcfg.dvr_floor,
             edge_ref = vcfg.edge_ref, base_usd = controls.base_usd(), max_pos_usd = controls.max_pos_usd(),
@@ -779,13 +802,16 @@ pub async fn run_decision_task(
                             // (drained on resolution, routed to the interval's recal).
                             state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred));
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
+                            let asleep_obs = book_asleep(&state, &intent.token_id, now);
                             oplog.sys("v2_intent_open", serde_json::json!({
                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,
                                 "side": ctx.side, "stake_usd": ctx.stake_usd,
                                 "fill_price": intent.fill_price, "shares": intent.shares,
                                 "disp_bps": ctx.binance_ret_bps, "p": pred,
                                 "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
-                                "asleep": book_asleep(&state, &intent.token_id, now),
+                                "asleep": asleep_obs.map(|a| a.0),
+                                "mid_move_3s": asleep_obs.map(|a| a.1),
+                                "asleep_age_ms": asleep_obs.map(|a| a.2),
                                 "exit_ts_s": intent.exit_ts_s,
                             }));
                             info!(token = %intent.token_id, p = pred, stake = ctx.stake_usd,
