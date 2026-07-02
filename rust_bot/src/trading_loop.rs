@@ -419,6 +419,7 @@ pub fn process_kline_v2(
             s.recal_bias,
             &s.cal_z,
             &s.cal_w,
+            s.vol_lookback_s,
         ) else {
             continue;
         };

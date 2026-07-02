@@ -431,10 +431,11 @@ impl PriceHistory {
         recal_bias: f64,
         cal_z: &[f64],
         cal_w: &[f64],
+        vol_lookback_s: i64,
     ) -> Option<Features> {
         let open = self.close_at(asset, epoch_sec - 1)?; // close just before window open
         let cur = self.close_at(asset, now_sec)?;
-        let vol = self.vol_bps(asset, now_sec, 60)?;
+        let vol = self.vol_bps(asset, now_sec, vol_lookback_s)?;
         let vel = self.vel_bps(asset, now_sec, 2, up).unwrap_or(0.0);
         let d = disp_bps(open, cur, up);
         let z = zscore(d, vol, ttl_s)?;
@@ -608,6 +609,9 @@ pub struct IntervalStrat {
     /// Per-interval stake + position cap (dashboard-adjustable, independent 5m/15m).
     pub base_usd: f64,
     pub max_pos_usd: f64,
+    /// Rolling-vol lookback (seconds) for z. Matched to the horizon: 60s for 5m,
+    /// 120s for 15m (a 60s window is too twitchy for a 900s market → mis-scaled z).
+    pub vol_lookback_s: i64,
 }
 
 /// Per-interval rolling recalibrators. 5m and 15m have different base win rates, so
@@ -826,7 +830,7 @@ mod tests {
         let now = 1080;
         let ttl = 120.0;
         let f = h
-            .features("BTC", 1000, now, ttl, /*up=*/ true, /*ask=*/ 0.60, /*bias=*/ 0.0, &CAL_Z, &CAL_W)
+            .features("BTC", 1000, now, ttl, /*up=*/ true, /*ask=*/ 0.60, /*bias=*/ 0.0, &CAL_Z, &CAL_W, 60)
             .expect("features computable");
         assert!(f.disp_bps > 0.0, "up-move → positive displacement");
         assert!(f.vol_bps > 0.0 && f.vol_bps.is_finite());
@@ -834,6 +838,6 @@ mod tests {
         assert!((f.p - pcal(f.z)).abs() < 1e-12); // bias=0 → p == pcal(z)
         // Cold start: window-open is BEFORE any history (earliest bar = 999) →
         // can't price the open → None (the correct skip).
-        assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0, &CAL_Z, &CAL_W).is_none());
+        assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0, &CAL_Z, &CAL_W, 60).is_none());
     }
 }

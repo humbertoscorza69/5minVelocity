@@ -112,26 +112,30 @@ inval_stop_enabled = false
 # would-fire (oplog "inval_stop" dry_run=true) but send NO sell, even 5m while armed.
 # Run ~1 day, confirm trigger fires on ~55% of positions, THEN set false to go live.
 inval_stop_dry_run = true
+vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50
 recal_path = "data/v2/recal.json"
 
-# 15-MINUTE market as its own strategy. Defaults encode the validated 15m spec
-# (interval_15m_study, June recorder OOS):
-#   * enabled: turn 15m trading on/off independently of 5m.
-#   * z_min 0.80: 15m wins ~75% at z>=0.80 (vs ~67% at 0.45) — stricter than 5m.
-#   * late_entry_max_ttl_s 360: only enter in the last 6 min of the 900s window,
-#     where the edge lives (+0.10 EV/$1 vs +0.003 early).
-#   * max_ask 0.70: quality cap — EV/$1 climbs from +0.12 (no cap) to +0.16 at 0.70.
-#   * its OWN recal file + its own 15m calibration curve (v2.rs CAL_*_15M).
-# These are BACKTEST-informed; the recalibrator self-heals live drift. Set
-# enabled=false to instantly revert to 5m-only.
+# 15-MINUTE market as its own strategy — FORMULA-V2 (entry15_study, IS/OOS + my
+# independent rebuild; the volume-vs-money frontier winner):
+#   * vol_lookback_s 120: horizon-matched. A 60s vol window is too twitchy for a
+#     900s market -> mis-scaled z. 120s makes z honest so the EDGE gate can select.
+#   * z_min 0.70: with vol120 the low-z region is reliable (edge does the work),
+#     so we DON'T sacrifice volume for a high z-floor (0.70 chosen for margin).
+#   * late_entry_max_ttl_s 540: widened window (works under vol120, bled under vol60).
+#   * max_ask 0.70: quality cap (unchanged).
+# vs the old vol60/z0.80/<=360: SAME ~58 trades/day, higher EV/trade in BOTH IS and
+# OOS (my rebuild: +0.081/+0.140 vs +0.061/+0.094), +44% total money. Win rate reads
+# ~64-68% (NOT the 87% friendly-week live sample). BACKTEST/idealized -> expect ~half
+# live; this RESETS the live-validation clock for the 15m cell. enabled=false reverts.
 [v2.i15m]
 enabled = true
-z_min = 0.80
+z_min = 0.70
 edge_min = 0.06
 max_ask = 0.70
-late_entry_max_ttl_s = 360
+late_entry_max_ttl_s = 540
+vol_lookback_s = 120
 recal_path = "data/v2/recal_15m.json"
 recal_capacity = 300
 recal_warmup = 50

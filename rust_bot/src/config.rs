@@ -105,6 +105,10 @@ pub struct V2Config {
     /// closes an un-validated envelope. `0` = off (pre-July-2 behavior).
     #[serde(default = "d_v2_max_ttl")]
     pub max_ttl_s: i64,
+    /// Rolling-vol lookback (seconds) for z. 60s is right for the 5m horizon; the
+    /// 15m override uses 120s (a 60s window is too twitchy for a 900s market).
+    #[serde(default = "d_vol_lb_5m")]
+    pub vol_lookback_s: i64,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -150,6 +154,7 @@ fn d_z_min() -> f64 { 0.45 }
 fn d_v2_min_ttl() -> i64 { 30 }
 fn d_v2_max_ttl() -> i64 { 0 } // 0 = off (opt-in via config); set 240 for the 5m late gate
 fn d_true() -> bool { true }
+fn d_vol_lb_5m() -> i64 { 60 }
 fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
 fn d_recal_path() -> String { "data/v2/recal.json".to_string() }
@@ -157,10 +162,11 @@ fn d_tick_throttle() -> i64 { 200 }
 
 // 15-minute overrides. Defaults encode the validated 15m spec (interval_15m_study):
 // LATE entries only (last 6 min), z_min 0.80, price cap 0.70, own recal file.
-fn d_i15m_z_min() -> f64 { 0.80 }
+fn d_i15m_z_min() -> f64 { 0.70 }   // formula-v2: vol120 makes low-z honest (edge gate selects)
 fn d_i15m_edge_min() -> f64 { 0.06 }
 fn d_i15m_max_ask() -> f64 { 0.70 }
-fn d_i15m_late_ttl() -> i64 { 360 }
+fn d_i15m_late_ttl() -> i64 { 540 } // formula-v2: widened window (works under vol120)
+fn d_i15m_vol_lb() -> i64 { 120 }   // horizon-matched vol lookback
 fn d_i15m_recal_path() -> String { "data/v2/recal_15m.json".to_string() }
 
 /// Per-interval override for the 15-minute market. Only the fields that differ from
@@ -197,6 +203,9 @@ pub struct Interval15mCfg {
     pub edge_ref: f64,
     #[serde(default = "d_v2_min_ttl")]
     pub min_ttl_s: i64,
+    /// Horizon-matched vol lookback (seconds). 120 for 15m (vs 60 for 5m).
+    #[serde(default = "d_i15m_vol_lb")]
+    pub vol_lookback_s: i64,
 }
 
 impl Default for Interval15mCfg {
@@ -214,6 +223,7 @@ impl Default for Interval15mCfg {
             dvr_floor: d_dvr_floor(),
             edge_ref: d_edge_ref(),
             min_ttl_s: d_v2_min_ttl(),
+            vol_lookback_s: d_i15m_vol_lb(),
         }
     }
 }
@@ -238,6 +248,7 @@ impl V2Config {
             recal_bias,
             base_usd: 0.0, // set per-tick from Controls in the decision loop
             max_pos_usd: 0.0,
+            vol_lookback_s: self.vol_lookback_s,
         }
     }
 }
@@ -262,6 +273,7 @@ impl Interval15mCfg {
             recal_bias,
             base_usd: 0.0, // set per-tick from Controls in the decision loop
             max_pos_usd: 0.0,
+            vol_lookback_s: self.vol_lookback_s,
         }
     }
 }
@@ -277,6 +289,7 @@ impl Default for V2Config {
             z_min: d_z_min(),
             min_ttl_s: d_v2_min_ttl(),
             max_ttl_s: d_v2_max_ttl(),
+            vol_lookback_s: d_vol_lb_5m(),
             recal_capacity: d_recal_capacity(),
             recal_warmup: d_recal_warmup(),
             recal_path: d_recal_path(),
