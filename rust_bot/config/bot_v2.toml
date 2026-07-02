@@ -98,6 +98,16 @@ min_ttl_s = 30
 # an un-validated envelope. This DOMINATES an ask floor (a proxy for the same thing)
 # and keeps more volume. 0 = off.
 max_ttl_s = 240
+# inval_stop_enabled: signal-invalidation stop (TOUCH). While a position is live,
+# exit the instant side-signed displacement-from-window-open reverts to <= 0 (the
+# entry thesis is dead). 5m SELLS at the bid (only when ARMED); 15m (both assets)
+# is PAPER-LOGGED only (oplog "inval_stop" action=paper) to gather evidence.
+# Backtest (recorder, honest touch fills): hold +0.04 -> stop +0.12 EV/$1 (~3x),
+# variance -40%, 28/28 days positive; breakeven fill haircut 8-11c. Win RATE drops
+# to ~52% BY DESIGN (clips winners that dip through open) -- EV/Sharpe are what rise.
+# Graduation: BTC-15m -> live once paper dEV over >=150 stops confirms at real
+# fills; ETH-15m needs that AND a non-negative late-window split. Default false.
+inval_stop_enabled = false
 recal_capacity = 300
 recal_warmup = 50
 recal_path = "data/v2/recal.json"

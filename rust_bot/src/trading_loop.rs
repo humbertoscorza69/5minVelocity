@@ -605,11 +605,59 @@ pub async fn run_decision_task(
                             continue;
                         }
                         let resolution = p.exit_ts_s - 300; // exit_ts_s = resolution + 300
+                        let win_secs = interval_secs(&p.interval).max(1);
+                        let epoch = resolution - win_secs; // window open (5m=300s, 15m=900s)
+                        // SIGNAL-INVALIDATION STOP (touch). While the position is
+                        // still live, if side-signed displacement-from-open reverts
+                        // to <= 0 the thesis is dead -> 5m SELLS at bid (when ARMED);
+                        // 15m PAPER-LOGS only (both assets). Fires once per token.
+                        if vcfg.inval_stop_enabled
+                            && now_s < resolution
+                            && !state.v2_stopped.contains_key(&p.token_id)
+                        {
+                            if let (Some(open), Some(cur)) = (
+                                history.close_at(&p.asset, epoch - 1),
+                                history.close_at(&p.asset, now_s),
+                            ) {
+                                let up = matches!(p.side, Outcome::Up);
+                                let raw = (cur / open - 1.0) * 1e4;
+                                let disp = if up { raw } else { -raw }; // side-signed
+                                if disp <= 0.0 {
+                                    use rust_decimal::prelude::ToPrimitive;
+                                    let bid = state.bbo.get(&p.token_id).and_then(|b| b.best_bid);
+                                    let armed = match &live_gate {
+                                        Some(pth) => std::path::Path::new(pth).exists(),
+                                        None => true, // paper mode: simulated sell
+                                    };
+                                    // 5m sells for real (armed + a bid to hit); 15m
+                                    // and disarmed/no-bid = paper-log only.
+                                    let do_sell = p.interval == "5m" && armed && bid.is_some();
+                                    oplog.sys("inval_stop", serde_json::json!({
+                                        "token_id": p.token_id, "asset": p.asset,
+                                        "interval": p.interval, "side": if up {"up"} else {"down"},
+                                        "disp_bps": disp, "model_bid": bid,
+                                        "entry_ask": p.entry_price.to_f64().unwrap_or(0.0),
+                                        "sec_in": now_s - epoch, "ttl": resolution - now_s,
+                                        "action": if do_sell { "sell" } else { "paper" },
+                                    }));
+                                    if do_sell {
+                                        let _ = exec_tx.send(ExecCommand::CloseToken {
+                                            token: p.token_id.clone(),
+                                            exit_price: bid, // FOK-sell at the bid
+                                            now_ms: now,
+                                        });
+                                        info!(token = %p.token_id, disp, bid = ?bid,
+                                            "inval_stop: 5m thesis dead -> SELL at bid");
+                                    }
+                                    // Dedup (failed FOK stays marked -> holds to settle).
+                                    if state.v2_stopped.len() > 50_000 { state.v2_stopped.clear(); }
+                                    state.v2_stopped.insert(p.token_id.clone(), true);
+                                }
+                            }
+                        }
                         if now_s < resolution + 2 {
                             continue; // wait for the close (resolution-1) bar to land
                         }
-                        let win_secs = interval_secs(&p.interval).max(1);
-                        let epoch = resolution - win_secs; // window open (5m=300s, 15m=900s)
                         let (Some(op), Some(fin)) = (
                             history.close_at(&p.asset, epoch - 1),
                             history.close_at(&p.asset, resolution - 1),

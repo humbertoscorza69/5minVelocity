@@ -163,6 +163,11 @@ pub struct SharedState {
     /// relayer redeem. Drained by `run_positions_refresh` to book P&L immediately,
     /// so the dashboard never waits on (rate-limited) redemption. Empty when v2 off.
     pub v2_settled: DashMap<String, bool>,
+    /// v2 signal-invalidation stop: token ids whose thesis has been invalidated
+    /// (side-signed displacement crossed <= 0) and already actioned (5m sell /
+    /// 15m paper-log). Dedup so the per-second sweep fires each stop at most once;
+    /// a failed FOK sell stays marked and the position simply holds to settlement.
+    pub v2_stopped: DashMap<String, bool>,
     /// PIECE 4 (active-only enrichment): per-token RESOLUTION flag derived from
     /// the data-api `/positions` snapshot (redeemable OR cur_price ∈ {0,1} OR
     /// end_date past). Updated periodically by `run_positions_refresh`. Missing
@@ -195,6 +200,7 @@ impl SharedState {
             balance_milli: AtomicI64::new(-1),
             v2_pred: DashMap::new(),
             v2_settled: DashMap::new(),
+            v2_stopped: DashMap::new(),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),
             started_at: Instant::now(),

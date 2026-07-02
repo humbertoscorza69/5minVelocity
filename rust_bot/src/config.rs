@@ -121,6 +121,14 @@ pub struct V2Config {
     /// Min ms between tick-driven evaluations (throttle the aggTrade firehose).
     #[serde(default = "d_tick_throttle")]
     pub tick_throttle_ms: i64,
+    /// SIGNAL-INVALIDATION STOP (touch): while a position is live, exit the instant
+    /// side-signed displacement-from-window-open reverts to <= 0 (the thesis is
+    /// dead). 5m sells for real at the bid (when ARMED); 15m is PAPER-LOGGED only
+    /// (both assets) to gather evidence before graduating. Backtest: hold +0.04 ->
+    /// stop +0.12 EV/$1 honest, ~3x, variance -40%, 28/28 recorder days positive;
+    /// breakeven fill haircut 8-11c. Default false (inert) — arm consciously.
+    #[serde(default)]
+    pub inval_stop_enabled: bool,
     /// 15-minute market as its OWN strategy (late-entry, higher z_min, price cap,
     /// its own recalibrator). Absent/disabled = 5m-only (no behavior change).
     #[serde(default)]
@@ -262,6 +270,7 @@ impl Default for V2Config {
             recal_path: d_recal_path(),
             tick_driven: false,
             tick_throttle_ms: d_tick_throttle(),
+            inval_stop_enabled: false,
             i15m: Interval15mCfg::default(),
         }
     }
