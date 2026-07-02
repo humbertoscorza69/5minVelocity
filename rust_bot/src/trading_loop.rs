@@ -69,6 +69,11 @@ pub struct DecisionCtx {
     pub binance_ret_bps: f64,
     pub window_s: i64,
     pub stake_usd: f64,
+    /// Vol-normalized displacement at entry (the PRIMARY gate variable). Logged so
+    /// live z-analysis needs no reconstruction. 0.0 on the legacy (non-v2) path.
+    pub z: f64,
+    /// Seconds-to-settle at entry (the ttl the max-ttl gate acts on). 0 on legacy.
+    pub ttl_s: i64,
 }
 
 /// A command from the decision task to the execution task.
@@ -271,6 +276,8 @@ pub fn process_kline(
                     binance_ret_bps: trig.ret_bps,
                     window_s: trig.window_s as i64,
                     stake_usd: cfg.stake_usd,
+                    z: 0.0, // legacy path: z not computed
+                    ttl_s: 0,
                 };
                 cmds.push(ExecCommand::Open {
                     intent: OpenIntent {
@@ -433,6 +440,8 @@ pub fn process_kline_v2(
             binance_ret_bps: f.disp_bps,
             window_s: 0,
             stake_usd: stake,
+            z: f.z,
+            ttl_s: ttl,
         };
         let intent = OpenIntent {
             token_id: bet_token,
@@ -748,6 +757,7 @@ pub async fn run_decision_task(
                                 "side": ctx.side, "stake_usd": ctx.stake_usd,
                                 "fill_price": intent.fill_price, "shares": intent.shares,
                                 "disp_bps": ctx.binance_ret_bps, "p": pred,
+                                "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
                                 "exit_ts_s": intent.exit_ts_s,
                             }));
                             info!(token = %intent.token_id, p = pred, stake = ctx.stake_usd,
