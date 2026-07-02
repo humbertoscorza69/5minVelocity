@@ -158,6 +158,10 @@ fn apply_control(controls: &crate::v2::Controls, path: &str) {
             // Accept both "1.05" and "1,05" (locale-tolerant) before parsing.
             "base_usd" => if let Ok(x) = v.replace(',', ".").parse::<f64>() { controls.set_base_usd(x) },
             "max_pos" => if let Ok(x) = v.replace(',', ".").parse::<f64>() { controls.set_max_pos_usd(x) },
+            "base_usd_15m" => if let Ok(x) = v.replace(',', ".").parse::<f64>() { controls.set_base_usd_15m(x) },
+            "max_pos_15m" => if let Ok(x) = v.replace(',', ".").parse::<f64>() { controls.set_max_pos_15m(x) },
+            "inval_stop" => controls.set_inval_stop_on(matches!(v, "1" | "true" | "on")),
+            "inval_stop_dry" => controls.set_inval_stop_dry(matches!(v, "1" | "true" | "on")),
             _ => {}
         }
     }
@@ -357,6 +361,10 @@ fn compute_stats(
             "enabled": controls.enabled(),
             "base_usd": controls.base_usd(),
             "max_pos": controls.max_pos_usd(),
+            "base_usd_15m": controls.base_usd_15m(),
+            "max_pos_15m": controls.max_pos_15m(),
+            "inval_stop": controls.inval_stop_on(),
+            "inval_stop_dry": controls.inval_stop_dry(),
         },
         "live": {
             "mode": mode,
@@ -446,8 +454,11 @@ tbody tr:hover{background:var(--panel2)}
   <div class="panel"><h2>Controls</h2>
     <div class="ctlrow">
       <button id="toggle" class="btn">—</button>
-      <label>Stake base $ <input id="in_base" type="number" step="0.05" min="0.1"></label>
-      <label>Max position $ <input id="in_max" type="number" step="1" min="0.1"></label>
+      <button id="stopbtn" class="btn" title="Cycle: OFF → DRY-RUN (log only) → LIVE (sells 5m)">—</button>
+      <label>5m base $ <input id="in_base" type="number" step="0.05" min="0.1"></label>
+      <label>5m max $ <input id="in_max" type="number" step="1" min="0.1"></label>
+      <label>15m base $ <input id="in_base15" type="number" step="0.05" min="0.1"></label>
+      <label>15m max $ <input id="in_max15" type="number" step="1" min="0.1"></label>
       <button id="apply" class="btn alt">Apply</button>
       <span id="ctl_msg" class="muted"></span>
       <span style="flex:1"></span>
@@ -528,6 +539,12 @@ async function tick(){
   tg.textContent=c.enabled?"● TRADING ON":"○ TRADING OFF";tg.className="btn "+(c.enabled?"on":"off");
   if(document.activeElement!==$("in_base"))$("in_base").value=(+c.base_usd).toFixed(2);
   if(document.activeElement!==$("in_max"))$("in_max").value=(+c.max_pos).toFixed(2);
+  if(document.activeElement!==$("in_base15"))$("in_base15").value=(+c.base_usd_15m).toFixed(2);
+  if(document.activeElement!==$("in_max15"))$("in_max15").value=(+c.max_pos_15m).toFixed(2);
+  const sb=$("stopbtn");
+  if(!c.inval_stop){sb.textContent="STOP: OFF";sb.className="btn off";}
+  else if(c.inval_stop_dry){sb.textContent="STOP: DRY-RUN";sb.className="btn kill";}
+  else{sb.textContent="STOP: LIVE ●";sb.className="btn on";}
   const lv=s.live;
   $("modebadge").textContent=lv.mode.toUpperCase();$("modebadge").className="pill "+(lv.mode==="live"?"bad":"ok");
   $("mode").textContent=lv.mode.toUpperCase();$("mode").className="pill "+(lv.mode==="live"?"bad":"ok");
@@ -572,7 +589,13 @@ document.querySelectorAll(".btn.seg").forEach(b=>b.onclick=()=>{
   render();
 });
 $("toggle").onclick=async()=>{const on=$("toggle").classList.contains("on");try{await fetch("/api/control?enabled="+(on?"false":"true"),{method:"POST"})}catch(e){}tick()};
-$("apply").onclick=async()=>{const b=$("in_base").value,m=$("in_max").value;try{await fetch(`/api/control?base_usd=${encodeURIComponent(b)}&max_pos=${encodeURIComponent(m)}`,{method:"POST"})}catch(e){}$("ctl_msg").textContent="applied ✓";setTimeout(()=>$("ctl_msg").textContent="",1800);tick()};
+$("apply").onclick=async()=>{const b=$("in_base").value,m=$("in_max").value,b15=$("in_base15").value,m15=$("in_max15").value;try{await fetch(`/api/control?base_usd=${encodeURIComponent(b)}&max_pos=${encodeURIComponent(m)}&base_usd_15m=${encodeURIComponent(b15)}&max_pos_15m=${encodeURIComponent(m15)}`,{method:"POST"})}catch(e){}$("ctl_msg").textContent="applied ✓";setTimeout(()=>$("ctl_msg").textContent="",1800);tick()};
+// Invalidation stop: cycle OFF -> DRY-RUN -> LIVE -> OFF. LIVE prompts (it sells).
+$("stopbtn").onclick=async()=>{const t=$("stopbtn").textContent;let q;
+  if(t.includes("OFF"))q="inval_stop=true&inval_stop_dry=true";        // -> DRY
+  else if(t.includes("DRY")){if(!confirm("Arm the invalidation stop LIVE? It will SELL 5m positions at the bid when the signal invalidates. Win rate will drop to ~52% by design."))return;q="inval_stop=true&inval_stop_dry=false";} // -> LIVE
+  else q="inval_stop=false";                                          // -> OFF
+  try{await fetch("/api/control?"+q,{method:"POST"})}catch(e){}tick()};
 $("arm").onclick=async()=>{const armed=$("arm").classList.contains("armed");
   if(!armed && !confirm("ARM live trading?\n\nReal orders will post when the bot is in --mode live and a signal fires. Make sure your stake is set correctly first.")) return;
   try{await fetch("/api/control?arm="+(armed?"false":"true"),{method:"POST"})}catch(e){}

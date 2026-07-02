@@ -236,6 +236,8 @@ impl V2Config {
             cal_z: crate::v2::CAL_Z.to_vec(),
             cal_w: crate::v2::CAL_W.to_vec(),
             recal_bias,
+            base_usd: 0.0, // set per-tick from Controls in the decision loop
+            max_pos_usd: 0.0,
         }
     }
 }
@@ -258,6 +260,8 @@ impl Interval15mCfg {
             cal_z: crate::v2::CAL_Z_15M.to_vec(),
             cal_w: crate::v2::CAL_W_15M.to_vec(),
             recal_bias,
+            base_usd: 0.0, // set per-tick from Controls in the decision loop
+            max_pos_usd: 0.0,
         }
     }
 }

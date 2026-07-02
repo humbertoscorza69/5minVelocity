@@ -463,17 +463,35 @@ impl PriceHistory {
 #[derive(Debug)]
 pub struct Controls {
     trading_enabled: AtomicBool,
-    base_usd_milli: AtomicU64,
-    max_pos_milli: AtomicU64,
+    base_usd_milli: AtomicU64,      // 5m stake
+    max_pos_milli: AtomicU64,       // 5m cap
+    base_usd_15m_milli: AtomicU64,  // 15m stake (independent)
+    max_pos_15m_milli: AtomicU64,   // 15m cap
+    inval_stop_on: AtomicBool,      // invalidation stop master switch (dashboard)
+    inval_stop_dry: AtomicBool,     // stop DRY-RUN (log would-fires, no sell)
 }
 
 impl Controls {
     #[must_use]
-    pub fn new(trading_enabled: bool, base_usd: f64, max_pos_usd: f64) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        trading_enabled: bool,
+        base_usd: f64,
+        max_pos_usd: f64,
+        base_usd_15m: f64,
+        max_pos_15m: f64,
+        inval_stop_on: bool,
+        inval_stop_dry: bool,
+    ) -> Self {
+        let m = |v: f64| AtomicU64::new((v.max(0.0) * 1000.0) as u64);
         Self {
             trading_enabled: AtomicBool::new(trading_enabled),
-            base_usd_milli: AtomicU64::new((base_usd.max(0.0) * 1000.0) as u64),
-            max_pos_milli: AtomicU64::new((max_pos_usd.max(0.0) * 1000.0) as u64),
+            base_usd_milli: m(base_usd),
+            max_pos_milli: m(max_pos_usd),
+            base_usd_15m_milli: m(base_usd_15m),
+            max_pos_15m_milli: m(max_pos_15m),
+            inval_stop_on: AtomicBool::new(inval_stop_on),
+            inval_stop_dry: AtomicBool::new(inval_stop_dry),
         }
     }
     #[must_use]
@@ -489,16 +507,53 @@ impl Controls {
     }
     /// Clamp to a sane floor (>= $0.10) so a fat-finger can't set $0 / negative.
     pub fn set_base_usd(&self, v: f64) {
-        let v = v.clamp(0.10, 10_000.0);
-        self.base_usd_milli.store((v * 1000.0) as u64, Ordering::Relaxed);
+        self.base_usd_milli.store((v.clamp(0.10, 10_000.0) * 1000.0) as u64, Ordering::Relaxed);
     }
     #[must_use]
     pub fn max_pos_usd(&self) -> f64 {
         self.max_pos_milli.load(Ordering::Relaxed) as f64 / 1000.0
     }
     pub fn set_max_pos_usd(&self, v: f64) {
-        let v = v.clamp(0.10, 10_000.0);
-        self.max_pos_milli.store((v * 1000.0) as u64, Ordering::Relaxed);
+        self.max_pos_milli.store((v.clamp(0.10, 10_000.0) * 1000.0) as u64, Ordering::Relaxed);
+    }
+    // --- 15m sizing (independent of 5m) ---
+    #[must_use]
+    pub fn base_usd_15m(&self) -> f64 {
+        self.base_usd_15m_milli.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    pub fn set_base_usd_15m(&self, v: f64) {
+        self.base_usd_15m_milli.store((v.clamp(0.10, 10_000.0) * 1000.0) as u64, Ordering::Relaxed);
+    }
+    #[must_use]
+    pub fn max_pos_15m(&self) -> f64 {
+        self.max_pos_15m_milli.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+    pub fn set_max_pos_15m(&self, v: f64) {
+        self.max_pos_15m_milli.store((v.clamp(0.10, 10_000.0) * 1000.0) as u64, Ordering::Relaxed);
+    }
+    /// Per-interval stake/cap (15m uses its own; everything else = 5m).
+    #[must_use]
+    pub fn base_usd_for(&self, interval: &str) -> f64 {
+        if interval == "15m" { self.base_usd_15m() } else { self.base_usd() }
+    }
+    #[must_use]
+    pub fn max_pos_for(&self, interval: &str) -> f64 {
+        if interval == "15m" { self.max_pos_15m() } else { self.max_pos_usd() }
+    }
+    // --- invalidation stop (dashboard live control) ---
+    #[must_use]
+    pub fn inval_stop_on(&self) -> bool {
+        self.inval_stop_on.load(Ordering::Relaxed)
+    }
+    pub fn set_inval_stop_on(&self, v: bool) {
+        self.inval_stop_on.store(v, Ordering::Relaxed);
+    }
+    #[must_use]
+    pub fn inval_stop_dry(&self) -> bool {
+        self.inval_stop_dry.load(Ordering::Relaxed)
+    }
+    pub fn set_inval_stop_dry(&self, v: bool) {
+        self.inval_stop_dry.store(v, Ordering::Relaxed);
     }
 }
 
@@ -550,6 +605,9 @@ pub struct IntervalStrat {
     pub cal_w: Vec<f64>,
     /// Current rolling-recalibrator de-bias for this interval.
     pub recal_bias: f64,
+    /// Per-interval stake + position cap (dashboard-adjustable, independent 5m/15m).
+    pub base_usd: f64,
+    pub max_pos_usd: f64,
 }
 
 /// Per-interval rolling recalibrators. 5m and 15m have different base win rates, so

@@ -357,8 +357,6 @@ pub fn process_kline_v2(
     catalog: &dyn MarketCatalog,
     book: &dyn BookProvider,
     strats: &std::collections::HashMap<&'static str, crate::v2::IntervalStrat>,
-    base_usd: f64,
-    max_pos_usd: f64,
     positions: &[OpenPosition],
     now_ms: i64,
     disabled: &[String],
@@ -440,11 +438,11 @@ pub fn process_kline_v2(
         // depth via the book channel later to also avoid wasted FOK-kills.)
         let stake = crate::v2::edge_stake(
             f.edge,
-            base_usd,
+            s.base_usd,
             s.edge_ref,
-            base_usd.min(1.05),
-            max_pos_usd,
-            max_pos_usd,
+            s.base_usd.min(1.05),
+            s.max_pos_usd,
+            s.max_pos_usd,
         );
         if stake <= 0.0 {
             continue;
@@ -664,7 +662,7 @@ pub async fn run_decision_task(
                         // still live, if side-signed displacement-from-open reverts
                         // to <= 0 the thesis is dead -> 5m SELLS at bid (when ARMED);
                         // 15m PAPER-LOGS only (both assets). Fires once per token.
-                        if vcfg.inval_stop_enabled
+                        if controls.inval_stop_on()
                             && now_s < resolution
                             && !state.v2_stopped.contains_key(&p.token_id)
                         {
@@ -688,7 +686,7 @@ pub async fn run_decision_task(
                                     let do_sell = p.interval == "5m"
                                         && armed
                                         && bid.is_some()
-                                        && !vcfg.inval_stop_dry_run;
+                                        && !controls.inval_stop_dry();
                                     oplog.sys("inval_stop", serde_json::json!({
                                         "token_id": p.token_id, "asset": p.asset,
                                         "interval": p.interval, "side": if up {"up"} else {"down"},
@@ -696,7 +694,7 @@ pub async fn run_decision_task(
                                         "entry_ask": p.entry_price.to_f64().unwrap_or(0.0),
                                         "sec_in": now_s - epoch, "ttl": resolution - now_s,
                                         "action": if do_sell { "sell" } else { "paper" },
-                                        "dry_run": vcfg.inval_stop_dry_run,
+                                        "dry_run": controls.inval_stop_dry(),
                                     }));
                                     if do_sell {
                                         let _ = exec_tx.send(ExecCommand::CloseToken {
@@ -768,11 +766,17 @@ pub async fn run_decision_task(
                     // its own gates + curve + recal, gated by v2.i15m.enabled.
                     let mut strats: std::collections::HashMap<&'static str, crate::v2::IntervalStrat> =
                         std::collections::HashMap::with_capacity(2);
-                    strats.insert("5m", vcfg.strat_5m(recal.bias("5m")));
-                    strats.insert("15m", vcfg.i15m.strat(vcfg.enabled, recal.bias("15m")));
+                    let mut s5 = vcfg.strat_5m(recal.bias("5m"));
+                    s5.base_usd = controls.base_usd_for("5m");
+                    s5.max_pos_usd = controls.max_pos_for("5m");
+                    strats.insert("5m", s5);
+                    let mut s15 = vcfg.i15m.strat(vcfg.enabled, recal.bias("15m"));
+                    s15.base_usd = controls.base_usd_for("15m");
+                    s15.max_pos_usd = controls.max_pos_for("15m");
+                    strats.insert("15m", s15);
                     let cmds = process_kline_v2(
                         &mut history, &kline, &catalog, &book, &strats,
-                        controls.base_usd(), controls.max_pos_usd(), &positions, now, &disabled_cells,
+                        &positions, now, &disabled_cells,
                     );
                     for (cmd, pred) in cmds {
                         if let ExecCommand::Open { intent, ctx } = &cmd {
@@ -3126,7 +3130,7 @@ mod tests {
             false,    // G5-test-rig: default OFF = no filter
             vec![],   // disabled_cells: default OFF = no production filter
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
-            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
+            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true)),
             crate::v2::RecalSet {
                 m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
                 m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
@@ -3233,7 +3237,7 @@ mod tests {
             false,    // G5-test-rig: default OFF = no filter
             vec![],   // disabled_cells: default OFF = no production filter
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
-            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
+            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true)),
             crate::v2::RecalSet {
                 m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
                 m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
@@ -3450,7 +3454,7 @@ mod tests {
             false,            // G5-test-rig: OFF
             disabled.clone(), // PRODUCTION filter: drop ETH:15m
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
-            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0)),
+            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true)),
             crate::v2::RecalSet {
                 m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
                 m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),

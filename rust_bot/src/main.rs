@@ -1119,7 +1119,15 @@ async fn main() -> anyhow::Result<()> {
         // with trading ENABLED and the config stakes; the dashboard can change
         // both at runtime without a restart. (LIVE_ARMED still gates live POSTs.)
         let controls_shared: std::sync::Arc<v2::Controls> = std::sync::Arc::new(
-            v2::Controls::new(true, config.stakes.base_usdc, config.stakes.max_position_usdc),
+            v2::Controls::new(
+                true,
+                config.stakes.base_usdc,
+                config.stakes.max_position_usdc,
+                config.stakes.base_usdc,            // 15m stake defaults = 5m (adjust on dashboard)
+                config.stakes.max_position_usdc,
+                config.v2.inval_stop_enabled,       // stop master switch from config
+                config.v2.inval_stop_dry_run,       // stop dry-run from config
+            ),
         );
         let mut handles: Vec<JoinHandle<()>> = vec![
             tokio::spawn(trading_loop::run_decision_task(
