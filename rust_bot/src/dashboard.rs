@@ -213,6 +213,9 @@ fn compute_stats(
     //      recorder, live wins (redeemed) never show as closed/realized. ----
     let mut entries = 0u64;
     let mut blocked = 0u64;
+    // Health classification: total order rollbacks, DETERMINISTIC rejections (bugs
+    // that will keep failing — precision/amount), and normal FOK kills (benign).
+    let (mut rolled_back, mut det_errors, mut fok_kills) = (0u64, 0u64, 0u64);
     // (ts_ms, net_pnl, token, side, entry, exit, interval)
     let mut rev: Vec<(i64, f64, String, String, Option<f64>, Option<f64>, String)> = Vec::new();
 
@@ -225,6 +228,17 @@ fn compute_stats(
             match kind {
                 "v2_intent_open" => entries += 1,
                 "v2_guard_blocked_open" => blocked += 1,
+                "live_open_rolled_back" => rolled_back += 1,
+                "error" | "api_error" => {
+                    let et = v.get("data").and_then(|d| d.get("error_text"))
+                        .and_then(Value::as_str).unwrap_or("");
+                    // Deterministic = same order fails forever (precision/amount) — a BUG.
+                    if et.contains("accuracy") || et.contains("decimal") || et.contains("invalid amounts") {
+                        det_errors += 1;
+                    } else if et.contains("fully filled") {
+                        fok_kills += 1; // benign: FOK couldn't fill at price
+                    }
+                }
                 _ => {}
             }
             // NOTE: pnl_recorder_recorded / pnl_recorded_at_redeem are the recorder's
@@ -321,7 +335,37 @@ fn compute_stats(
 
     let bal_milli = state.balance_milli.load(std::sync::atomic::Ordering::Relaxed);
     let balance: Value = if bal_milli < 0 { Value::Null } else { json!(bal_milli as f64 / 1000.0) };
+
+    // ---- HEALTH REPORT: surface subtle failures the operator would otherwise miss.
+    //      ALERT (red) = money is leaking or the bot is blind; WARN (amber) = degraded.
+    use std::sync::atomic::Ordering::Relaxed;
+    let posted = entries.saturating_sub(rolled_back);
+    let fill_rate = if entries > 0 { posted as f64 / entries as f64 } else { 1.0 };
+    let uptime_h = ((now - started_ms).max(1) as f64) / 3_600_000.0;
+    let reconnects = state.counters.reconnects.load(Relaxed);
+    let recon_per_hr = reconnects as f64 / uptime_h.max(0.05);
+    let bn_up = state.binance_connected.load(Relaxed);
+    let pm_up = state.polymarket_connected.load(Relaxed);
+    let mut alerts: Vec<String> = Vec::new();
+    let mut warns: Vec<String> = Vec::new();
+    if !bn_up { alerts.push("Binance feed DOWN".into()); }
+    if !pm_up { alerts.push("Polymarket feed DOWN".into()); }
+    if !state.is_healthy() { alerts.push("feed stale / halted".into()); }
+    if det_errors > 0 { alerts.push(format!("{det_errors} order rejections — DETERMINISTIC bug (orders won't fill)")); }
+    if entries >= 20 && fill_rate < 0.50 { alerts.push(format!("fill rate {:.0}% ({posted}/{entries}) — most orders rejected", fill_rate * 100.0)); }
+    if recon_per_hr > 20.0 { warns.push(format!("WS unstable: {:.0} reconnects/hr", recon_per_hr)); }
+    if entries >= 20 && (0.50..0.70).contains(&fill_rate) { warns.push(format!("fill rate {:.0}%", fill_rate * 100.0)); }
+    let status = if !alerts.is_empty() { "alert" } else if !warns.is_empty() { "warn" } else { "ok" };
+    let issues: Vec<String> = alerts.into_iter().chain(warns).collect();
+    let health_report = json!({
+        "status": status, "issues": issues,
+        "fill_rate": fill_rate, "posted": posted, "intents_total": entries,
+        "det_errors": det_errors, "fok_kills": fok_kills, "rolled_back": rolled_back,
+        "reconnects": reconnects, "reconnects_per_hr": recon_per_hr,
+    });
+
     json!({
+        "health_report": health_report,
         "now_ms": now,
         "uptime_s": (now - started_ms).max(0) / 1000,
         "balance": balance,
@@ -441,6 +485,11 @@ tbody tr:hover{background:var(--panel2)}
 .ctlrow input{width:92px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:7px 9px;font-size:13px;font-variant-numeric:tabular-nums}
 .btn.seg{padding:6px 15px;font-size:12px;font-weight:600}
 .btn.seg.sel{color:var(--acc);border-color:var(--acc);background:#0d1b2e}
+.healthbar{border-radius:10px;padding:11px 15px;margin-bottom:14px;font-weight:650;font-size:13px;letter-spacing:.2px}
+.healthbar.ok{background:#0f2417;border:1px solid #1c3a25;color:var(--grn)}
+.healthbar.warn{background:#241f0a;border:1px solid #3a2c10;color:var(--amb)}
+.healthbar.alert{background:#2a0f12;border:1px solid var(--red);color:var(--red);animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.62}}
 </style></head><body>
 <header>
   <h1>⚡ v2 bot <span class="muted" style="font-weight:400">— Polymarket lag-arb (5minSnip)</span></h1>
@@ -451,6 +500,7 @@ tbody tr:hover{background:var(--panel2)}
   <span id="up" class="pill"></span>
 </header>
 <div class="wrap">
+  <div id="healthbar" class="healthbar ok">● checking…</div>
   <div class="panel"><h2>Controls</h2>
     <div class="ctlrow">
       <button id="toggle" class="btn">—</button>
@@ -528,8 +578,24 @@ function drawChart(curve){
   x.beginPath();curve.forEach((p,i)=>{const px=X(p.t),py=Y(p.pnl);i?x.lineTo(px,py):x.moveTo(px,py)});
   x.strokeStyle=col;x.lineWidth=2;x.stroke();
 }
+function notify(title,body){try{if(!("Notification"in window))return;if(Notification.permission==="granted"){new Notification(title,{body})}else if(Notification.permission!=="denied"){Notification.requestPermission().then(p=>{if(p==="granted")new Notification(title,{body})})}}catch(e){}}
+function renderHealth(h){
+  const hb=$("healthbar");if(!h){return}
+  hb.className="healthbar "+h.status;
+  if(h.status==="ok"){
+    hb.textContent="● HEALTHY — fills "+(h.fill_rate*100).toFixed(0)+"% ("+h.posted+"/"+h.intents_total+") · "+h.reconnects+" reconnects · "+h.fok_kills+" FOK kills · 0 order bugs";
+    document.title="v2 bot — live";
+  }else{
+    const ic=h.status==="alert"?"⛔ ALERT":"▲ WARN";
+    hb.textContent=ic+" — "+h.issues.join("     ·     ");
+    document.title=(h.status==="alert"?"⛔ ":"▲ ")+"v2 bot — "+(h.issues[0]||"");
+  }
+  if(h.status==="alert"&&window.__lastHealth!=="alert")notify("⛔ Bot ALERT",h.issues.join(" · "));
+  window.__lastHealth=h.status;
+}
 async function tick(){
-  let s;try{s=await(await fetch("/api/stats",{cache:"no-store"})).json()}catch(e){$("foot").textContent="disconnected — retrying…";return}
+  let s;try{s=await(await fetch("/api/stats",{cache:"no-store"})).json()}catch(e){$("foot").textContent="disconnected — retrying…";$("healthbar").className="healthbar alert";$("healthbar").textContent="⛔ ALERT — dashboard can't reach the bot (process down?)";document.title="⛔ v2 bot — DOWN";return}
+  renderHealth(s.health_report);
   pill($("bn"),s.health.binance,"Binance "+(s.health.binance?"●":"○"));
   pill($("pm"),s.health.polymarket,"Polymarket "+(s.health.polymarket?"●":"○"));
   $("up").textContent="uptime "+fmtAge(s.uptime_s)+" · "+s.health.active_tokens+" mkts · "+s.health.decisions+" dec";

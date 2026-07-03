@@ -138,12 +138,23 @@ async fn session(
         return SessionEnd::Lost(format!("subscribe send failed: {e}"));
     }
 
+    // Client-initiated keepalive: proactively ping every 15s so an idle/half-open
+    // connection (or a proxy that expects client liveness) can't silently rot into
+    // a "connection reset". The server Pongs (ignored below). Cheap insurance on top
+    // of the fast-reconnect supervisor.
+    let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let end = loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let _ = write.send(Message::Close(None)).await;
                     break SessionEnd::Shutdown;
+                }
+            }
+            _ = keepalive.tick() => {
+                if write.send(Message::Ping(Default::default())).await.is_err() {
+                    break SessionEnd::Lost("keepalive ping send failed".into());
                 }
             }
             changed = token_rx.changed() => {
