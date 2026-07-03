@@ -216,6 +216,12 @@ fn compute_stats(
     // Health classification: total order rollbacks, DETERMINISTIC rejections (bugs
     // that will keep failing — precision/amount), and normal FOK kills (benign).
     let (mut rolled_back, mut det_errors, mut fok_kills) = (0u64, 0u64, 0u64);
+    // Trailing-window fill rate: each intent's signal_id in order + the set that
+    // rolled back, so the alarm fires on a FRESH rejection storm within ~N intents
+    // regardless of how long the session has been healthy (cumulative would dilute
+    // for hours). Paired by signal_id (both events carry it).
+    let mut intent_sids: Vec<String> = Vec::new();
+    let mut rolled_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (ts_ms, net_pnl, token, side, entry, exit, interval)
     let mut rev: Vec<(i64, f64, String, String, Option<f64>, Option<f64>, String)> = Vec::new();
 
@@ -225,10 +231,17 @@ fn compute_stats(
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
             if ts < started_ms { continue; } // session-scope
+            let sid = || v.get("data").and_then(|d| d.get("signal_id")).and_then(Value::as_str);
             match kind {
-                "v2_intent_open" => entries += 1,
+                "v2_intent_open" => {
+                    entries += 1;
+                    if let Some(s) = sid() { intent_sids.push(s.to_string()); }
+                }
                 "v2_guard_blocked_open" => blocked += 1,
-                "live_open_rolled_back" => rolled_back += 1,
+                "live_open_rolled_back" => {
+                    rolled_back += 1;
+                    if let Some(s) = sid() { rolled_sids.insert(s.to_string()); }
+                }
                 "error" | "api_error" => {
                     let et = v.get("data").and_then(|d| d.get("error_text"))
                         .and_then(Value::as_str).unwrap_or("");
@@ -340,7 +353,15 @@ fn compute_stats(
     //      ALERT (red) = money is leaking or the bot is blind; WARN (amber) = degraded.
     use std::sync::atomic::Ordering::Relaxed;
     let posted = entries.saturating_sub(rolled_back);
-    let fill_rate = if entries > 0 { posted as f64 / entries as f64 } else { 1.0 };
+    let fill_rate = if entries > 0 { posted as f64 / entries as f64 } else { 1.0 }; // cumulative (display)
+    // TRAILING-WINDOW fill rate over the last N intents — the ALARM signal. A fresh
+    // rejection storm trips this within ~N intents even after days of healthy fills
+    // (cumulative would dilute for hours). Paired to outcomes by signal_id.
+    const WIN: usize = 40;
+    let recent = if intent_sids.len() > WIN { &intent_sids[intent_sids.len() - WIN..] } else { &intent_sids[..] };
+    let win_n = recent.len();
+    let win_failed = recent.iter().filter(|s| rolled_sids.contains(*s)).count();
+    let fill_rate_win = if win_n > 0 { (win_n - win_failed) as f64 / win_n as f64 } else { 1.0 };
     let uptime_h = ((now - started_ms).max(1) as f64) / 3_600_000.0;
     let reconnects = state.counters.reconnects.load(Relaxed);
     let recon_per_hr = reconnects as f64 / uptime_h.max(0.05);
@@ -352,14 +373,15 @@ fn compute_stats(
     if !pm_up { alerts.push("Polymarket feed DOWN".into()); }
     if !state.is_healthy() { alerts.push("feed stale / halted".into()); }
     if det_errors > 0 { alerts.push(format!("{det_errors} order rejections — DETERMINISTIC bug (orders won't fill)")); }
-    if entries >= 20 && fill_rate < 0.50 { alerts.push(format!("fill rate {:.0}% ({posted}/{entries}) — most orders rejected", fill_rate * 100.0)); }
+    if win_n >= 20 && fill_rate_win < 0.50 { alerts.push(format!("fill rate {:.0}% (last {win_n}) — most orders rejected", fill_rate_win * 100.0)); }
     if recon_per_hr > 20.0 { warns.push(format!("WS unstable: {:.0} reconnects/hr", recon_per_hr)); }
-    if entries >= 20 && (0.50..0.70).contains(&fill_rate) { warns.push(format!("fill rate {:.0}%", fill_rate * 100.0)); }
+    if win_n >= 20 && (0.50..0.70).contains(&fill_rate_win) { warns.push(format!("fill rate {:.0}% (last {win_n})", fill_rate_win * 100.0)); }
     let status = if !alerts.is_empty() { "alert" } else if !warns.is_empty() { "warn" } else { "ok" };
     let issues: Vec<String> = alerts.into_iter().chain(warns).collect();
     let health_report = json!({
         "status": status, "issues": issues,
-        "fill_rate": fill_rate, "posted": posted, "intents_total": entries,
+        "fill_rate": fill_rate_win, "fill_rate_cumulative": fill_rate,
+        "window_n": win_n, "posted": posted, "intents_total": entries,
         "det_errors": det_errors, "fok_kills": fok_kills, "rolled_back": rolled_back,
         "reconnects": reconnects, "reconnects_per_hr": recon_per_hr,
     });
@@ -583,7 +605,7 @@ function renderHealth(h){
   const hb=$("healthbar");if(!h){return}
   hb.className="healthbar "+h.status;
   if(h.status==="ok"){
-    hb.textContent="● HEALTHY — fills "+(h.fill_rate*100).toFixed(0)+"% ("+h.posted+"/"+h.intents_total+") · "+h.reconnects+" reconnects · "+h.fok_kills+" FOK kills · 0 order bugs";
+    hb.textContent="● HEALTHY — fills "+(h.fill_rate*100).toFixed(0)+"% (last "+h.window_n+") · "+(h.fill_rate_cumulative*100).toFixed(0)+"% overall · "+h.reconnects+" reconnects · "+h.fok_kills+" FOK kills · 0 order bugs";
     document.title="v2 bot — live";
   }else{
     const ic=h.status==="alert"?"⛔ ALERT":"▲ WARN";
