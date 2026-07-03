@@ -236,11 +236,14 @@ pub async fn build_sign_maybe_post<S: Signer>(
     // 2. Build via the SDK (runs precision/amount validation — the A2 fix-3 path).
     let tok = U256::from_str_radix(&spec.token_id, 10)
         .map_err(|e| anyhow!("token_id parse: {e}"))?;
-    // Round to Polymarket's 6-decimal USDC/shares precision. The edge-proportional
-    // stake is a raw float (e.g. 1.1442227035581272) → the SDK rejects >6 dp with
-    // "Unable to build Amount with 15 decimal points, must be <= 6", silently killing
-    // every odd-sized order. Round-to-zero so we never spend above the intended size.
-    let amt = spec.amount.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero);
+    // Quantize to Polymarket's venue precision. This is the hard boundary that owns
+    // executability: market-BUY USDC amount and market-SELL shares BOTH cap at 2
+    // decimals. The SDK's own 6dp check passes at build time, but the CLOB rejects
+    // >2dp market-buy maker amounts at POST ("max accuracy of 2 decimals") — which
+    // silently killed ~84% of orders once edge-scaled stakes went non-cent. FLOOR
+    // (round-to-zero) so we never spend/sell above the intended size. (edge_stake
+    // already floors the buy stake to cents; this guarantees it for every path.)
+    let amt = spec.amount.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
     let amount = match spec.side {
         OrderSide::Buy => Amount::usdc(amt).map_err(|e| anyhow!("usdc amount: {e}"))?,
         OrderSide::Sell => Amount::shares(amt).map_err(|e| anyhow!("shares amount: {e}"))?,

@@ -242,7 +242,13 @@ pub fn edge_stake(
     let raw = base_usd * (edge / edge_ref);
     let capped = raw.clamp(min_usd, max_pos_usd);
     // Never stake more than the book can fill.
-    capped.min(depth_usd.max(0.0))
+    let stake = capped.min(depth_usd.max(0.0));
+    // Quantize to whole cents. Polymarket market-BUY USDC amounts must have <= 2
+    // decimals; edge-scaled stakes like 2.4375 are rejected ("max accuracy of 2
+    // decimals") -- this silently killed ~84% of orders once base != max made
+    // stakes non-cent. FLOOR (never round up) so we can't breach max_position by a
+    // cent. Doing it here means guards, logs, paper, and the live order all agree.
+    (stake * 100.0).floor() / 100.0
 }
 
 /// Fractional-Kelly stake (alternative to edge-proportional). `b = (1-ask)/ask`,
@@ -757,6 +763,25 @@ mod tests {
         assert!(approx(s4, 7.0, 1e-9));
         // no edge -> no stake
         assert_eq!(edge_stake(0.0, 10.0, 0.08, 1.05, 50.0, 1000.0), 0.0);
+    }
+
+    #[test]
+    fn edge_stake_always_whole_cents() {
+        // REGRESSION: differential sizing produced amounts like 2.4375 → Polymarket
+        // rejects market-buy USDC with >2 decimals. edge_stake must FLOOR to cents
+        // for every input, and never exceed max_pos.
+        for &(edge, base, eref, maxp) in &[
+            (0.13, 2.0, 0.08, 4.0), // -> raw 3.25, clean
+            (0.10, 2.0, 0.08, 4.0), // -> raw 2.5, clean
+            (0.075, 2.0, 0.08, 4.0), // -> raw 1.875 -> floor 1.87
+            (0.19, 3.0, 0.08, 4.0), // -> raw 7.125 -> clamp 4.00
+            (0.061, 2.13, 0.08, 4.0), // messy on purpose
+        ] {
+            let s = edge_stake(edge, base, eref, 1.05, maxp, maxp);
+            let cents = (s * 100.0).round();
+            assert!((s * 100.0 - cents).abs() < 1e-9, "stake {s} is not whole cents");
+            assert!(s <= maxp + 1e-9, "stake {s} breached max_pos {maxp}");
+        }
     }
 
     #[test]
