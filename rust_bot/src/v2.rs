@@ -562,6 +562,66 @@ impl Controls {
     pub fn set_inval_stop_dry(&self, v: bool) {
         self.inval_stop_dry.store(v, Ordering::Relaxed);
     }
+
+    /// Serializable snapshot of every operator-adjustable control, so dashboard
+    /// changes SURVIVE a restart (systemd auto-restart, reboot, redeploy). Without
+    /// this, a crash at 3am silently reverts stakes + the invalidation stop to the
+    /// config defaults.
+    #[must_use]
+    pub fn snapshot(&self) -> ControlsSnapshot {
+        ControlsSnapshot {
+            trading_enabled: self.enabled(),
+            base_usd: self.base_usd(),
+            max_pos: self.max_pos_usd(),
+            base_usd_15m: self.base_usd_15m(),
+            max_pos_15m: self.max_pos_15m(),
+            inval_stop_on: self.inval_stop_on(),
+            inval_stop_dry: self.inval_stop_dry(),
+        }
+    }
+
+    /// Apply a persisted snapshot over the current controls (startup restore).
+    pub fn apply_snapshot(&self, s: &ControlsSnapshot) {
+        self.set_enabled(s.trading_enabled);
+        self.set_base_usd(s.base_usd);
+        self.set_max_pos_usd(s.max_pos);
+        self.set_base_usd_15m(s.base_usd_15m);
+        self.set_max_pos_15m(s.max_pos_15m);
+        self.set_inval_stop_on(s.inval_stop_on);
+        self.set_inval_stop_dry(s.inval_stop_dry);
+    }
+
+    /// Persist the current controls to `path` (best-effort; creates parent dirs).
+    /// Called by the dashboard after every control change.
+    pub fn save(&self, path: &str) {
+        if let Some(dir) = std::path::Path::new(path).parent() {
+            if !dir.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&self.snapshot()) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// Persisted operator controls (see `Controls::snapshot`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlsSnapshot {
+    pub trading_enabled: bool,
+    pub base_usd: f64,
+    pub max_pos: f64,
+    pub base_usd_15m: f64,
+    pub max_pos_15m: f64,
+    pub inval_stop_on: bool,
+    pub inval_stop_dry: bool,
+}
+
+/// Load a persisted controls snapshot from `path` (None if missing/unparseable).
+#[must_use]
+pub fn load_controls(path: &str) -> Option<ControlsSnapshot> {
+    let s = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&s).ok()
 }
 
 /// Load the persisted recalibrator from `path`, or a fresh one (with the given

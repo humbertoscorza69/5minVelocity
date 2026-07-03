@@ -27,7 +27,7 @@ disabled_cells = []
 # capped by max_position_usdc. STARTUP defaults only — the dashboard overrides both
 # live (per-interval). Set to the live $1 size so a restart never jumps to big stakes.
 base_usdc = 1.05
-max_position_usdc = 5.0
+max_position_usdc = 2.0
 max_open_positions = 20
 paper_initial_usdc = 1000.0
 
@@ -108,11 +108,11 @@ max_ttl_s = 240
 # to ~52% BY DESIGN (clips winners that dip through open) -- EV/Sharpe are what rise.
 # Graduation: BTC-15m -> live once paper dEV over >=150 stops confirms at real
 # fills; ETH-15m needs that AND a non-negative late-window split. Default false.
-inval_stop_enabled = false
+inval_stop_enabled = true
 # inval_stop_dry_run: when the stop is enabled, DRY-RUN first — compute + log every
 # would-fire (oplog "inval_stop" dry_run=true) but send NO sell, even 5m while armed.
 # Run ~1 day, confirm trigger fires on ~55% of positions, THEN set false to go live.
-inval_stop_dry_run = true
+inval_stop_dry_run = false
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50

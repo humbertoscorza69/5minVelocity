@@ -31,6 +31,7 @@ pub async fn run_dashboard(
     store_state: SharedBotState,
     recal: crate::v2::RecalSet,
     controls: Arc<crate::v2::Controls>,
+    controls_path: String,
     mode: String,
     live_armed_path: String,
     kill_switch_path: String,
@@ -62,6 +63,7 @@ pub async fn run_dashboard(
                     .unwrap_or("/");
                 let resp = if path.starts_with("/api/control") {
                     apply_control(&controls, path);
+                    controls.save(&controls_path); // persist so it survives restarts
                     // Operator arming buttons → write/remove the gate files the
                     // guards already enforce. `arm` only has effect in --mode live
                     // (the live backend is only built then); `kill` halts the

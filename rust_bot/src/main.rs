@@ -1129,6 +1129,14 @@ async fn main() -> anyhow::Result<()> {
                 config.v2.inval_stop_dry_run,       // stop dry-run from config
             ),
         );
+        // Restore persisted operator controls (stakes, stop) so dashboard settings
+        // SURVIVE restarts (systemd auto-restart / reboot / redeploy). Config values
+        // above are only the first-boot fallback.
+        let controls_path = "data/v2/controls.json".to_string();
+        if let Some(snap) = v2::load_controls(&controls_path) {
+            controls_shared.apply_snapshot(&snap);
+            info!(?snap, "controls: restored persisted operator settings from {controls_path}");
+        }
         let mut handles: Vec<JoinHandle<()>> = vec![
             tokio::spawn(trading_loop::run_decision_task(
                 state.clone(),
@@ -1181,6 +1189,7 @@ async fn main() -> anyhow::Result<()> {
                 state_store.state(),
                 recal_shared.clone(),
                 controls_shared.clone(),
+                controls_path.clone(),
                 effective_mode.to_string(),
                 live_armed_path_str.clone(),
                 kill_switch_path_str.clone(),
