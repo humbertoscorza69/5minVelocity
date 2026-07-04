@@ -218,6 +218,7 @@ fn compute_stats(
     // Health classification: total order rollbacks, DETERMINISTIC rejections (bugs
     // that will keep failing — precision/amount), and normal FOK kills (benign).
     let (mut rolled_back, mut det_errors, mut fok_kills) = (0u64, 0u64, 0u64);
+    let mut asleep_null = 0u64; // intents where the asleep telemetry logged null (regression)
     // Trailing-window fill rate: each intent's signal_id in order + the set that
     // rolled back, so the alarm fires on a FRESH rejection storm within ~N intents
     // regardless of how long the session has been healthy (cumulative would dilute
@@ -238,6 +239,10 @@ fn compute_stats(
                 "v2_intent_open" => {
                     entries += 1;
                     if let Some(s) = sid() { intent_sids.push(s.to_string()); }
+                    // Telemetry self-check: asleep should populate on ~all intents.
+                    if v.get("data").and_then(|d| d.get("asleep")).map(Value::is_null).unwrap_or(true) {
+                        asleep_null += 1;
+                    }
                 }
                 "v2_guard_blocked_open" => blocked += 1,
                 "live_open_rolled_back" => {
@@ -377,6 +382,7 @@ fn compute_stats(
     if det_errors > 0 { alerts.push(format!("{det_errors} order rejections — DETERMINISTIC bug (orders won't fill)")); }
     if win_n >= 20 && fill_rate_win < 0.50 { alerts.push(format!("fill rate {:.0}% (last {win_n}) — most orders rejected", fill_rate_win * 100.0)); }
     if recon_per_hr > 20.0 { warns.push(format!("WS unstable: {:.0} reconnects/hr", recon_per_hr)); }
+    if entries >= 20 && (asleep_null as f64 / entries as f64) > 0.30 { warns.push(format!("asleep telemetry null on {:.0}% of intents", 100.0 * asleep_null as f64 / entries as f64)); }
     if win_n >= 20 && (0.50..0.70).contains(&fill_rate_win) { warns.push(format!("fill rate {:.0}% (last {win_n})", fill_rate_win * 100.0)); }
     let status = if !alerts.is_empty() { "alert" } else if !warns.is_empty() { "warn" } else { "ok" };
     let issues: Vec<String> = alerts.into_iter().chain(warns).collect();
