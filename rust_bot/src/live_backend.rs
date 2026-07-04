@@ -181,7 +181,12 @@ pub async fn live_open(
     intent: &OpenIntent,
     ctx: &DecisionCtx,
     oplog: &OpLog,
-) -> Result<Option<polymarket_client_sdk_v2::types::Decimal>> {
+) -> Result<Option<(polymarket_client_sdk_v2::types::Decimal, polymarket_client_sdk_v2::types::Decimal)>> {
+    // Returns Some((real_shares, real_usdc_spent)) on a Posted fill so the caller
+    // can set the position's cost basis to the ACTUAL fill (shares AND price),
+    // not the pre-POST estimate. Both are needed: overwriting shares alone while
+    // leaving entry_price at the intended quote understates cost basis and
+    // over-reports P&L on every trade.
     use crate::idempotency::client_order_id;
     use crate::live_executor::{ExecOutcome, OrderSide, OrderSpec, assess_slippage, place_order_idempotent};
     use polymarket_client_sdk_v2::POLYGON;
@@ -284,7 +289,7 @@ pub async fn live_open(
                 opened = opened_after, max = lb.max_trades_per_session,
                 "live_open: POSTED -> opened {opened}/{max} (F3 worst_price={worst} kills FOK above tolerance)",
                 opened = opened_after, max = lb.max_trades_per_session, worst = worst);
-            Ok(Some(real_shares))
+            Ok(Some((real_shares, real_usdc)))
         }
         Ok(ExecOutcome::IdempotencyRefused { coid: c, reason }) => {
             oplog.sys("live_open_idempotency_refused", serde_json::json!({"coid": c, "reason": reason}));

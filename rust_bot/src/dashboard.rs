@@ -49,6 +49,11 @@ pub async fn run_dashboard(
         }
     };
     info!(%bind, port, "task started: dashboard (http://{bind}:{port} — tunnel this port)");
+    // Latch the wallet balance at the FIRST valid reading of this session so the
+    // dashboard can reconcile realized P&L against the wallet: realized ==
+    // walletΔ + in-flight (money booked at settlement but not yet redeemed into
+    // free USDC, or cash currently locked in open buys). -1 = not yet latched.
+    let mut session_start_bal_milli: i64 = -1;
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -86,10 +91,15 @@ pub async fn run_dashboard(
                         "dashboard: controls updated");
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path.starts_with("/api/stats") {
+                    // Latch the session-start wallet on the first valid reading.
+                    let cur_bal = state.balance_milli.load(std::sync::atomic::Ordering::Relaxed);
+                    if session_start_bal_milli < 0 && cur_bal >= 0 {
+                        session_start_bal_milli = cur_bal;
+                    }
                     let body = compute_stats(
                         &state, &store_state, &recal, &controls,
                         &mode, &live_armed_path, &kill_switch_path,
-                        &oplog_path, started_ms,
+                        &oplog_path, started_ms, session_start_bal_milli,
                     ).to_string();
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path == "/" || path.starts_with("/?") || path.starts_with("/index") {
@@ -181,6 +191,7 @@ fn compute_stats(
     kill_switch_path: &str,
     oplog_path: &str,
     started_ms: i64,
+    session_start_bal_milli: i64,
 ) -> Value {
     let now = crate::state::now_ms();
 
@@ -355,6 +366,22 @@ fn compute_stats(
 
     let bal_milli = state.balance_milli.load(std::sync::atomic::Ordering::Relaxed);
     let balance: Value = if bal_milli < 0 { Value::Null } else { json!(bal_milli as f64 / 1000.0) };
+    // Reconciliation: realized P&L is booked at SETTLEMENT (dashboard, real-time),
+    // but the wallet only moves when a winner is REDEEMED into free USDC (rate-
+    // limited relayer) and is reduced by cash locked in open buys. So
+    //   realized  ==  walletΔ (since session start)  +  in-flight
+    // where in-flight = money booked-but-not-yet-in-free-cash. Both terms are
+    // session-scoped (walletΔ latched at first valid reading ≈ started_ms), so
+    // this reconciles on screen and → 0 once everything redeems with 0 open.
+    let (wallet_delta, in_flight): (Value, Value) = if session_start_bal_milli >= 0 && bal_milli >= 0 {
+        let d = (bal_milli - session_start_bal_milli) as f64 / 1000.0;
+        (json!(d), json!(realized_total - d))
+    } else {
+        (Value::Null, Value::Null)
+    };
+    let wallet_start: Value = if session_start_bal_milli >= 0 {
+        json!(session_start_bal_milli as f64 / 1000.0)
+    } else { Value::Null };
 
     // ---- HEALTH REPORT: surface subtle failures the operator would otherwise miss.
     //      ALERT (red) = money is leaking or the bot is blind; WARN (amber) = degraded.
@@ -412,6 +439,9 @@ fn compute_stats(
             "realized": realized_total,
             "unrealized": unreal_total,
             "total": realized_total + unreal_total,
+            "wallet_start": wallet_start,
+            "wallet_delta": wallet_delta,
+            "in_flight": in_flight,
         },
         "stats": {
             "entries": entries,
@@ -562,7 +592,7 @@ tbody tr:hover{background:var(--panel2)}
     <span id="filt_note" class="muted" style="font-size:11px"></span>
   </div>
   <div class="grid">
-    <div class="card"><div class="lbl">Wallet balance</div><div class="val mono acc" id="balance">—</div><div class="sub">USDC (funder wallet)</div></div>
+    <div class="card"><div class="lbl">Wallet balance</div><div class="val mono acc" id="balance">—</div><div class="sub" id="balance_sub">USDC (funder wallet)</div></div>
     <div class="card"><div class="lbl">Total P&L</div><div class="val mono" id="pnl_total">—</div><div class="sub" id="pnl_split"></div></div>
     <div class="card"><div class="lbl">Realized</div><div class="val mono" id="pnl_real">—</div></div>
     <div class="card"><div class="lbl">Unrealized</div><div class="val mono" id="pnl_unreal">—</div></div>
@@ -630,6 +660,14 @@ async function tick(){
   pill($("pm"),s.health.polymarket,"Polymarket "+(s.health.polymarket?"●":"○"));
   $("up").textContent="uptime "+fmtAge(s.uptime_s)+" · "+s.health.active_tokens+" mkts · "+s.health.decisions+" dec";
   $("balance").textContent=(s.balance==null)?"—":"$"+(+s.balance).toFixed(2);
+  // Reconciliation sub-line: realized == walletΔ (this session) + in-flight
+  // (booked at settlement but not yet redeemed into free USDC / locked in open
+  // buys). Explains why realized P&L can lead the wallet with 0 open positions.
+  (function(){const p=s.pnl||{};const b=$("balance_sub");
+    if(p.wallet_delta==null){b.textContent="USDC (funder wallet)";return;}
+    const d=+p.wallet_delta, f=(p.in_flight==null?0:+p.in_flight);
+    b.innerHTML="Δsession "+money(d)+" · <span title=\"booked at settlement, not yet redeemed into free USDC or locked in open buys — converges to $0 once all winners redeem\">awaiting redeem "+money(f)+"</span>";
+  })();
   LAST=s;render();
   const c=s.controls;const tg=$("toggle");
   tg.textContent=c.enabled?"● TRADING ON":"○ TRADING OFF";tg.className="btn "+(c.enabled?"on":"off");
@@ -667,8 +705,11 @@ function render(){
   $("pf_sub").textContent="W $"+st.gross_win.toFixed(0)+" / L $"+st.gross_loss.toFixed(0);
   $("wr").textContent=(st.win_rate*100).toFixed(1)+"%";
   $("wr_sub").textContent=st.wins+"W / "+st.losses+"L";
-  $("trades").textContent=(FILT==="all")?s.stats.entries:st.closed;
-  $("trades_sub").textContent=(FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed");
+  // Headline = REAL filled trades (positions that actually opened = open+closed),
+  // NOT s.stats.entries (which counts every v2_intent_open, incl. FOK kills /
+  // rolled-back orders that never became a position). Intents shown in the sub.
+  $("trades").textContent=(FILT==="all")?(s.stats.open+s.stats.closed):st.closed;
+  $("trades_sub").textContent=(FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.entries+" intents · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed");
   $("recal").textContent=(rc.bias>=0?"+":"")+rc.bias.toFixed(3);
   $("recal_sub").textContent=rc.samples+" samples ("+(FILT==="15m"?"15m":"5m")+")";
   $("open_n").textContent=opens.length;

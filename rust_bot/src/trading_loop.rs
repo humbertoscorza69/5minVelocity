@@ -1391,18 +1391,34 @@ pub async fn run_execution_task(
                         // with > actual on-chain shares -> SELL tries to over-sell -> rejected.
                         if let Some(lb) = &live {
                             match crate::live_backend::live_open(lb, &intent, &ctx, &oplog).await {
-                                Ok(Some(real_shares)) => {
+                                Ok(Some((real_shares, real_usdc))) => {
                                     if let Ok(mut bs) = store_state.lock() {
                                         if let Some(p) = bs.positions.iter_mut().find(|p| p.token_id == intent.token_id) {
                                             let prev = p.shares;
+                                            let prev_entry = p.entry_price;
+                                            // Cost basis MUST equal the USDC actually spent. A FOK
+                                            // market BUY fills at a VWAP >= the quoted ask, so
+                                            // real_shares < the pre-POST estimate. Overwriting ONLY
+                                            // shares (leaving entry_price at the intended quote) made
+                                            //   cost = real_shares * intended  <  real_usdc,
+                                            // understating cost and OVER-reporting P&L (positive) on
+                                            // EVERY trade. Set entry to the TRUE VWAP so
+                                            //   real_shares * entry_price == real_usdc  exactly.
                                             p.shares = real_shares;
+                                            if !real_shares.is_zero() {
+                                                p.entry_price = real_usdc / real_shares;
+                                            }
                                             oplog.sys("position_shares_updated_to_real_fill", serde_json::json!({
                                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,
                                                 "computed_shares": prev.to_string(),
                                                 "real_shares": real_shares.to_string(),
+                                                "real_usdc": real_usdc.to_string(),
+                                                "entry_before": prev_entry.to_string(),
+                                                "entry_after": p.entry_price.to_string(),
                                             }));
                                             info!(token = %intent.token_id, computed = %prev, real = %real_shares,
-                                                "live_open: position.shares overwritten with real BUY fill");
+                                                real_usdc = %real_usdc, entry_after = %p.entry_price,
+                                                "live_open: position shares+entry set to real BUY fill (true cost basis)");
                                         }
                                     }
                                 }
