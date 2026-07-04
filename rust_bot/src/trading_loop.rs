@@ -74,6 +74,9 @@ pub struct DecisionCtx {
     pub z: f64,
     /// Seconds-to-settle at entry (the ttl the max-ttl gate acts on). 0 on legacy.
     pub ttl_s: i64,
+    /// Seconds since the Binance tape last moved at entry (frozen-tape telemetry;
+    /// logged on every intent so the gate threshold stays offline-tunable). 0 legacy.
+    pub tick_age_s: i64,
 }
 
 /// A command from the decision task to the execution task.
@@ -115,18 +118,24 @@ fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<(bool, f
     let r = state.mid_ring.get(token)?;
     let (mut oldest, mut mn, mut mx, mut n) = (i64::MAX, f64::MAX, f64::MIN, 0u32);
     for (t, m) in r.iter() {
-        if now_ms - t <= 3000 {
+        let age = now_ms - t;
+        if (0..=3000).contains(&age) {
             oldest = oldest.min(*t);
             mn = mn.min(*m);
             mx = mx.max(*m);
             n += 1;
         }
     }
-    if n < 2 || now_ms - oldest < 2500 {
-        return None; // not enough coverage to claim "unchanged for 3s"
+    if n < 1 {
+        return None; // no mid samples in the window at all
     }
-    let move_ = (mx - mn).abs();
-    Some((move_ < 1e-9, move_, now_ms - oldest))
+    // ALWAYS return the raw movement + coverage age so the telemetry is never null
+    // when there IS data (offline tuning needs the raw values, not just the bool).
+    let move_ = if n >= 2 { (mx - mn).abs() } else { 0.0 };
+    let age = now_ms - oldest;
+    // The boolean stays conservative: only assert "asleep" with real coverage.
+    let asleep = n >= 2 && age >= 1500 && move_ < 1e-9;
+    Some((asleep, move_, age))
 }
 
 fn interval_secs(interval: &str) -> i64 {
@@ -303,6 +312,7 @@ pub fn process_kline(
                     stake_usd: cfg.stake_usd,
                     z: 0.0, // legacy path: z not computed
                     ttl_s: 0,
+                    tick_age_s: 0,
                 };
                 cmds.push(ExecCommand::Open {
                     intent: OpenIntent {
@@ -383,6 +393,14 @@ pub fn process_kline_v2(
         }
         // Late-entry gate (the 15m edge lives in the last few minutes). 0 = no gate.
         if s.late_entry_max_ttl_s > 0 && ttl > s.late_entry_max_ttl_s {
+            continue;
+        }
+        // FROZEN-TAPE GATE (5m): if the Binance price hasn't ticked in the last
+        // `frozen_tape_secs`, the triggering displacement is stale and the book has
+        // caught up — no lag left to buy. tick_age is logged on every fired intent
+        // for offline threshold tuning. `frozen_tape_secs == 0` = gate off.
+        let tick_age = history.secs_since_change(&kline.asset, kline.t_s, 10);
+        if s.frozen_tape_secs > 0 && tick_age >= s.frozen_tape_secs {
             continue;
         }
         let Some(m) = catalog.active_market(&kline.asset, interval, epoch) else { continue };
@@ -466,6 +484,7 @@ pub fn process_kline_v2(
             stake_usd: stake,
             z: f.z,
             ttl_s: ttl,
+            tick_age_s: tick_age,
         };
         let intent = OpenIntent {
             token_id: bet_token,
@@ -819,6 +838,7 @@ pub async fn run_decision_task(
                                 "fill_price": intent.fill_price, "shares": intent.shares,
                                 "disp_bps": ctx.binance_ret_bps, "p": pred,
                                 "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
+                                "tick_age_s": ctx.tick_age_s,
                                 "asleep": asleep_obs.map(|a| a.0),
                                 "mid_move_3s": asleep_obs.map(|a| a.1),
                                 "asleep_age_ms": asleep_obs.map(|a| a.2),

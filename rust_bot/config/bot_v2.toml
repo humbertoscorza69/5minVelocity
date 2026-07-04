@@ -91,6 +91,11 @@ vol_cap = 1.0
 dvr_floor = 0.2
 edge_ref = 0.08
 min_ttl_s = 30
+# frozen_tape_secs: skip a 5m entry if Binance hasn't ticked in this many seconds
+# (stale move -> book already caught up -> no lag to buy). Validated on 26 recorder
+# days: frozen entries -0.04/$1, monotone in staleness, self-throttling (blocks
+# ~18-20% on dead tapes, ~5-9% on lively ones). 3 = validated. 0 = off. 15m unaffected.
+frozen_tape_secs = 3
 # max_ttl_s: skip the first minute of the 5m window (only enter when ttl <= 240s).
 # Live (Jul 2, 452 trades) + recorder both show early-window entries are the −EV
 # drag: ttl<=240 booked +$20.96 vs ttl>240 −$8.62 on the same day; and the (240,270]

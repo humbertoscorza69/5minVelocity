@@ -109,6 +109,12 @@ pub struct V2Config {
     /// 15m override uses 120s (a 60s window is too twitchy for a 900s market).
     #[serde(default = "d_vol_lb_5m")]
     pub vol_lookback_s: i64,
+    /// Frozen-tape gate (5m): skip an entry if the Binance price hasn't ticked in
+    /// this many seconds — the triggering move is stale and the book has caught up.
+    /// Validated on 26 recorder days (frozen entries −0.04/$1, monotone in staleness,
+    /// self-throttling by regime). `0` = off. 3 = the validated setting.
+    #[serde(default = "d_frozen_tape")]
+    pub frozen_tape_secs: i64,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -155,6 +161,7 @@ fn d_v2_min_ttl() -> i64 { 30 }
 fn d_v2_max_ttl() -> i64 { 0 } // 0 = off (opt-in via config); set 240 for the 5m late gate
 fn d_true() -> bool { true }
 fn d_vol_lb_5m() -> i64 { 60 }
+fn d_frozen_tape() -> i64 { 0 } // 0 = off (opt-in via config); 3 = validated 5m setting
 fn d_recal_capacity() -> usize { 300 }
 fn d_recal_warmup() -> usize { 50 }
 fn d_recal_path() -> String { "data/v2/recal.json".to_string() }
@@ -249,6 +256,7 @@ impl V2Config {
             base_usd: 0.0, // set per-tick from Controls in the decision loop
             max_pos_usd: 0.0,
             vol_lookback_s: self.vol_lookback_s,
+            frozen_tape_secs: self.frozen_tape_secs, // 5m: validated
         }
     }
 }
@@ -274,6 +282,7 @@ impl Interval15mCfg {
             base_usd: 0.0, // set per-tick from Controls in the decision loop
             max_pos_usd: 0.0,
             vol_lookback_s: self.vol_lookback_s,
+            frozen_tape_secs: 0, // 15m: not significant in validation → off
         }
     }
 }
@@ -290,6 +299,7 @@ impl Default for V2Config {
             min_ttl_s: d_v2_min_ttl(),
             max_ttl_s: d_v2_max_ttl(),
             vol_lookback_s: d_vol_lb_5m(),
+            frozen_tape_secs: d_frozen_tape(),
             recal_capacity: d_recal_capacity(),
             recal_warmup: d_recal_warmup(),
             recal_path: d_recal_path(),

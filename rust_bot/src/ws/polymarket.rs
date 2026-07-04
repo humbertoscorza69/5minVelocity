@@ -344,10 +344,15 @@ fn update_bbo(
         .bbo
         .insert(token.to_string(), EventBbo { best_ask, best_bid, ts_ms });
     // Feed the mid-ring for the book-asleep flag (LOG-only). Keep ~6s / 64 samples.
+    // Stamp with the LOCAL clock (not the event's ts_ms, which may be Polymarket's
+    // exchange time) so the window math in book_asleep — which uses the decision
+    // loop's local now_ms — is on the same clock. A skew here was making the flag
+    // null on ~100% of intents.
     if let Some(mid) = mid_of(best_ask, best_bid) {
+        let local = crate::state::now_ms();
         let mut r = state.mid_ring.entry(token.to_string()).or_default();
-        r.push_back((ts_ms, mid));
-        let cutoff = ts_ms - 6000;
+        r.push_back((local, mid));
+        let cutoff = local - 6000;
         while r.front().map(|(t, _)| *t < cutoff).unwrap_or(false) || r.len() > 64 {
             r.pop_front();
         }

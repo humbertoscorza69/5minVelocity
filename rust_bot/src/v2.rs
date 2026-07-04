@@ -387,6 +387,24 @@ impl PriceHistory {
         last
     }
 
+    /// Seconds since the Binance price last CHANGED at/before `now_sec`, capped at
+    /// `cap`. 0 = the price just moved; `cap` = frozen for at least `cap` seconds.
+    /// Used by the frozen-tape gate: if the tape hasn't ticked, the triggering
+    /// displacement is stale and the book has already caught up — no lag to buy.
+    /// Returns `cap` if there's no data (fail-safe: treat unknown as frozen).
+    #[must_use]
+    pub fn secs_since_change(&self, asset: &str, now_sec: i64, cap: i64) -> i64 {
+        let Some(now) = self.close_at(asset, now_sec) else { return cap };
+        for k in 1..=cap {
+            match self.close_at(asset, now_sec - k) {
+                Some(past) if (past - now).abs() > f64::EPSILON => return k - 1,
+                Some(_) => {}
+                None => return k - 1, // ran out of history -> that's the observed age
+            }
+        }
+        cap
+    }
+
     /// Closes in `[from_sec, to_sec]` inclusive, ascending — for the vol window.
     #[must_use]
     pub fn closes_in(&self, asset: &str, from_sec: i64, to_sec: i64) -> Vec<f64> {
@@ -678,6 +696,10 @@ pub struct IntervalStrat {
     /// Rolling-vol lookback (seconds) for z. Matched to the horizon: 60s for 5m,
     /// 120s for 15m (a 60s window is too twitchy for a 900s market → mis-scaled z).
     pub vol_lookback_s: i64,
+    /// Frozen-tape gate: skip the entry if the Binance price hasn't ticked in this
+    /// many seconds (stale displacement → no lag left to buy). `0` = gate off.
+    /// Validated on 5m (−0.04/$1 for frozen entries); off for 15m (not significant).
+    pub frozen_tape_secs: i64,
 }
 
 /// Per-interval rolling recalibrators. 5m and 15m have different base win rates, so
