@@ -118,6 +118,17 @@ inval_stop_enabled = true
 # would-fire (oplog "inval_stop" dry_run=true) but send NO sell, even 5m while armed.
 # Run ~1 day, confirm trigger fires on ~55% of positions, THEN set false to go live.
 inval_stop_dry_run = false
+# BID-BAND conditional stop (dynstop_study, 26 recorder days post-frozen-gate):
+# the stop only fires when the live bid is in an OVERPAY band (>= hi OR <= lo) —
+# the fair mid-band (0.30,0.50) has no stale-bid premium to harvest and whipsaws,
+# so HOLD. Statistical TIE with the unconditional stop on normal days (100% edge
+# retained) + turned the Jul 3-4 dead-vol live replay from -$12.15 to +$9.07
+# (median dead-day stop bid 0.40 = dead center of the worthless band). Continuous:
+# a suppressed trigger re-checks each second and fires if the bid later enters a
+# band. Same bands for 5m + 15m (paper) for dataset comparability. Set hi=1.0 &
+# lo=0.0 to revert to the unconditional stop.
+stop_bid_hi = 0.50
+stop_bid_lo = 0.30
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50

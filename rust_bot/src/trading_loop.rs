@@ -696,50 +696,81 @@ pub async fn run_decision_task(
                                 if disp <= 0.0 {
                                     use rust_decimal::prelude::ToPrimitive;
                                     let bid = state.bbo.get(&p.token_id).and_then(|b| b.best_bid);
-                                    let armed = match &live_gate {
-                                        Some(pth) => std::path::Path::new(pth).exists(),
-                                        None => true, // paper mode: simulated sell
+                                    // BID-BAND gate: the stop's edge is selling a
+                                    // reversal to a STALE bid; that premium exists only
+                                    // when the bid is in an overpay band (>= hi OR <= lo).
+                                    // The fair mid-band (lo, hi) has nothing to harvest
+                                    // and whipsaws -> HOLD. No bid = nothing to sell to =
+                                    // HOLD. CONTINUOUS: a suppressed trigger is NOT
+                                    // deduped, so if the bid later enters a band while
+                                    // disp stays <= 0 the stop fires then.
+                                    let in_band = match bid {
+                                        Some(b) => b >= vcfg.stop_bid_hi || b <= vcfg.stop_bid_lo,
+                                        None => false,
                                     };
-                                    // 5m sells for real (armed + a bid to hit) UNLESS
-                                    // dry-run; 15m, disarmed, no-bid, or dry-run =
-                                    // paper-log only (would-fire, no sell).
-                                    let do_sell = p.interval == "5m"
-                                        && armed
-                                        && bid.is_some()
-                                        && !controls.inval_stop_dry();
-                                    oplog.sys("inval_stop", serde_json::json!({
-                                        "token_id": p.token_id, "asset": p.asset,
-                                        "interval": p.interval, "side": if up {"up"} else {"down"},
-                                        "disp_bps": disp, "model_bid": bid,
-                                        "entry_ask": p.entry_price.to_f64().unwrap_or(0.0),
-                                        "sec_in": now_s - epoch, "ttl": resolution - now_s,
-                                        "action": if do_sell { "sell" } else { "paper" },
-                                        "dry_run": controls.inval_stop_dry(),
-                                    }));
-                                    if do_sell {
-                                        let _ = exec_tx.send(ExecCommand::CloseToken {
-                                            token: p.token_id.clone(),
-                                            exit_price: bid, // FOK-sell at the bid
-                                            now_ms: now,
-                                        });
-                                        info!(token = %p.token_id, disp, bid = ?bid,
-                                            "inval_stop: 5m thesis dead -> SELL at bid");
-                                    }
-                                    // Dedup (failed FOK stays marked -> holds to settle).
-                                    if state.v2_stopped.len() > 50_000 { state.v2_stopped.clear(); }
-                                    state.v2_stopped.insert(p.token_id.clone(), true);
-                                    // BUG #3: a REAL sell removes the position from bs
-                                    // before resolution -> it never reaches the
-                                    // settlement sweep -> recal would never see it.
-                                    // Stash its window info for a counterfactual feed.
-                                    // Paper/dry stops stay in bs and are fed normally.
-                                    if do_sell {
-                                        if let Some(pr) = state.v2_pred.get(&p.token_id).map(|v| v.value().1) {
-                                            if state.v2_stop_recal.len() > 50_000 { state.v2_stop_recal.clear(); }
-                                            state.v2_stop_recal.insert(
-                                                p.token_id.clone(),
-                                                (p.interval.clone(), p.asset.clone(), up, resolution, pr),
-                                            );
+                                    if !in_band {
+                                        // Suppressed: log for offline band-tuning + the
+                                        // suppressed cohort's settlement outcomes (free
+                                        // ongoing validation — the markets settle anyway).
+                                        // Deliberately NOT deduped (continuous re-check).
+                                        oplog.sys("inval_stop_suppressed", serde_json::json!({
+                                            "token_id": p.token_id, "asset": p.asset,
+                                            "interval": p.interval, "side": if up {"up"} else {"down"},
+                                            "disp_bps": disp, "bid": bid,
+                                            "entry_ask": p.entry_price.to_f64().unwrap_or(0.0),
+                                            "sec_in": now_s - epoch, "ttl": resolution - now_s,
+                                            "stop_bid_hi": vcfg.stop_bid_hi, "stop_bid_lo": vcfg.stop_bid_lo,
+                                        }));
+                                    } else {
+                                        let armed = match &live_gate {
+                                            Some(pth) => std::path::Path::new(pth).exists(),
+                                            None => true, // paper mode: simulated sell
+                                        };
+                                        // 5m sells for real (armed + a bid to hit) UNLESS
+                                        // dry-run; 15m, disarmed, no-bid, or dry-run =
+                                        // paper-log only (would-fire, no sell).
+                                        let do_sell = p.interval == "5m"
+                                            && armed
+                                            && bid.is_some()
+                                            && !controls.inval_stop_dry();
+                                        oplog.sys("inval_stop", serde_json::json!({
+                                            "token_id": p.token_id, "asset": p.asset,
+                                            "interval": p.interval, "side": if up {"up"} else {"down"},
+                                            "disp_bps": disp, "model_bid": bid,
+                                            "entry_ask": p.entry_price.to_f64().unwrap_or(0.0),
+                                            "sec_in": now_s - epoch, "ttl": resolution - now_s,
+                                            "action": if do_sell { "sell" } else { "paper" },
+                                            "dry_run": controls.inval_stop_dry(),
+                                            "stop_bid_hi": vcfg.stop_bid_hi, "stop_bid_lo": vcfg.stop_bid_lo,
+                                        }));
+                                        if do_sell {
+                                            let _ = exec_tx.send(ExecCommand::CloseToken {
+                                                token: p.token_id.clone(),
+                                                exit_price: bid, // FOK-sell at the bid
+                                                now_ms: now,
+                                            });
+                                            info!(token = %p.token_id, disp, bid = ?bid,
+                                                "inval_stop: 5m thesis dead + bid in band -> SELL at bid");
+                                        }
+                                        // Dedup ONLY after an actual fire (failed FOK stays
+                                        // marked -> holds to settle). Suppressed triggers
+                                        // above are intentionally left un-marked so they
+                                        // re-check each second (continuous evaluation).
+                                        if state.v2_stopped.len() > 50_000 { state.v2_stopped.clear(); }
+                                        state.v2_stopped.insert(p.token_id.clone(), true);
+                                        // BUG #3: a REAL sell removes the position from bs
+                                        // before resolution -> it never reaches the
+                                        // settlement sweep -> recal would never see it.
+                                        // Stash its window info for a counterfactual feed.
+                                        // Paper/dry stops stay in bs and are fed normally.
+                                        if do_sell {
+                                            if let Some(pr) = state.v2_pred.get(&p.token_id).map(|v| v.value().1) {
+                                                if state.v2_stop_recal.len() > 50_000 { state.v2_stop_recal.clear(); }
+                                                state.v2_stop_recal.insert(
+                                                    p.token_id.clone(),
+                                                    (p.interval.clone(), p.asset.clone(), up, resolution, pr),
+                                                );
+                                            }
                                         }
                                     }
                                 }

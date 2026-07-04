@@ -146,12 +146,31 @@ pub struct V2Config {
     /// go live. Default true so enabling the stop can't sell until you opt in.
     #[serde(default = "d_true")]
     pub inval_stop_dry_run: bool,
+    /// BID-BAND conditional stop. The invalidation stop's entire edge is selling
+    /// a reversal to a STALE bid; that premium exists only when the bid is in an
+    /// overpay band (>= stop_bid_hi OR <= stop_bid_lo). In the fair mid-band
+    /// (lo, hi) there is nothing to harvest and triggers whipsaw, so HOLD. The
+    /// evaluation is CONTINUOUS: a suppressed trigger is NOT deduped, so if the
+    /// bid later enters a band while displacement stays <= 0 the stop fires then.
+    /// Validated (dynstop_study, 26 recorder days post-frozen-gate): statistical
+    /// tie with the unconditional stop (100% normal-day edge retained) AND +$21
+    /// on the Jul 3-4 dead-vol live replay (median dead-day stop bid 0.40 = dead
+    /// center of the worthless band). Defaults 0.50 / 0.30 (smooth plateau; the
+    /// <= lo leg is load-bearing). Same bands for 5m and 15m so the 15m paper set
+    /// stays comparable. Set stop_bid_hi = 1.0 AND stop_bid_lo = 0.0 to disable
+    /// the band (unconditional stop = fire on every crossing).
+    #[serde(default = "d_stop_bid_hi")]
+    pub stop_bid_hi: f64,
+    #[serde(default = "d_stop_bid_lo")]
+    pub stop_bid_lo: f64,
     /// 15-minute market as its OWN strategy (late-entry, higher z_min, price cap,
     /// its own recalibrator). Absent/disabled = 5m-only (no behavior change).
     #[serde(default)]
     pub i15m: Interval15mCfg,
 }
 
+fn d_stop_bid_hi() -> f64 { 0.50 }
+fn d_stop_bid_lo() -> f64 { 0.30 }
 fn d_edge_min() -> f64 { 0.04 }
 fn d_vol_cap() -> f64 { 1.0 }
 fn d_dvr_floor() -> f64 { 0.2 }
@@ -307,6 +326,8 @@ impl Default for V2Config {
             tick_throttle_ms: d_tick_throttle(),
             inval_stop_enabled: false,
             inval_stop_dry_run: true,
+            stop_bid_hi: d_stop_bid_hi(),
+            stop_bid_lo: d_stop_bid_lo(),
             i15m: Interval15mCfg::default(),
         }
     }
