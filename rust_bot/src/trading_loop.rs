@@ -728,6 +728,20 @@ pub async fn run_decision_task(
                                     // Dedup (failed FOK stays marked -> holds to settle).
                                     if state.v2_stopped.len() > 50_000 { state.v2_stopped.clear(); }
                                     state.v2_stopped.insert(p.token_id.clone(), true);
+                                    // BUG #3: a REAL sell removes the position from bs
+                                    // before resolution -> it never reaches the
+                                    // settlement sweep -> recal would never see it.
+                                    // Stash its window info for a counterfactual feed.
+                                    // Paper/dry stops stay in bs and are fed normally.
+                                    if do_sell {
+                                        if let Some(pr) = state.v2_pred.get(&p.token_id).map(|v| v.value().1) {
+                                            if state.v2_stop_recal.len() > 50_000 { state.v2_stop_recal.clear(); }
+                                            state.v2_stop_recal.insert(
+                                                p.token_id.clone(),
+                                                (p.interval.clone(), p.asset.clone(), up, resolution, pr),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -749,6 +763,35 @@ pub async fn run_decision_task(
                             state.v2_photofinish.insert(p.token_id.clone(), true);
                         }
                         state.v2_settled.insert(p.token_id.clone(), won);
+                    }
+                    // BUG #3: feed recal the counterfactual outcome of STOPPED-and-SOLD
+                    // positions — they left bs before resolution, so the loop above
+                    // never saw them, and without this recal trains on survivors only.
+                    // Skip any still in bs (a failed sell was reverted → the normal
+                    // settlement path feeds it). Same Binance open-vs-close basis.
+                    let pending: Vec<(String, (String, String, bool, i64, f64))> =
+                        state.v2_stop_recal.iter().map(|e| (e.key().clone(), e.value().clone())).collect();
+                    let mut cf_fed = 0u32;
+                    for (token, (iv, asset, up, resolution, pred)) in pending {
+                        if now_s < resolution + 2 { continue; }
+                        if snap.iter().any(|p| p.token_id == token) {
+                            state.v2_stop_recal.remove(&token); // reverted into bs → normal path feeds it
+                            continue;
+                        }
+                        let epoch = resolution - interval_secs(&iv).max(1);
+                        let (Some(op), Some(fin)) = (
+                            history.close_at(&asset, epoch - 1),
+                            history.close_at(&asset, resolution - 1),
+                        ) else { continue }; // ring cold → retry next tick
+                        let won = up == (fin >= op);
+                        if let Ok(mut r) = recal.for_interval(&iv).lock() { r.record(pred, won); }
+                        state.v2_stop_recal.remove(&token);
+                        state.v2_pred.remove(&token); // consumed by the counterfactual feed
+                        cf_fed += 1;
+                    }
+                    if cf_fed > 0 {
+                        recal.save_both();
+                        oplog.sys("v2_recal_update", serde_json::json!({ "fed": cf_fed, "source": "stopped_counterfactual" }));
                     }
                 }
                 let catalog = snapshot_catalog_for(&state, &kline.asset, kline.t_s);
@@ -1400,30 +1443,59 @@ pub async fn run_execution_task(
                     }
                     ExecCommand::CloseToken { token, exit_price, now_ms } => {
                         if let Some(px) = exit_price {
+                            // BUG #2 FIX: snapshot the position(s) BEFORE close_token
+                            // removes them, so a FAILED live sell can be reverted —
+                            // the position is kept and settles normally, booking its
+                            // TRUE resolution P&L instead of being orphaned at the
+                            // model bid. Paper P&L is booked ONLY on a confirmed sell.
+                            let orig: Vec<OpenPosition> = match store_state.lock() {
+                                Ok(bs) => bs.positions.iter().filter(|p| p.token_id == token).cloned().collect(),
+                                Err(_) => Vec::new(),
+                            };
                             let closed = if let Ok(mut bs) = store_state.lock() {
                                 let mut ex = PaperExecutor::new(&mut bs.positions);
                                 ex.close_token(&token, px, ExitKind::OppositeTriggerClose, now_ms)
                             } else { Vec::new() };
+                            let mut sell_failed = false;
                             for ct in &closed {
-                                emit_close_log(ct);
-                                feed_guards_net_pnl(&guards, ct, now_ms);
-                                oplog.sys("paper_close", serde_json::json!({
-                                    "token_id": ct.token_id, "signal_id": ct.signal_id,
-                                    "entry_price": ct.entry_price.to_string(),
-                                    "exit_price": ct.exit_price.to_string(),
-                                    "shares": ct.shares.to_string(),
-                                    "realized_pnl": ct.realized_pnl.to_string(),
-                                    "kind": ct.exit_kind.as_str(),
-                                }));
-                                // PIECE 6 LIVE: real SELL on REGLA C close.
-                                if let Some(lb) = &live {
-                                    if let Err(e) = crate::live_backend::live_close(lb, ct, &oplog).await {
-                                        warn!(error = %e, "live_close (REGLA C) error");
-                                        oplog.err("live_close", &e.to_string(), serde_json::json!({}));
+                                // LIVE: sell FIRST; only book if it actually fills.
+                                // PAPER mode (no live backend): always books.
+                                let sell_ok = if let Some(lb) = &live {
+                                    match crate::live_backend::live_close(lb, ct, &oplog).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            warn!(error = %e, token = %ct.token_id,
+                                                "live_close failed — HOLD position to settle (not booking)");
+                                            oplog.err("live_close", &e.to_string(), serde_json::json!({}));
+                                            false
+                                        }
                                     }
+                                } else { true };
+                                if sell_ok {
+                                    emit_close_log(ct);
+                                    feed_guards_net_pnl(&guards, ct, now_ms);
+                                    oplog.sys("paper_close", serde_json::json!({
+                                        "token_id": ct.token_id, "signal_id": ct.signal_id,
+                                        "entry_price": ct.entry_price.to_string(),
+                                        "exit_price": ct.exit_price.to_string(),
+                                        "shares": ct.shares.to_string(),
+                                        "realized_pnl": ct.realized_pnl.to_string(),
+                                        "kind": ct.exit_kind.as_str(),
+                                    }));
+                                } else {
+                                    sell_failed = true;
                                 }
                             }
-                            debug!(token, n = closed.len(), "paper close (REGLA C)");
+                            if sell_failed {
+                                // Re-insert so the settlement sweep books the REAL
+                                // outcome (one entry per market => `orig` is the one
+                                // position for this token; no double-add).
+                                if let Ok(mut bs) = store_state.lock() {
+                                    bs.positions.extend(orig.iter().cloned());
+                                }
+                                oplog.sys("live_close_failed_held", serde_json::json!({ "token_id": token }));
+                            }
+                            debug!(token, n = closed.len(), "close processed");
                         }
                     }
                 }

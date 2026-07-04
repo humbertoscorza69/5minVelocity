@@ -173,6 +173,13 @@ pub struct SharedState {
     /// direct observation that the book has not yet repriced (our edge, and — unlike
     /// confirmation features — NOT priced into the ask). LOG-only for now.
     pub mid_ring: DashMap<String, std::collections::VecDeque<(i64, f64)>>,
+    /// STOPPED positions pending a counterfactual recal feed. A stopped position is
+    /// SOLD before resolution, so it never reaches the settlement sweep — feeding the
+    /// recalibrator only survivors (mostly winners on a stop-heavy day) drifts its
+    /// bias negative and inflates p_adj, loosening the gates exactly when they should
+    /// tighten. We stash `(interval, asset, up, resolution_sec, pred)` at stop time and
+    /// feed the recal the position's WINDOW outcome at resolution, regardless of exit.
+    pub v2_stop_recal: DashMap<String, (String, String, bool, i64, f64)>,
     /// Tokens whose settlement was a PHOTO FINISH (|Binance close-open| < ~2bps).
     /// The Binance-derived win label flips ~20% of the time exactly here, so we do
     /// NOT feed these into the recalibrator from the Binance settlement path — we
@@ -213,6 +220,7 @@ impl SharedState {
             v2_settled: DashMap::new(),
             v2_stopped: DashMap::new(),
             mid_ring: DashMap::new(),
+            v2_stop_recal: DashMap::new(),
             v2_photofinish: DashMap::new(),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),
