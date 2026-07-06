@@ -1202,6 +1202,158 @@ async fn binance_close_at_rest(http: &reqwest::Client, asset: &str, sec: i64) ->
     arr.first()?.get(4)?.as_str()?.parse::<f64>().ok()
 }
 
+/// Settlement BOOKING — mode-independent (needs only `bs` + Binance, NOT the
+/// Polymarket REST client). Runs the ring-gap REST fallback (Bug A i) then books
+/// every v2_settled outcome via record_settled + feeds the recalibrator. Shared
+/// by run_positions_refresh (live) and run_settlement_booking (paper) so both
+/// modes book held-to-settle positions identically. Idempotent (recorder set).
+async fn settle_and_book(
+    state: &Arc<SharedState>,
+    bs: &crate::state::store::SharedBotState,
+    guards: &Arc<Mutex<crate::guards::Guards>>,
+    recorder: &Arc<Mutex<crate::pnl_recorder::PnlRecorder>>,
+    recal: &crate::v2::RecalSet,
+    oplog: &OpLog,
+    bn_http: &reqwest::Client,
+) {
+    // BUG A (i): RING-GAP SETTLEMENT FALLBACK. The decision-loop sweep settles
+    // from the in-memory Binance ring; a WS drop (or a restart across a window
+    // close) leaves a gap so close_at() returned None and the position was never
+    // settled. Fetch the missing 1s closes via REST for any bot position whose
+    // window EXPIRED but is not in v2_settled, and settle it. Capped per tick.
+    {
+        let now_s = now_ms() / 1000;
+        let unsettled: Vec<OpenPosition> = match bs.lock() {
+            Ok(g) => g
+                .positions
+                .iter()
+                .filter(|p| now_s > p.exit_ts_s - 300 + 2 && !state.v2_settled.contains_key(&p.token_id))
+                .take(20)
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for p in &unsettled {
+            if recorder.lock().map(|r| r.already_recorded(&p.token_id)).unwrap_or(true) {
+                continue; // already booked by another path
+            }
+            let resolution = p.exit_ts_s - 300;
+            let win_secs = interval_secs(&p.interval).max(1);
+            let epoch = resolution - win_secs;
+            let (Some(op), Some(fin)) = (
+                binance_close_at_rest(bn_http, &p.asset, epoch - 1).await,
+                binance_close_at_rest(bn_http, &p.asset, resolution - 1).await,
+            ) else {
+                oplog.sys("settlement_rest_fallback_miss", serde_json::json!({
+                    "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
+                }));
+                continue;
+            };
+            let up = matches!(p.side, Outcome::Up);
+            let won = up == (fin >= op); // tie => Up wins (same as the sweep)
+            if op > 0.0 && (fin / op - 1.0).abs() * 1e4 < 2.0 {
+                state.v2_photofinish.insert(p.token_id.clone(), true);
+            }
+            state.v2_settled.insert(p.token_id.clone(), won);
+            oplog.sys("settlement_rest_fallback", serde_json::json!({
+                "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
+                "epoch_open": op, "resolution_close": fin, "won": won,
+            }));
+            info!(token = %p.token_id, won, op, fin,
+                "settle_and_book: ring-gap settlement recovered via Binance REST");
+        }
+    }
+    // PRIMARY P&L PATH (decoupled from redemption): book the settlement outcomes
+    // the decision loop computed from Binance open-vs-close. Realized P&L appears
+    // within ~1 min of resolution WITHOUT waiting on the (rate-limited) relayer.
+    {
+        let settled: Vec<(String, bool)> = state
+            .v2_settled
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        let mut booked = 0u32;
+        for (token, won) in settled {
+            let did = match recorder.lock() {
+                Ok(mut r) => crate::pnl_recorder::record_settled(
+                    &token,
+                    if won { 1.0 } else { 0.0 },
+                    "settlement",
+                    bs,
+                    guards,
+                    &mut r,
+                    oplog,
+                    now_ms(),
+                ),
+                Err(_) => false,
+            };
+            // Drop WINNERS from v2_settled (redemption claims them via the
+            // redeemable flag). KEEP LOSERS so the redemption task can see them
+            // and SKIP the pointless $0 redeem (quota saver).
+            if won {
+                state.v2_settled.remove(&token);
+            }
+            if did {
+                booked += 1;
+                if !state.v2_photofinish.contains_key(&token) {
+                    if let Some((_, (iv, pred))) = state.v2_pred.remove(&token) {
+                        if let Ok(mut r) = recal.for_interval(&iv).lock() {
+                            r.record(pred, won);
+                        }
+                    }
+                }
+            }
+        }
+        if state.v2_settled.len() > 50_000 {
+            state.v2_settled.clear();
+        }
+        if state.v2_photofinish.len() > 50_000 { state.v2_photofinish.clear(); }
+        if state.mid_ring.len() > 50_000 { state.mid_ring.clear(); }
+        if booked > 0 {
+            recal.save_both();
+            oplog.sys("v2_recal_update", serde_json::json!({
+                "fed": booked, "source": "settlement",
+            }));
+            info!(booked,
+                "settle_and_book: settlements booked from Binance close (decoupled from redeem)");
+        }
+    }
+}
+
+/// PAPER-mode P&L path. In `--mode paper` the Polymarket REST client isn't built,
+/// so run_positions_refresh (which holds the settlement booking) never spawns and
+/// held-to-settle positions would NEVER book. This lightweight task runs the same
+/// mode-independent `settle_and_book` on an interval so paper books identically to
+/// live (minus the on-chain /positions + redemption coupling).
+pub async fn run_settlement_booking(
+    state: Arc<SharedState>,
+    bs: crate::state::store::SharedBotState,
+    guards: Arc<Mutex<crate::guards::Guards>>,
+    recorder: Arc<Mutex<crate::pnl_recorder::PnlRecorder>>,
+    recal: crate::v2::RecalSet,
+    oplog: Arc<OpLog>,
+    period: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    info!(period_secs = period.as_secs(),
+        "task started: settlement_booking (paper P&L path — books held-to-settle from Binance close)");
+    let bn_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let mut iv = tokio::time::interval(period);
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = iv.tick() => {
+                settle_and_book(&state, &bs, &guards, &recorder, &recal, oplog.as_ref(), &bn_http).await;
+            }
+            _ = shutdown.changed() => if *shutdown.borrow() { break },
+        }
+    }
+    info!("settlement_booking: shutdown");
+}
+
 pub async fn run_positions_refresh(
     rest: Arc<RestClient>,
     state: Arc<SharedState>,
@@ -1320,121 +1472,10 @@ pub async fn run_positions_refresh(
                         "positions_refresh: G8 P&L recorder this tick"
                     );
                 }
-                // BUG A (i): RING-GAP SETTLEMENT FALLBACK. The decision-loop sweep
-                // settles from the in-memory Binance ring; a WS drop leaves a gap so
-                // close_at() returns None and the position is NEVER settled -> a hole
-                // in the books (losers especially, since they also skip redemption ->
-                // the activity feed never sees them either). Here (async, off the hot
-                // path) we fetch the missing 1s closes via REST for any bot position
-                // whose window EXPIRED but is not in v2_settled, and settle it. The
-                // booking loop below then records it. Idempotent (recorder + v2_settled);
-                // capped per tick so a long outage can't storm the API.
-                {
-                    let now_s = now_ms() / 1000;
-                    let unsettled: Vec<OpenPosition> = match bs.lock() {
-                        Ok(g) => g
-                            .positions
-                            .iter()
-                            .filter(|p| now_s > p.exit_ts_s - 300 + 2 && !state.v2_settled.contains_key(&p.token_id))
-                            .take(20)
-                            .cloned()
-                            .collect(),
-                        Err(_) => Vec::new(),
-                    };
-                    for p in &unsettled {
-                        if recorder.lock().map(|r| r.already_recorded(&p.token_id)).unwrap_or(true) {
-                            continue; // already booked by another path
-                        }
-                        let resolution = p.exit_ts_s - 300;
-                        let win_secs = interval_secs(&p.interval).max(1);
-                        let epoch = resolution - win_secs;
-                        let (Some(op), Some(fin)) = (
-                            binance_close_at_rest(&bn_http, &p.asset, epoch - 1).await,
-                            binance_close_at_rest(&bn_http, &p.asset, resolution - 1).await,
-                        ) else {
-                            oplog.sys("settlement_rest_fallback_miss", serde_json::json!({
-                                "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
-                            }));
-                            continue;
-                        };
-                        let up = matches!(p.side, Outcome::Up);
-                        let won = up == (fin >= op); // tie => Up wins (same as the sweep)
-                        // Photo-finish: near-tie Binance label is unreliable; flag so the
-                        // recal feed skips it (P&L still books from the label below).
-                        if op > 0.0 && (fin / op - 1.0).abs() * 1e4 < 2.0 {
-                            state.v2_photofinish.insert(p.token_id.clone(), true);
-                        }
-                        state.v2_settled.insert(p.token_id.clone(), won);
-                        oplog.sys("settlement_rest_fallback", serde_json::json!({
-                            "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
-                            "epoch_open": op, "resolution_close": fin, "won": won,
-                        }));
-                        info!(token = %p.token_id, won, op, fin,
-                            "positions_refresh: ring-gap settlement recovered via Binance REST");
-                    }
-                }
-                // PRIMARY P&L PATH (decoupled from redemption): book the settlement
-                // outcomes the decision loop computed from Binance open-vs-close.
-                // This makes realized P&L appear within ~1 min of resolution WITHOUT
-                // waiting on the (rate-limited) relayer redeem. The activity feed
-                // below stays as an idempotent audit/fallback (shared recorder set).
-                {
-                    let settled: Vec<(String, bool)> = state
-                        .v2_settled
-                        .iter()
-                        .map(|e| (e.key().clone(), *e.value()))
-                        .collect();
-                    let mut booked = 0u32;
-                    for (token, won) in settled {
-                        let did = match recorder.lock() {
-                            Ok(mut r) => crate::pnl_recorder::record_settled(
-                                &token,
-                                if won { 1.0 } else { 0.0 },
-                                "settlement",
-                                &bs,
-                                &guards,
-                                &mut r,
-                                oplog.as_ref(),
-                                now_ms(),
-                            ),
-                            Err(_) => false,
-                        };
-                        // Drop WINNERS from v2_settled (redemption claims them via the
-                        // redeemable flag). KEEP LOSERS so the redemption task can see
-                        // them and SKIP the pointless $0 redeem (quota saver).
-                        if won {
-                            state.v2_settled.remove(&token);
-                        }
-                        if did {
-                            booked += 1;
-                            // Photo-finish (near-tie): DON'T feed the Binance label to
-                            // the recal (it flips ~20%); leave v2_pred so the activity
-                            // feed labels it with the TRUE payout below.
-                            if !state.v2_photofinish.contains_key(&token) {
-                                if let Some((_, (iv, pred))) = state.v2_pred.remove(&token) {
-                                    if let Ok(mut r) = recal.for_interval(&iv).lock() {
-                                        r.record(pred, won);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Bound v2_settled (mostly residual losers kept for the redeem
-                    // skip-list); clear if it somehow grows unbounded.
-                    if state.v2_settled.len() > 50_000 {
-                        state.v2_settled.clear();
-                    }
-                    if state.v2_photofinish.len() > 50_000 { state.v2_photofinish.clear(); }
-                    if state.mid_ring.len() > 50_000 { state.mid_ring.clear(); }
-                    if booked > 0 {
-                        recal.save_both();
-                        oplog.sys("v2_recal_update", serde_json::json!({
-                            "fed": booked, "source": "settlement",
-                        }));
-                        info!(booked,
-                            "positions_refresh: settlements booked from Binance close (decoupled from redeem)");
-                    }
-                }
+                // Settlement booking (ring-gap REST fallback + book every v2_settled
+                // outcome + recal feed). Shared with the paper-mode settlement_booking
+                // task via settle_and_book so both modes book identically.
+                settle_and_book(&state, &bs, &guards, &recorder, &recal, oplog.as_ref(), &bn_http).await;
                 // AUDIT/FALLBACK reconcile from the on-chain activity feed (exact
                 // payout). Idempotent with the settlement path above via the shared
                 // recorder set -- catches anything the Binance path missed (e.g.

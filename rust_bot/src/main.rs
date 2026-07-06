@@ -1202,19 +1202,12 @@ async fn main() -> anyhow::Result<()> {
         }
         // Shared with the redemption task so winners recorded at redeem-time and
         // losers recorded at poll-time use the SAME recorder set (idempotent).
-        let mut pnl_recorder_for_redeem: Option<
-            std::sync::Arc<std::sync::Mutex<pnl_recorder::PnlRecorder>>,
-        > = None;
-        if let Some(rest_arc) = refresh_rest.clone() {
-            info!("PIECE 4: spawning positions_refresh (60s period) -- active-only cap reads REST snapshot + G8 P&L hook");
-            // G8: build the shared PnlRecorder once from the persisted file. If
-            // load fails, log + start with an EMPTY set (safe default -- the
-            // worst case is one double-count per pre-existing record across the
-            // load failure, which is still bounded by the under-count > double-
-            // count invariant of the recorder's persist-first ordering).
-            let pnl_recorder = match pnl_recorder::PnlRecorder::load(
-                pnl_recorder::DEFAULT_PNL_RECORDED_LOG,
-            ) {
+        // G8: build the shared PnlRecorder UNCONDITIONALLY (from the persisted file;
+        // EMPTY on load failure). Settlement booking runs in PAPER too (via
+        // run_settlement_booking below), and both modes MUST share ONE recorder set
+        // for idempotency, so this can't live inside the live-only REST block.
+        let pnl_recorder_shared = std::sync::Arc::new(std::sync::Mutex::new(
+            match pnl_recorder::PnlRecorder::load(pnl_recorder::DEFAULT_PNL_RECORDED_LOG) {
                 Ok(r) => {
                     info!(loaded = r.len(),
                         "pnl_recorder: persisted set loaded -- these token_ids are already accounted for");
@@ -1223,15 +1216,17 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     warn!(error = %e,
                         "pnl_recorder: failed to load persisted set; starting EMPTY (will re-snapshot backlog)");
-                    pnl_recorder::PnlRecorder::load("/dev/null").unwrap_or_else(|_| {
-                        // Construct empty by loading from a definitely-nonexistent path
-                        pnl_recorder::PnlRecorder::load(
-                            std::env::temp_dir().join(format!("_empty_pnl_{}", state::now_ms()))
-                        ).expect("load missing file returns empty")
-                    })
+                    pnl_recorder::PnlRecorder::load(
+                        std::env::temp_dir().join(format!("_empty_pnl_{}", state::now_ms()))
+                    ).expect("load missing file returns empty")
                 }
-            };
-            let pnl_recorder_shared = std::sync::Arc::new(std::sync::Mutex::new(pnl_recorder));
+            },
+        ));
+        let mut pnl_recorder_for_redeem: Option<
+            std::sync::Arc<std::sync::Mutex<pnl_recorder::PnlRecorder>>,
+        > = None;
+        if let Some(rest_arc) = refresh_rest.clone() {
+            info!("PIECE 4: spawning positions_refresh (60s period) -- active-only cap reads REST snapshot + G8 P&L hook");
             pnl_recorder_for_redeem = Some(pnl_recorder_shared.clone());
 
             // G8: initial snapshot pass BEFORE positions_refresh ticks. Catalogs
@@ -1267,8 +1262,27 @@ async fn main() -> anyhow::Result<()> {
                 shutdown_rx.clone(),
                 state_store.state(),
                 guards_shared.clone(),
-                pnl_recorder_shared,
+                pnl_recorder_shared.clone(),
                 recal_shared.clone(),          // v2 per-interval recalibrators (fed on resolution)
+            )));
+        } else {
+            // PAPER: no Polymarket REST -> positions_refresh (which holds the
+            // settlement booking) is NOT spawned. Run the standalone
+            // settlement_booking task so held-to-settle positions still book P&L
+            // from Binance close (+ the ring-gap REST fallback). Without this, paper
+            // only ever books stops and held-to-settle positions pile up unbooked
+            // (the accounting invariant ALERTs on them). Mode-independent: bs +
+            // Binance only, no on-chain /positions or redemption coupling.
+            info!("spawning settlement_booking task (paper P&L path — books held-to-settle from Binance close)");
+            handles.push(tokio::spawn(trading_loop::run_settlement_booking(
+                state.clone(),
+                state_store.state(),
+                guards_shared.clone(),
+                pnl_recorder_shared.clone(),
+                recal_shared.clone(),
+                oplog_shared.clone(),
+                Duration::from_secs(30),
+                shutdown_rx.clone(),
             )));
         }
         // G5-wire: auto-redeem task. ONLY in live mode AND ONLY if the
