@@ -621,12 +621,39 @@ pub fn record_from_activity(
         if recorder.already_recorded(token) {
             continue;
         }
-        let Some(cond) = tok_cond.get(token) else { continue };
-        let Some(payout) = cond_payout.get(cond) else { continue }; // no REDEEM yet => unsettled
-        let won = *payout > 1e-9;
-        let resolved_price = if won { 1.0 } else { 0.0 };
-        if record_settled(token, resolved_price, "activity", bs, guards, recorder, oplog, now_ms_arg) {
-            booked.push((token.clone(), won));
+        let Some(cond) = tok_cond.get(token) else { continue }; // no BUY row seen yet
+        match cond_payout.get(cond) {
+            Some(payout) => {
+                let won = *payout > 1e-9;
+                let resolved_price = if won { 1.0 } else { 0.0 };
+                if record_settled(token, resolved_price, "activity", bs, guards, recorder, oplog, now_ms_arg) {
+                    booked.push((token.clone(), won));
+                }
+            }
+            None => {
+                // BUG A (ii): a BUY exists, the window expired long ago, and NO REDEEM
+                // row ever arrived => book as LOSS. Winners always redeem (eventually);
+                // a loser's $0 payout produces no activity row, so it would otherwise
+                // vanish from the books forever (the -$14.65 losses-only hole). This
+                // only reaches genuinely-STUCK positions: the Binance-REST fallback (i)
+                // and the /positions path both remove any they can settle from bs first,
+                // so reaching here means both failed for NO_REDEEM_LOSS_SECS. Erring to
+                // "loss" can at worst under-report a slow-redeeming winner (conservative
+                // direction — it can never hide a loss). N is generous so a normal
+                // redeem backlog never trips it. Logged as source=activity_no_redeem_loss.
+                const NO_REDEEM_LOSS_SECS: i64 = 45 * 60;
+                let expired_by = bs.lock().ok().and_then(|g| {
+                    g.positions
+                        .iter()
+                        .find(|p| &p.token_id == token)
+                        .map(|p| now_ms_arg / 1000 - (p.exit_ts_s - 300))
+                });
+                if expired_by.map(|e| e >= NO_REDEEM_LOSS_SECS).unwrap_or(false)
+                    && record_settled(token, 0.0, "activity_no_redeem_loss", bs, guards, recorder, oplog, now_ms_arg)
+                {
+                    booked.push((token.clone(), false));
+                }
+            }
         }
     }
     booked

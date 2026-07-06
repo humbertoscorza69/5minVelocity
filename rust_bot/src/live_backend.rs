@@ -496,7 +496,10 @@ pub async fn live_close(
     lb: &Arc<LiveBackend>,
     ct: &ClosedTrade,
     oplog: &OpLog,
-) -> Result<()> {
+) -> Result<Option<polymarket_client_sdk_v2::types::Decimal>> {
+    // R1: returns Some(usdc_received) on a Posted sell so the caller books the
+    // stop at the REAL proceeds (realized = usdc - shares*entry), not the model
+    // bid it was quoted at. None = no sell landed (gate/phantom/non-posted).
     use crate::live_executor::{ExecOutcome, OrderSide, OrderSpec, assess_slippage, place_order_idempotent};
     use polymarket_client_sdk_v2::POLYGON;
     use polymarket_client_sdk_v2::auth::{LocalSigner, Signer};
@@ -519,7 +522,7 @@ pub async fn live_close(
     }));
     if !verdict.is_allow() {
         warn!(reason = %verdict.reason(), token = %ct.token_id, "live_close: gate refused; NO POST (close not counted -- waiting for re-arm)");
-        return Ok(());
+        return Ok(None);
     }
 
     // F1 + G2: fetch /positions with PHANTOM RETRY (ground truth on-chain shares
@@ -578,24 +581,24 @@ pub async fn live_close(
             warn!(token = %ct.token_id, ct_shares = %ct.shares,
                 "live_close: PHANTOM (/positions empty or 0 shares); NO SELL POST; ESCALATE");
             record_attempt("Phantom");
-            return Ok(());
+            return Ok(None);
         }
         crate::exec::SellPlan::Mismatch => {
             warn!(token = %ct.token_id, ct_shares = %ct.shares,
                 "live_close: MISMATCH (bot's tracked shares vs /positions differ > dust); NO SELL POST; ESCALATE");
             record_attempt("Mismatch");
-            return Ok(());
+            return Ok(None);
         }
         crate::exec::SellPlan::NoFill => {
             warn!(token = %ct.token_id, "live_close: NoFill outcome (defensive; shouldn't reach here from exit_task)");
             record_attempt("NoFill");
-            return Ok(());
+            return Ok(None);
         }
     };
     if sell_shares <= Decimal::ZERO {
         warn!(token = %ct.token_id, %sell_shares, "live_close: sell_shares <= 0; NO POST");
         record_attempt("ZeroShares");
-        return Ok(());
+        return Ok(None);
     }
 
     // SELL coid scheme: prefix + signal_id + closed_at_ms. Unique per close.
@@ -633,8 +636,10 @@ pub async fn live_close(
         "shares": sell_shares.to_string(), "worst_price": worst.to_string(),
     }));
     let outcome = place_order_idempotent(&lb.rest, &signer, &spec, slip, false, &coid, epoch, &lb.intent_log).await;
+    let mut sold_usdc: Option<Decimal> = None; // R1: real proceeds on a Posted sell
     match &outcome {
         Ok(ExecOutcome::Posted(resp)) => {
+            sold_usdc = Some(resp.taking_amount); // taking_amount = USDC received
             oplog.api_ok("clob/place_order_idempotent", t0, 200, serde_json::json!({
                 "order_id": resp.order_id, "coid": coid,
             }));
@@ -705,7 +710,7 @@ pub async fn live_close(
         "live_close: ATTEMPT recorded -> opened={opened_now} closed={new_closed}/max={max} (shutdown_signaled={signaled})",
         max = lb.max_trades_per_session,
     );
-    Ok(())
+    Ok(sold_usdc)
 }
 
 #[cfg(test)]

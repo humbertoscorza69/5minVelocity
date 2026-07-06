@@ -1175,6 +1175,33 @@ fn eval_guards(
 ///
 /// PIECE 5: every poll emits api_call / api_ok / api_err to the oplog so the
 /// exact REST call + response + latency + verbatim error text is reconstructable.
+/// BUG A (i): fetch the Binance 1s-kline CLOSE at a specific second via public
+/// REST. Used as the settlement fallback when the in-memory ring has a gap (WS
+/// drop) so `close_at()` returned None and the decision-loop sweep couldn't
+/// settle the position. Returns None on any failure (network / parse / no bar) —
+/// the caller then logs a miss and leaves the position for the activity-feed
+/// backstop rather than guessing. Best-effort backstop, not the hot path.
+async fn binance_close_at_rest(http: &reqwest::Client, asset: &str, sec: i64) -> Option<f64> {
+    let symbol = match asset {
+        "BTC" => "BTCUSDT",
+        "ETH" => "ETHUSDT",
+        _ => return None,
+    };
+    let start = sec * 1000;
+    let url = format!(
+        "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1s&startTime={start}&endTime={}&limit=1",
+        start + 999
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr: Vec<Vec<serde_json::Value>> = resp.json().await.ok()?;
+    // Kline row: [openTime, open, high, low, CLOSE(4), volume, closeTime, ...];
+    // prices are JSON strings.
+    arr.first()?.get(4)?.as_str()?.parse::<f64>().ok()
+}
+
 pub async fn run_positions_refresh(
     rest: Arc<RestClient>,
     state: Arc<SharedState>,
@@ -1196,6 +1223,12 @@ pub async fn run_positions_refresh(
 ) {
     info!(period_secs = period.as_secs(), "task started: positions_refresh (G8 wired)");
     oplog.sys("positions_refresh_start", serde_json::json!({ "period_secs": period.as_secs() }));
+    // BUG A (i): a small HTTP client for the Binance-REST settlement fallback
+    // (recovers the specific 1s closes a WS drop left out of the in-memory ring).
+    let bn_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
     let mut iv = tokio::time::interval(period);
     iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1286,6 +1319,59 @@ pub async fn run_positions_refresh(
                         classified_by_redeemable = stats.classified_by_redeemable,
                         "positions_refresh: G8 P&L recorder this tick"
                     );
+                }
+                // BUG A (i): RING-GAP SETTLEMENT FALLBACK. The decision-loop sweep
+                // settles from the in-memory Binance ring; a WS drop leaves a gap so
+                // close_at() returns None and the position is NEVER settled -> a hole
+                // in the books (losers especially, since they also skip redemption ->
+                // the activity feed never sees them either). Here (async, off the hot
+                // path) we fetch the missing 1s closes via REST for any bot position
+                // whose window EXPIRED but is not in v2_settled, and settle it. The
+                // booking loop below then records it. Idempotent (recorder + v2_settled);
+                // capped per tick so a long outage can't storm the API.
+                {
+                    let now_s = now_ms() / 1000;
+                    let unsettled: Vec<OpenPosition> = match bs.lock() {
+                        Ok(g) => g
+                            .positions
+                            .iter()
+                            .filter(|p| now_s > p.exit_ts_s - 300 + 2 && !state.v2_settled.contains_key(&p.token_id))
+                            .take(20)
+                            .cloned()
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    for p in &unsettled {
+                        if recorder.lock().map(|r| r.already_recorded(&p.token_id)).unwrap_or(true) {
+                            continue; // already booked by another path
+                        }
+                        let resolution = p.exit_ts_s - 300;
+                        let win_secs = interval_secs(&p.interval).max(1);
+                        let epoch = resolution - win_secs;
+                        let (Some(op), Some(fin)) = (
+                            binance_close_at_rest(&bn_http, &p.asset, epoch - 1).await,
+                            binance_close_at_rest(&bn_http, &p.asset, resolution - 1).await,
+                        ) else {
+                            oplog.sys("settlement_rest_fallback_miss", serde_json::json!({
+                                "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
+                            }));
+                            continue;
+                        };
+                        let up = matches!(p.side, Outcome::Up);
+                        let won = up == (fin >= op); // tie => Up wins (same as the sweep)
+                        // Photo-finish: near-tie Binance label is unreliable; flag so the
+                        // recal feed skips it (P&L still books from the label below).
+                        if op > 0.0 && (fin / op - 1.0).abs() * 1e4 < 2.0 {
+                            state.v2_photofinish.insert(p.token_id.clone(), true);
+                        }
+                        state.v2_settled.insert(p.token_id.clone(), won);
+                        oplog.sys("settlement_rest_fallback", serde_json::json!({
+                            "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
+                            "epoch_open": op, "resolution_close": fin, "won": won,
+                        }));
+                        info!(token = %p.token_id, won, op, fin,
+                            "positions_refresh: ring-gap settlement recovered via Binance REST");
+                    }
                 }
                 // PRIMARY P&L PATH (decoupled from redemption): book the settlement
                 // outcomes the decision loop computed from Binance open-vs-close.
@@ -1556,27 +1642,40 @@ pub async fn run_execution_task(
                             for ct in &closed {
                                 // LIVE: sell FIRST; only book if it actually fills.
                                 // PAPER mode (no live backend): always books.
-                                let sell_ok = if let Some(lb) = &live {
+                                let (sell_ok, sold_usdc) = if let Some(lb) = &live {
                                     match crate::live_backend::live_close(lb, ct, &oplog).await {
-                                        Ok(()) => true,
+                                        Ok(usdc) => (true, usdc),
                                         Err(e) => {
                                             warn!(error = %e, token = %ct.token_id,
                                                 "live_close failed — HOLD position to settle (not booking)");
                                             oplog.err("live_close", &e.to_string(), serde_json::json!({}));
-                                            false
+                                            (false, None)
                                         }
                                     }
-                                } else { true };
+                                } else { (true, None) };
                                 if sell_ok {
-                                    emit_close_log(ct);
-                                    feed_guards_net_pnl(&guards, ct, now_ms);
+                                    // R1: when the live sell returned real proceeds, book
+                                    // the stop at usdc_received (realized = proceeds -
+                                    // shares*entry) + record the true avg fill as exit,
+                                    // not the model bid we quoted. Paper mode (no proceeds)
+                                    // keeps the model exit. Rebuild ct so the exec log,
+                                    // the daily-loss guard, and the dashboard all agree.
+                                    let mut ct_booked = ct.clone();
+                                    if let Some(usdc) = sold_usdc {
+                                        ct_booked.realized_pnl = usdc - ct.shares * ct.entry_price;
+                                        if !ct.shares.is_zero() {
+                                            ct_booked.exit_price = usdc / ct.shares;
+                                        }
+                                    }
+                                    emit_close_log(&ct_booked);
+                                    feed_guards_net_pnl(&guards, &ct_booked, now_ms);
                                     oplog.sys("paper_close", serde_json::json!({
-                                        "token_id": ct.token_id, "signal_id": ct.signal_id,
-                                        "entry_price": ct.entry_price.to_string(),
-                                        "exit_price": ct.exit_price.to_string(),
-                                        "shares": ct.shares.to_string(),
-                                        "realized_pnl": ct.realized_pnl.to_string(),
-                                        "kind": ct.exit_kind.as_str(),
+                                        "token_id": ct_booked.token_id, "signal_id": ct_booked.signal_id,
+                                        "entry_price": ct_booked.entry_price.to_string(),
+                                        "exit_price": ct_booked.exit_price.to_string(),
+                                        "shares": ct_booked.shares.to_string(),
+                                        "realized_pnl": ct_booked.realized_pnl.to_string(),
+                                        "kind": ct_booked.exit_kind.as_str(),
                                     }));
                                 } else {
                                     sell_failed = true;
