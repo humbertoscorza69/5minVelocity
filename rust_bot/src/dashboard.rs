@@ -667,19 +667,22 @@ function drawChart(curve){
   const w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;
   const x=c.getContext("2d");x.scale(dpr,dpr);x.clearRect(0,0,w,h);
   if(!curve.length){x.fillStyle="#8b98a9";x.font="13px sans-serif";x.fillText("no closed trades yet",16,28);return}
-  const ys=curve.map(p=>p.pnl),xs=curve.map(p=>p.t);
+  const ys=curve.map(p=>p.pnl);
   let mn=Math.min(0,...ys),mx=Math.max(0,...ys);if(mn===mx){mx+=1;mn-=1}
-  const t0=xs[0],t1=xs[xs.length-1]||t0+1;const pad=34;
-  const X=t=>pad+(w-pad-10)*((t-t0)/((t1-t0)||1));
+  const n=curve.length,pad=34;
+  // X by trade SEQUENCE, not timestamp: settlements booked in the same tick (e.g.
+  // a backlog recovered in one pass) share a ts to the millisecond, which would
+  // collapse a time-axis to a single vertical line. Index spacing is immune.
+  const X=i=>pad+(w-pad-10)*(i/((n-1)||1));
   const Y=v=>10+(h-20-10)*(1-((v-mn)/((mx-mn)||1)));
   // zero line
   x.strokeStyle="#283041";x.lineWidth=1;x.beginPath();x.moveTo(pad,Y(0));x.lineTo(w-10,Y(0));x.stroke();
   x.fillStyle="#8b98a9";x.font="10px sans-serif";x.fillText("$"+mx.toFixed(0),4,Y(mx)+4);x.fillText("$"+mn.toFixed(0),4,Y(mn)+4);
   // area + line
   const last=ys[ys.length-1];const col=last>=0?"#3fb950":"#f85149";
-  x.beginPath();curve.forEach((p,i)=>{const px=X(p.t),py=Y(p.pnl);i?x.lineTo(px,py):x.moveTo(px,py)});
-  x.lineTo(X(t1),Y(0));x.lineTo(X(t0),Y(0));x.closePath();x.fillStyle=col+"22";x.fill();
-  x.beginPath();curve.forEach((p,i)=>{const px=X(p.t),py=Y(p.pnl);i?x.lineTo(px,py):x.moveTo(px,py)});
+  x.beginPath();curve.forEach((p,i)=>{const px=X(i),py=Y(p.pnl);i?x.lineTo(px,py):x.moveTo(px,py)});
+  x.lineTo(X(n-1),Y(0));x.lineTo(X(0),Y(0));x.closePath();x.fillStyle=col+"22";x.fill();
+  x.beginPath();curve.forEach((p,i)=>{const px=X(i),py=Y(p.pnl);i?x.lineTo(px,py):x.moveTo(px,py)});
   x.strokeStyle=col;x.lineWidth=2;x.stroke();
 }
 function notify(title,body){try{if(!("Notification"in window))return;if(Notification.permission==="granted"){new Notification(title,{body})}else if(Notification.permission!=="denied"){Notification.requestPermission().then(p=>{if(p==="granted")new Notification(title,{body})})}}catch(e){}}
