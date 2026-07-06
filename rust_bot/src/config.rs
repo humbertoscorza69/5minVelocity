@@ -115,6 +115,18 @@ pub struct V2Config {
     /// self-throttling by regime). `0` = off. 3 = the validated setting.
     #[serde(default = "d_frozen_tape")]
     pub frozen_tape_secs: i64,
+    /// BOOK-UNMOVED entry gate: skip an entry unless the PM book's mid has NOT
+    /// moved in the ~3s before the decision (mid_move_3s == 0). With the
+    /// frozen-tape gate (Binance side) this is the literal lag detector — spot
+    /// moved, book hasn't. Entries where the book had ALREADY repriced bled
+    /// -$0.21/trade (84% of the Jul 4-5 loss; 64 trades, live fills); unmoved
+    /// entries were breakeven on dead tape and +0.65/$1 idealized on normal
+    /// recorder tape (n=2,341, twice-replicated). Skips ONLY affirmative movement
+    /// (mid_move_3s > 0); an unobservable book (no mid history in the 3s window)
+    /// passes rather than being silently starved. `true` = on (default). The 15m
+    /// override lives in [v2.i15m]; both default ON.
+    #[serde(default = "d_true")]
+    pub book_unmoved_gate: bool,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -232,6 +244,10 @@ pub struct Interval15mCfg {
     /// Horizon-matched vol lookback (seconds). 120 for 15m (vs 60 for 5m).
     #[serde(default = "d_i15m_vol_lb")]
     pub vol_lookback_s: i64,
+    /// BOOK-UNMOVED entry gate for 15m (see V2Config.book_unmoved_gate). Applied
+    /// so the 15m paper dataset stays comparable; default ON, flag independently.
+    #[serde(default = "d_true")]
+    pub book_unmoved_gate: bool,
 }
 
 impl Default for Interval15mCfg {
@@ -250,6 +266,7 @@ impl Default for Interval15mCfg {
             edge_ref: d_edge_ref(),
             min_ttl_s: d_v2_min_ttl(),
             vol_lookback_s: d_i15m_vol_lb(),
+            book_unmoved_gate: true,
         }
     }
 }
@@ -328,6 +345,7 @@ impl Default for V2Config {
             inval_stop_dry_run: true,
             stop_bid_hi: d_stop_bid_hi(),
             stop_bid_lo: d_stop_bid_lo(),
+            book_unmoved_gate: true,
             i15m: Interval15mCfg::default(),
         }
     }

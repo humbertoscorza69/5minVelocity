@@ -129,6 +129,13 @@ inval_stop_dry_run = false
 # lo=0.0 to revert to the unconditional stop.
 stop_bid_hi = 0.50
 stop_bid_lo = 0.30
+# BOOK-UNMOVED entry gate: skip an entry unless the PM book's mid was UNMOVED in
+# the ~3s before the decision (the book-side half of the lag detector; the
+# Binance-side half is frozen_tape_secs). Entries where the book had already
+# repriced bled -$0.21/trade (84% of the Jul 4-5 loss); unmoved entries were
+# breakeven on dead tape, +0.65/$1 on normal recorder tape. Skips only affirmative
+# movement (mid_move_3s > 0); an unobservable book passes. true = on.
+book_unmoved_gate = true
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50
@@ -160,6 +167,8 @@ vol_cap = 1.0
 dvr_floor = 0.2
 edge_ref = 0.08
 min_ttl_s = 30
+# Book-unmoved gate for 15m (same as 5m; paper-log). Default ON for comparability.
+book_unmoved_gate = true
 
 # No [exits.cells] → every cell uses Baseline (hold-to-settle). v2 positions
 # carry exit_ts_s past resolution; the redemption task claims the winner.

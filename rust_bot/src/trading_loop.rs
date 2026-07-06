@@ -133,8 +133,13 @@ fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<(bool, f
     // when there IS data (offline tuning needs the raw values, not just the bool).
     let move_ = if n >= 2 { (mx - mn).abs() } else { 0.0 };
     let age = now_ms - oldest;
-    // The boolean stays conservative: only assert "asleep" with real coverage.
-    let asleep = n >= 2 && age >= 1500 && move_ < 1e-9;
+    // BUG B fix: the bool now means exactly what the book-unmoved gate keys on —
+    // the mid did not move over the window, with >=2 samples of coverage. The old
+    // `age >= 1500` guard required the OLDEST sample to be >=1.5s back, which a
+    // quiet book (few, recent mid updates) rarely satisfies, so the bool was true
+    // on only ~1% of intents while move==0 held on ~83%. `age` is still returned
+    // raw for staleness auditing; it is no longer a gate on the flag.
+    let asleep = n >= 2 && move_ < 1e-9;
     Some((asleep, move_, age))
 }
 
@@ -882,6 +887,27 @@ pub async fn run_decision_task(
                             if v2_entered.contains(&intent.token_id) {
                                 continue;
                             }
+                            // BOOK-UNMOVED GATE (the PM-book side of the lag detector):
+                            // skip the entry if the book's mid has ALREADY moved in the
+                            // ~3s pre-decision (it repriced -> no lag left to buy).
+                            // Together with the frozen-tape gate (Binance side, inside
+                            // process_kline_v2) this is "spot moved, book hasn't". Skips
+                            // ONLY affirmative movement (mid_move_3s > 0); an unobservable
+                            // book (None) passes rather than being silently starved.
+                            let asleep_obs = book_asleep(&state, &intent.token_id, now);
+                            let book_gate_on = match intent.interval.as_str() {
+                                "15m" => vcfg.i15m.book_unmoved_gate,
+                                _ => vcfg.book_unmoved_gate,
+                            };
+                            if book_gate_on && asleep_obs.map(|a| a.1 > 1e-9).unwrap_or(false) {
+                                oplog.sys("v2_book_moved_skip", serde_json::json!({
+                                    "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                    "interval": intent.interval,
+                                    "mid_move_3s": asleep_obs.map(|a| a.1),
+                                    "asleep_age_ms": asleep_obs.map(|a| a.2),
+                                }));
+                                continue;
+                            }
                             let verdict = {
                                 let g = guards.lock().expect("guards mutex poisoned");
                                 eval_guards(&g, &state, &positions, intent, now)
@@ -905,7 +931,29 @@ pub async fn run_decision_task(
                             // (drained on resolution, routed to the interval's recal).
                             state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred));
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
-                            let asleep_obs = book_asleep(&state, &intent.token_id, now);
+                            // BURST (LOG-ONLY; Part 4 sizing dial NOT built): max
+                            // side-aligned 1s/3s Binance return (bps) over entry-5s..entry.
+                            // Cheap now, builds the live validation set for burst sizing.
+                            let burst_bps = {
+                                let sign = if ctx.side.eq_ignore_ascii_case("up") { 1.0 } else { -1.0 };
+                                let mut b = 0.0_f64;
+                                for k in 0..5i64 {
+                                    let t = kline.t_s - k;
+                                    if let (Some(c), Some(c1)) =
+                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 1))
+                                        && c1 > 0.0
+                                    {
+                                        b = b.max(sign * (c / c1 - 1.0) * 1e4);
+                                    }
+                                    if let (Some(c), Some(c3)) =
+                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 3))
+                                        && c3 > 0.0
+                                    {
+                                        b = b.max(sign * (c / c3 - 1.0) * 1e4);
+                                    }
+                                }
+                                b
+                            };
                             oplog.sys("v2_intent_open", serde_json::json!({
                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,
                                 "side": ctx.side, "stake_usd": ctx.stake_usd,
@@ -916,6 +964,7 @@ pub async fn run_decision_task(
                                 "asleep": asleep_obs.map(|a| a.0),
                                 "mid_move_3s": asleep_obs.map(|a| a.1),
                                 "asleep_age_ms": asleep_obs.map(|a| a.2),
+                                "burst_bps": burst_bps,
                                 "exit_ts_s": intent.exit_ts_s,
                             }));
                             info!(token = %intent.token_id, p = pred, stake = ctx.stake_usd,

@@ -230,6 +230,7 @@ fn compute_stats(
     // that will keep failing — precision/amount), and normal FOK kills (benign).
     let (mut rolled_back, mut det_errors, mut fok_kills) = (0u64, 0u64, 0u64);
     let mut asleep_null = 0u64; // intents where the asleep telemetry logged null (regression)
+    let mut stops_fired = 0u64; // invalidation stops that actually SOLD (action=sell)
     // Trailing-window fill rate: each intent's signal_id in order + the set that
     // rolled back, so the alarm fires on a FRESH rejection storm within ~N intents
     // regardless of how long the session has been healthy (cumulative would dilute
@@ -238,6 +239,16 @@ fn compute_stats(
     let mut rolled_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // (ts_ms, net_pnl, token, side, entry, exit, interval)
     let mut rev: Vec<(i64, f64, String, String, Option<f64>, Option<f64>, String)> = Vec::new();
+    // ACCOUNTING INVARIANT (Bug A net): every opened position must terminate in a
+    // close OR a recorded resolution. `opened` = paper_open ∪ live_open_posted
+    // (paper_open fires in BOTH modes; live_open_posted is the confirmed real
+    // fill). `rolled` = live_open_rolled_back (phantoms that never landed —
+    // excluded). `terminated` = any close/pnl-record. A token opened > GRACE ago,
+    // not terminated and not rolled, is a LOSS/WIN that vanished from the books —
+    // exactly the hole that showed +$9 on the dashboard while the wallet lost $27.
+    let mut opened: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut terminated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rolled_tok: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     if let Ok(text) = std::fs::read_to_string(oplog_path) {
         for line in text.lines() {
@@ -256,9 +267,27 @@ fn compute_stats(
                     }
                 }
                 "v2_guard_blocked_open" => blocked += 1,
+                "paper_open" | "live_open_posted" => {
+                    if let Some(t) = v.get("data").and_then(|d| d.get("token_id")).and_then(Value::as_str) {
+                        opened.entry(t.to_string()).or_insert(ts);
+                    }
+                }
+                "paper_close" | "live_close_posted" | "pnl_recorder_recorded" => {
+                    if let Some(t) = v.get("data").and_then(|d| d.get("token_id")).and_then(Value::as_str) {
+                        terminated.insert(t.to_string());
+                    }
+                }
+                "inval_stop" => {
+                    if v.get("data").and_then(|d| d.get("action")).and_then(Value::as_str) == Some("sell") {
+                        stops_fired += 1;
+                    }
+                }
                 "live_open_rolled_back" => {
                     rolled_back += 1;
                     if let Some(s) = sid() { rolled_sids.insert(s.to_string()); }
+                    if let Some(t) = v.get("data").and_then(|d| d.get("token_id")).and_then(Value::as_str) {
+                        rolled_tok.insert(t.to_string());
+                    }
                 }
                 "error" | "api_error" => {
                     let et = v.get("data").and_then(|d| d.get("error_text"))
@@ -300,6 +329,7 @@ fn compute_stats(
             let np = v.get("net_pnl").and_then(num).unwrap_or(0.0);
             let rp = v.get("resolved_price").and_then(num);
             let side = match rp { Some(x) if x >= 0.5 => "win", Some(_) => "lose", None => "" };
+            if let Some(t) = v.get("token_id").and_then(Value::as_str) { terminated.insert(t.to_string()); }
             rev.push((ts, np,
                 short_tok(v.get("token_id").and_then(Value::as_str).unwrap_or("")),
                 side.to_string(),
@@ -401,8 +431,20 @@ fn compute_stats(
     let recon_per_hr = reconnects as f64 / uptime_h.max(0.05);
     let bn_up = state.binance_connected.load(Relaxed);
     let pm_up = state.polymarket_connected.load(Relaxed);
+    // ACCOUNTING INVARIANT: opened positions past the settlement grace that never
+    // terminated in a close/pnl-record and weren't rolled back = the P&L hole.
+    // GRACE (20 min) > the 15m window + settlement/redeem lag, so still-settling
+    // positions don't false-positive. count > 0 is a hard ALERT.
+    const HOLE_GRACE_MS: i64 = 20 * 60 * 1000;
+    let accounting_hole = opened
+        .iter()
+        .filter(|(tok, ts)| now - **ts > HOLE_GRACE_MS && !terminated.contains(*tok) && !rolled_tok.contains(*tok))
+        .count();
     let mut alerts: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
+    if accounting_hole > 0 {
+        alerts.push(format!("{accounting_hole} settled position(s) NEVER booked — P&L accounting hole (loss/win vanished from the books)"));
+    }
     if !bn_up { alerts.push("Binance feed DOWN".into()); }
     if !pm_up { alerts.push("Polymarket feed DOWN".into()); }
     if !state.is_healthy() { alerts.push("feed stale / halted".into()); }
@@ -419,6 +461,7 @@ fn compute_stats(
         "window_n": win_n, "posted": posted, "intents_total": entries,
         "det_errors": det_errors, "fok_kills": fok_kills, "rolled_back": rolled_back,
         "reconnects": reconnects, "reconnects_per_hr": recon_per_hr,
+        "accounting_hole": accounting_hole,
     });
 
     json!({
@@ -454,6 +497,7 @@ fn compute_stats(
             "gross_win": gross_win,
             "gross_loss": gross_loss,
             "blocked": blocked,
+            "stops_fired": stops_fired,
         },
         "by_interval": by_interval,
         "recal": {
@@ -597,7 +641,7 @@ tbody tr:hover{background:var(--panel2)}
     <div class="card"><div class="lbl">Realized</div><div class="val mono" id="pnl_real">—</div></div>
     <div class="card"><div class="lbl">Unrealized</div><div class="val mono" id="pnl_unreal">—</div></div>
     <div class="card"><div class="lbl">Profit Factor</div><div class="val mono" id="pf">—</div><div class="sub" id="pf_sub"></div></div>
-    <div class="card"><div class="lbl">Win Rate</div><div class="val mono" id="wr">—</div><div class="sub" id="wr_sub"></div></div>
+    <div class="card"><div class="lbl">Settled WR</div><div class="val mono" id="wr">—</div><div class="sub" id="wr_sub"></div></div>
     <div class="card"><div class="lbl">Trades</div><div class="val mono" id="trades">—</div><div class="sub" id="trades_sub"></div></div>
     <div class="card"><div class="lbl">Recal bias</div><div class="val mono" id="recal">—</div><div class="sub" id="recal_sub"></div></div>
   </div>
@@ -704,7 +748,12 @@ function render(){
   $("pf").textContent=(typeof st.profit_factor==="number")?st.profit_factor.toFixed(2):st.profit_factor;
   $("pf_sub").textContent="W $"+st.gross_win.toFixed(0)+" / L $"+st.gross_loss.toFixed(0);
   $("wr").textContent=(st.win_rate*100).toFixed(1)+"%";
-  $("wr_sub").textContent=st.wins+"W / "+st.losses+"L";
+  // WR is a COMPOSITION stat now: the invalidation stop clips winners by design,
+  // so a settled WR of 45-52% is expected, not a warning. Show the stop rate
+  // alongside so the number reads in context (all-view; stops_fired is global).
+  const sf=(FILT==="all")?(s.stats.stops_fired||0):0;
+  const sr=(FILT==="all"&&st.closed>0&&sf>0)?" · "+sf+" stops ("+Math.round(100*sf/st.closed)+"% of exits)":"";
+  $("wr_sub").textContent=st.wins+"W / "+st.losses+"L"+sr;
   // Headline = REAL filled trades (positions that actually opened = open+closed),
   // NOT s.stats.entries (which counts every v2_intent_open, incl. FOK kills /
   // rolled-back orders that never became a position). Intents shown in the sub.
