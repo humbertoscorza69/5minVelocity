@@ -127,6 +127,17 @@ pub struct V2Config {
     /// override lives in [v2.i15m]; both default ON.
     #[serde(default = "d_true")]
     pub book_unmoved_gate: bool,
+    /// RE-ENTRY after a band-stop (Handoff #3 feature A). When a position is closed
+    /// by the bid-band invalidation stop, the market becomes eligible for ONE more
+    /// entry (max 2/market total), EITHER side, awarded FCFS to the first fresh
+    /// signal clearing the full gate stack (edge>=0.06, z>=0.45 side-signed for the
+    /// new side, ttl>=30, frozen-tape, book-unmoved on the new token). Validated:
+    /// opposite-side +0.144/$1 (CI [0.098,0.191], all windows/IS/OOS/LOWO), same-
+    /// side +0.132/$1; EV concentrates ~10-30s after a hi-band stop (we sold >=0.50,
+    /// contra sits cheap). NOT the killed instant-flip: median re-entry is 33s out
+    /// and must clear a fresh gate. Expected +23.5% volume, ~+26% $/day. Default ON.
+    #[serde(default = "d_true")]
+    pub reentry_enabled: bool,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -346,6 +357,7 @@ impl Default for V2Config {
             stop_bid_hi: d_stop_bid_hi(),
             stop_bid_lo: d_stop_bid_lo(),
             book_unmoved_gate: true,
+            reentry_enabled: true,
             i15m: Interval15mCfg::default(),
         }
     }

@@ -136,6 +136,11 @@ stop_bid_lo = 0.30
 # breakeven on dead tape, +0.65/$1 on normal recorder tape. Skips only affirmative
 # movement (mid_move_3s > 0); an unobservable book passes. true = on.
 book_unmoved_gate = true
+# RE-ENTRY after a band-stop (Handoff #3 feature A): a stopped market becomes
+# eligible for ONE more entry (max 2/market), either side, FCFS to the first fresh
+# signal clearing the full gate stack. Validated: opposite +0.144/$1, same +0.132;
+# expected +23.5% volume, ~+26% $/day. Logs reentry/reentry_side/secs_since_stop.
+reentry_enabled = true
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50

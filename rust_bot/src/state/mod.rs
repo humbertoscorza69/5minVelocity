@@ -186,6 +186,15 @@ pub struct SharedState {
     /// leave them for the activity-feed TRUE payout to label. P&L still books
     /// normally (and self-corrects via activity). Prevents recal poisoning at ties.
     pub v2_photofinish: DashMap<String, bool>,
+    /// RE-ENTRY (Handoff #3 feature A): a market becomes eligible for ONE re-entry
+    /// after a band-stop SELL. Keyed by "{asset}:{interval}:{epoch}" (stable per
+    /// market, derivable at both stop time and decision time). Value =
+    /// (stopped_at_sec, stopped_side_was_up) — used to gate the 2nd entry and to
+    /// log reentry_side (same|opposite) + secs_since_stop on the re-entry intent.
+    pub v2_reentry: DashMap<String, (i64, bool)>,
+    /// Per-market ENTRY COUNT (same key as v2_reentry). Enforces max 2 entries per
+    /// market total (original + one re-entry). Incremented on every fired entry.
+    pub v2_market_entries: DashMap<String, u8>,
     /// PIECE 4 (active-only enrichment): per-token RESOLUTION flag derived from
     /// the data-api `/positions` snapshot (redeemable OR cur_price ∈ {0,1} OR
     /// end_date past). Updated periodically by `run_positions_refresh`. Missing
@@ -222,6 +231,8 @@ impl SharedState {
             mid_ring: DashMap::new(),
             v2_stop_recal: DashMap::new(),
             v2_photofinish: DashMap::new(),
+            v2_reentry: DashMap::new(),
+            v2_market_entries: DashMap::new(),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),
             started_at: Instant::now(),

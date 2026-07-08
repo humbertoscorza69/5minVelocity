@@ -756,6 +756,19 @@ pub async fn run_decision_task(
                                             });
                                             info!(token = %p.token_id, disp, bid = ?bid,
                                                 "inval_stop: 5m thesis dead + bid in band -> SELL at bid");
+                                            // RE-ENTRY (feature A): the market becomes eligible
+                                            // for ONE re-entry (either side), and the stopped
+                                            // token is cleared from the entered-set so a fresh
+                                            // SAME-side signal can re-fire. The max-2 cap +
+                                            // eligibility are enforced at decision time;
+                                            // positions.any still blocks until the sell clears,
+                                            // so a failed FOK can't double-open.
+                                            if vcfg.reentry_enabled {
+                                                let mkey = format!("{}:{}:{}", p.asset, p.interval, epoch);
+                                                if state.v2_reentry.len() > 50_000 { state.v2_reentry.clear(); }
+                                                state.v2_reentry.insert(mkey, (now_s, up));
+                                                v2_entered.remove(&p.token_id);
+                                            }
                                         }
                                         // Dedup ONLY after an actual fire (failed FOK stays
                                         // marked -> holds to settle). Suppressed triggers
@@ -887,6 +900,33 @@ pub async fn run_decision_task(
                             if v2_entered.contains(&intent.token_id) {
                                 continue;
                             }
+                            // RE-ENTRY / MAX-ENTRIES gate (feature A). Per-market entry
+                            // count caps at 2 (original + one re-entry). A 2nd entry is
+                            // allowed ONLY as a re-entry after a band-stop (v2_reentry has
+                            // the market key) and only with the feature on. reentry_side
+                            // (same|opposite) + secs_since_stop are logged on the intent.
+                            let mkey = format!("{}:{}:{}", ctx.asset, ctx.interval, ctx.epoch);
+                            let prior_entries = state.v2_market_entries.get(&mkey).map(|v| *v).unwrap_or(0);
+                            let (mut is_reentry, mut reentry_side, mut secs_since_stop) = (false, "", 0i64);
+                            if prior_entries >= 2 {
+                                oplog.sys("v2_reentry_capped", serde_json::json!({
+                                    "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                    "market": mkey, "entries": prior_entries,
+                                }));
+                                continue;
+                            }
+                            if prior_entries >= 1 {
+                                match (vcfg.reentry_enabled, state.v2_reentry.get(&mkey)) {
+                                    (true, Some(r)) => {
+                                        let (stopped_at, stopped_up) = *r;
+                                        is_reentry = true;
+                                        let up = ctx.side.eq_ignore_ascii_case("up");
+                                        reentry_side = if up == stopped_up { "same" } else { "opposite" };
+                                        secs_since_stop = now / 1000 - stopped_at;
+                                    }
+                                    _ => continue, // 2nd entry only via a post-band-stop re-entry
+                                }
+                            }
                             // BOOK-UNMOVED GATE (the PM-book side of the lag detector):
                             // skip the entry if the book's mid has ALREADY moved in the
                             // ~3s pre-decision (it repriced -> no lag left to buy).
@@ -927,6 +967,9 @@ pub async fn run_decision_task(
                                 v2_entered.clear();
                             }
                             v2_entered.insert(intent.token_id.clone());
+                            // Count this entry against the per-market max-2 cap (feature A).
+                            if state.v2_market_entries.len() > 50_000 { state.v2_market_entries.clear(); }
+                            *state.v2_market_entries.entry(mkey.clone()).or_insert(0) += 1;
                             // Record (interval, predicted-p) for the recalibrator
                             // (drained on resolution, routed to the interval's recal).
                             state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred));
@@ -965,6 +1008,22 @@ pub async fn run_decision_task(
                                 "mid_move_3s": asleep_obs.map(|a| a.1),
                                 "asleep_age_ms": asleep_obs.map(|a| a.2),
                                 "burst_bps": burst_bps,
+                                // FEATURE A: re-entry telemetry (FCFS; both-sides-qualified
+                                // is reconstructable from reentry_side across the market's
+                                // intents + v2_reentry_capped events).
+                                "reentry": is_reentry,
+                                "reentry_side": reentry_side,
+                                "secs_since_stop": secs_since_stop,
+                                // FEATURE B: book-unmoved gate reconcile. This intent PASSED
+                                // the gate; classify HOW so the pass_on_missing share (live
+                                // ~17% block vs recorder ~60% — sparse ring passing) is
+                                // measurable. passed = affirmative unmoved (>=2 samples);
+                                // pass_thin = 1 sample; pass_on_missing = no ring coverage.
+                                "book_gate": match asleep_obs {
+                                    None => "pass_on_missing",
+                                    Some((true, _, _)) => "passed",
+                                    Some((false, _, _)) => "pass_thin",
+                                },
                                 "exit_ts_s": intent.exit_ts_s,
                             }));
                             info!(token = %intent.token_id, p = pred, stake = ctx.stake_usd,
