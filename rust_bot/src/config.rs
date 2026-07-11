@@ -168,6 +168,16 @@ pub struct V2Config {
     pub tickage_mult: f64,
     #[serde(default = "d_stake_mult_cap")]
     pub stake_mult_cap: f64,
+    /// 5m win-prob calibration knots (Order #6 A4: moved from constants to config so
+    /// a validated refit ships as config + recal reset, not a code deploy). Default =
+    /// the frozen May curve; bot_v2.toml carries the refit (cal_w re-based to the
+    /// honest scale, cal_z unchanged) which is why edge_min drops to 0.01 — 0.06 was
+    /// calibrated against the inflated curve. Ship all three together (knots without
+    /// the edge_min re-base halve volume and lose money — tested).
+    #[serde(default = "d_cal_z")]
+    pub cal_z: Vec<f64>,
+    #[serde(default = "d_cal_w")]
+    pub cal_w: Vec<f64>,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -224,6 +234,10 @@ pub struct V2Config {
 
 fn d_stop_bid_hi() -> f64 { 0.50 }
 fn d_stop_bid_lo() -> f64 { 0.30 }
+fn d_cal_z() -> Vec<f64> { crate::v2::CAL_Z.to_vec() }
+fn d_cal_w() -> Vec<f64> { crate::v2::CAL_W.to_vec() }
+fn d_cal_z_15m() -> Vec<f64> { crate::v2::CAL_Z_15M.to_vec() }
+fn d_cal_w_15m() -> Vec<f64> { crate::v2::CAL_W_15M.to_vec() }
 fn d_burst_lo() -> f64 { 3.0 }
 fn d_burst_hi() -> f64 { 8.0 }
 fn d_burst_mult_lo() -> f64 { 2.0 }
@@ -295,6 +309,12 @@ pub struct Interval15mCfg {
     /// so the 15m paper dataset stays comparable; default ON, flag independently.
     #[serde(default = "d_true")]
     pub book_unmoved_gate: bool,
+    /// 15m calibration knots (A4: moved to config for parity). UNTOUCHED by the 5m
+    /// refit — defaults are the current 15m curve; leave them out of the toml.
+    #[serde(default = "d_cal_z_15m")]
+    pub cal_z: Vec<f64>,
+    #[serde(default = "d_cal_w_15m")]
+    pub cal_w: Vec<f64>,
 }
 
 impl Default for Interval15mCfg {
@@ -314,6 +334,8 @@ impl Default for Interval15mCfg {
             min_ttl_s: d_v2_min_ttl(),
             vol_lookback_s: d_i15m_vol_lb(),
             book_unmoved_gate: true,
+            cal_z: d_cal_z_15m(),
+            cal_w: d_cal_w_15m(),
         }
     }
 }
@@ -333,8 +355,8 @@ impl V2Config {
             min_ttl_s: self.min_ttl_s,
             late_entry_max_ttl_s: self.max_ttl_s, // 5m late gate (0 = off)
             max_ask: 0.0,            // 5m: no price cap (its live edge includes cheap)
-            cal_z: crate::v2::CAL_Z.to_vec(),
-            cal_w: crate::v2::CAL_W.to_vec(),
+            cal_z: self.cal_z.clone(),
+            cal_w: self.cal_w.clone(),
             recal_bias,
             base_usd: 0.0, // set per-tick from Controls in the decision loop
             max_pos_usd: 0.0,
@@ -359,8 +381,8 @@ impl Interval15mCfg {
             min_ttl_s: self.min_ttl_s,
             late_entry_max_ttl_s: self.late_entry_max_ttl_s,
             max_ask: self.max_ask,
-            cal_z: crate::v2::CAL_Z_15M.to_vec(),
-            cal_w: crate::v2::CAL_W_15M.to_vec(),
+            cal_z: self.cal_z.clone(),
+            cal_w: self.cal_w.clone(),
             recal_bias,
             base_usd: 0.0, // set per-tick from Controls in the decision loop
             max_pos_usd: 0.0,
@@ -402,6 +424,8 @@ impl Default for V2Config {
             burst_mult_hi: d_burst_mult_hi(),
             tickage_mult: d_tickage_mult(),
             stake_mult_cap: d_stake_mult_cap(),
+            cal_z: d_cal_z(),
+            cal_w: d_cal_w(),
             i15m: Interval15mCfg::default(),
         }
     }

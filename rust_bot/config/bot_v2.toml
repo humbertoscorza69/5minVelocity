@@ -73,9 +73,17 @@ alert_dir = "alerts"
 # v2 strategy — the validated edge-gate brain.
 [v2]
 enabled = true
-# 0.06 (was 0.04): sweep showed total holds (~$3231 vs $3184) with higher EV/trade
-# + better Sharpe — drops the marginal 0.04-0.06 trades. Near-free tune.
-edge_min = 0.06
+# edge_min 0.01 (Order #6 refit): RE-BASED to the honest curve. 0.06 was calibrated
+# against the inflated May cal_w; on the refit scale the same edge region sits at
+# ~0.01-0.08. SHIP WITH cal_w BELOW — never separately (knots without this re-base
+# halve volume + lose money; 0.02 ok, 0.03 falls off a cliff — all tested). Refit
+# passed both hold-outs (recorder 9d +$23.4 vs +$20.3/day; July live +$12.0 vs
+# +$10.5, EV/trade +29%). Deploy step: delete data/v2/recal.json (5m only).
+edge_min = 0.01
+# 5m calibration curve (A4 → config). cal_z UNCHANGED; cal_w re-based to the honest
+# scale (the May curve ran +7.8pts hot, which is why recal bias climbed to 0.175).
+cal_z = [0.14, 0.45, 0.80, 1.24, 1.74, 2.46, 3.82, 10.49]
+cal_w = [0.536, 0.615, 0.664, 0.737, 0.767, 0.767, 0.767, 0.767]
 # z_min: minimum vol-normalized displacement to enter. THE fix for firing on
 # noise at the window open -- live showed the bot entered ~every window at ~0.9bps
 # displacement (z~0.1) where pcal was a bogus ~0.59. 0.45 = the May knot whose
