@@ -784,9 +784,10 @@ pub async fn run_decision_task(
                                         if do_sell {
                                             if let Some(pr) = state.v2_pred.get(&p.token_id).map(|v| v.value().1) {
                                                 if state.v2_stop_recal.len() > 50_000 { state.v2_stop_recal.clear(); }
+                                                let sh = p.shares.to_f64().unwrap_or(0.0);
                                                 state.v2_stop_recal.insert(
                                                     p.token_id.clone(),
-                                                    (p.interval.clone(), p.asset.clone(), up, resolution, pr),
+                                                    (p.interval.clone(), p.asset.clone(), up, resolution, pr, sh, bid.unwrap_or(0.0)),
                                                 );
                                             }
                                         }
@@ -818,10 +819,10 @@ pub async fn run_decision_task(
                     // never saw them, and without this recal trains on survivors only.
                     // Skip any still in bs (a failed sell was reverted → the normal
                     // settlement path feeds it). Same Binance open-vs-close basis.
-                    let pending: Vec<(String, (String, String, bool, i64, f64))> =
+                    let pending: Vec<(String, (String, String, bool, i64, f64, f64, f64))> =
                         state.v2_stop_recal.iter().map(|e| (e.key().clone(), e.value().clone())).collect();
                     let mut cf_fed = 0u32;
-                    for (token, (iv, asset, up, resolution, pred)) in pending {
+                    for (token, (iv, asset, up, resolution, pred, shares, stop_bid)) in pending {
                         if now_s < resolution + 2 { continue; }
                         if snap.iter().any(|p| p.token_id == token) {
                             state.v2_stop_recal.remove(&token); // reverted into bs → normal path feeds it
@@ -834,6 +835,18 @@ pub async fn run_decision_task(
                         ) else { continue }; // ring cold → retry next tick
                         let won = up == (fin >= op);
                         if let Ok(mut r) = recal.for_interval(&iv).lock() { r.record(pred, won); }
+                        // STOP PROBATION GAUGE (Decision 2): net dEV of the stop vs
+                        // HOLDING = shares*(stop_bid - resolved). Saved a loser
+                        // (won=false) banks +bid; whipsawed a winner (won=true) forfeits
+                        // -(1-bid). The dashboard rolls the last 500 into net-dEV/stop;
+                        // sustained < 0 => disarm the stop (revert to hold-only).
+                        let resolved = if won { 1.0 } else { 0.0 };
+                        let dev = shares * (stop_bid - resolved);
+                        oplog.sys("stop_dev", serde_json::json!({
+                            "token_id": token, "interval": iv, "won": won,
+                            "stop_bid": stop_bid, "shares": shares, "dev": dev,
+                            "outcome": if won { "whipsawed" } else { "saved" },
+                        }));
                         state.v2_stop_recal.remove(&token);
                         state.v2_pred.remove(&token); // consumed by the counterfactual feed
                         cf_fed += 1;
@@ -919,9 +932,24 @@ pub async fn run_decision_task(
                                 match (vcfg.reentry_enabled, state.v2_reentry.get(&mkey)) {
                                     (true, Some(r)) => {
                                         let (stopped_at, stopped_up) = *r;
-                                        is_reentry = true;
                                         let up = ctx.side.eq_ignore_ascii_case("up");
-                                        reentry_side = if up == stopped_up { "same" } else { "opposite" };
+                                        let side = if up == stopped_up { "same" } else { "opposite" };
+                                        // Decision-3 per-side kill-rule: each side toggles
+                                        // independently (same-side is the probationary leg).
+                                        let side_on = if side == "same" {
+                                            vcfg.reentry_same_enabled
+                                        } else {
+                                            vcfg.reentry_opposite_enabled
+                                        };
+                                        if !side_on {
+                                            oplog.sys("v2_reentry_side_off", serde_json::json!({
+                                                "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                                "market": mkey, "side": side,
+                                            }));
+                                            continue;
+                                        }
+                                        is_reentry = true;
+                                        reentry_side = side;
                                         secs_since_stop = now / 1000 - stopped_at;
                                     }
                                     _ => continue, // 2nd entry only via a post-band-stop re-entry

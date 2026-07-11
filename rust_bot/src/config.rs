@@ -138,6 +138,16 @@ pub struct V2Config {
     /// and must clear a fresh gate. Expected +23.5% volume, ~+26% $/day. Default ON.
     #[serde(default = "d_true")]
     pub reentry_enabled: bool,
+    /// Independent per-side re-entry toggles (Handoff #4 Decision 3 kill-rule).
+    /// `reentry_enabled` is the master; these gate the two sides separately so the
+    /// pre-registered rule "if same-side cumulative net < -$15 at n=100, disable
+    /// SAME-side only" is a config flip, not a redeploy. Same-side is the weaker
+    /// leg (live −0.356/$1 at n=17 vs recorder +0.132 at n=380 — watch, don't
+    /// panic); opposite is the validated winner (+0.144/$1). Both default ON.
+    #[serde(default = "d_true")]
+    pub reentry_same_enabled: bool,
+    #[serde(default = "d_true")]
+    pub reentry_opposite_enabled: bool,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -358,6 +368,8 @@ impl Default for V2Config {
             stop_bid_lo: d_stop_bid_lo(),
             book_unmoved_gate: true,
             reentry_enabled: true,
+            reentry_same_enabled: true,
+            reentry_opposite_enabled: true,
             i15m: Interval15mCfg::default(),
         }
     }

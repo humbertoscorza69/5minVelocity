@@ -250,11 +250,21 @@ fn compute_stats(
     let mut terminated: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rolled_tok: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // STOP PROBATION GAUGE (Decision 2): collected LIFETIME (not session-scoped)
+    // because the rolling window is the trailing 500 fired stops, which spans
+    // restarts. Each stop_dev row carries the counterfactual dEV vs holding.
+    let mut stop_devs: Vec<(f64, bool)> = Vec::new();
     if let Ok(text) = std::fs::read_to_string(oplog_path) {
         for line in text.lines() {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+            if kind == "stop_dev" {
+                if let Some(d) = v.get("data").and_then(|d| d.get("dev")).and_then(num) {
+                    let won = v.get("data").and_then(|d| d.get("won")).and_then(Value::as_bool).unwrap_or(false);
+                    stop_devs.push((d, won));
+                }
+            }
             if ts < started_ms { continue; } // session-scope
             let sid = || v.get("data").and_then(|d| d.get("signal_id")).and_then(Value::as_str);
             match kind {
@@ -440,8 +450,29 @@ fn compute_stats(
         .iter()
         .filter(|(tok, ts)| now - **ts > HOLE_GRACE_MS && !terminated.contains(*tok) && !rolled_tok.contains(*tok))
         .count();
+    // STOP PROBATION GAUGE (Decision 2): rolling net dEV per fired stop over the
+    // trailing 500 (spans restarts). Saved = won==false (banked the bid on a loser);
+    // whipsawed = won==true (forfeited 1-bid on a winner). Sustained negative =>
+    // the stop is bleeding vs hold => WARN so the operator disarms it.
+    let tail500: &[(f64, bool)] = if stop_devs.len() > 500 {
+        &stop_devs[stop_devs.len() - 500..]
+    } else {
+        &stop_devs[..]
+    };
+    let stop_n = tail500.len();
+    let stop_saved = tail500.iter().filter(|(_, won)| !won).count();
+    let stop_whipsawed = stop_n - stop_saved;
+    let stop_dev_per = if stop_n > 0 {
+        tail500.iter().map(|(d, _)| *d).sum::<f64>() / stop_n as f64
+    } else { 0.0 };
     let mut alerts: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
+    if stop_n >= 100 && stop_dev_per < 0.0 {
+        warns.push(format!(
+            "stop probation: net dEV {:+.3}/stop over last {stop_n} ({stop_saved} saved / {stop_whipsawed} whipsawed) — stop bleeding vs hold, consider disarm",
+            stop_dev_per
+        ));
+    }
     if accounting_hole > 0 {
         alerts.push(format!("{accounting_hole} settled position(s) NEVER booked — P&L accounting hole (loss/win vanished from the books)"));
     }
@@ -462,6 +493,8 @@ fn compute_stats(
         "det_errors": det_errors, "fok_kills": fok_kills, "rolled_back": rolled_back,
         "reconnects": reconnects, "reconnects_per_hr": recon_per_hr,
         "accounting_hole": accounting_hole,
+        "stop_dev_per": stop_dev_per, "stop_n": stop_n,
+        "stop_saved": stop_saved, "stop_whipsawed": stop_whipsawed,
     });
 
     json!({
@@ -690,7 +723,10 @@ function renderHealth(h){
   const hb=$("healthbar");if(!h){return}
   hb.className="healthbar "+h.status;
   if(h.status==="ok"){
-    hb.textContent="● HEALTHY — fills "+(h.fill_rate*100).toFixed(0)+"% (last "+h.window_n+") · "+(h.fill_rate_cumulative*100).toFixed(0)+"% overall · "+h.reconnects+" reconnects · "+h.fok_kills+" FOK kills · 0 order bugs";
+    // Stop probation gauge (Decision 2): net dEV/stop over the trailing 500 — the
+    // "is the stop still earning" number. Shown when any fired stops exist.
+    const stopg=(h.stop_n>0)?" · stop dEV "+(h.stop_dev_per>=0?"+":"")+(h.stop_dev_per).toFixed(3)+"/"+h.stop_n+" ("+h.stop_saved+"s/"+h.stop_whipsawed+"w)":"";
+    hb.textContent="● HEALTHY — fills "+(h.fill_rate*100).toFixed(0)+"% (last "+h.window_n+") · "+(h.fill_rate_cumulative*100).toFixed(0)+"% overall · "+h.reconnects+" reconnects · "+h.fok_kills+" FOK kills · 0 order bugs"+stopg;
     document.title="v2 bot — live";
   }else{
     const ic=h.status==="alert"?"⛔ ALERT":"▲ WARN";

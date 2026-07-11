@@ -179,7 +179,11 @@ pub struct SharedState {
     /// bias negative and inflates p_adj, loosening the gates exactly when they should
     /// tighten. We stash `(interval, asset, up, resolution_sec, pred)` at stop time and
     /// feed the recal the position's WINDOW outcome at resolution, regardless of exit.
-    pub v2_stop_recal: DashMap<String, (String, String, bool, i64, f64)>,
+    /// (interval, asset, up, resolution_sec, pred, shares, stop_bid). shares +
+    /// stop_bid added (Handoff #4 Decision 2) to compute the stop's net dEV vs
+    /// holding = shares*(stop_bid - resolved_price) at resolution → the probation
+    /// gauge (rolling net dEV per fired stop must stay > 0, else disarm the stop).
+    pub v2_stop_recal: DashMap<String, (String, String, bool, i64, f64, f64, f64)>,
     /// Tokens whose settlement was a PHOTO FINISH (|Binance close-open| < ~2bps).
     /// The Binance-derived win label flips ~20% of the time exactly here, so we do
     /// NOT feed these into the recalibrator from the Binance settlement path — we

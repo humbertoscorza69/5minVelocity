@@ -141,6 +141,12 @@ book_unmoved_gate = true
 # signal clearing the full gate stack. Validated: opposite +0.144/$1, same +0.132;
 # expected +23.5% volume, ~+26% $/day. Logs reentry/reentry_side/secs_since_stop.
 reentry_enabled = true
+# Independent per-side re-entry toggles (Handoff #4 Decision 3). Same-side is on
+# probation: pre-registered kill-rule = if same-side cumulative net < -$15 at n=100,
+# set reentry_same_enabled = false (no redeploy needed — dashboard-persisted controls
+# not required; a config flip + restart suffices). Opposite is the validated winner.
+reentry_same_enabled = true
+reentry_opposite_enabled = true
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50
