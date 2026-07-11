@@ -254,6 +254,10 @@ fn compute_stats(
     // because the rolling window is the trailing 500 fired stops, which spans
     // restarts. Each stop_dev row carries the counterfactual dEV vs holding.
     let mut stop_devs: Vec<(f64, bool)> = Vec::new();
+    // RE-ENTRY COHORT (Order #5 A5): short_token -> side, filled from v2_intent_open
+    // rows with reentry=true, then joined to realized P&L for the per-side n + net
+    // that back the same-side kill-rule (net < -$15 at n=100).
+    let mut reentry_side_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Ok(text) = std::fs::read_to_string(oplog_path) {
         for line in text.lines() {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
@@ -271,6 +275,14 @@ fn compute_stats(
                 "v2_intent_open" => {
                     entries += 1;
                     if let Some(s) = sid() { intent_sids.push(s.to_string()); }
+                    if v.get("data").and_then(|d| d.get("reentry")).and_then(Value::as_bool).unwrap_or(false) {
+                        if let (Some(t), Some(side)) = (
+                            v.get("data").and_then(|d| d.get("token_id")).and_then(Value::as_str),
+                            v.get("data").and_then(|d| d.get("reentry_side")).and_then(Value::as_str),
+                        ) {
+                            reentry_side_map.insert(short_tok(t), side.to_string());
+                        }
+                    }
                     // Telemetry self-check: asleep should populate on ~all intents.
                     if v.get("data").and_then(|d| d.get("asleep")).map(Value::is_null).unwrap_or(true) {
                         asleep_null += 1;
@@ -388,6 +400,15 @@ fn compute_stats(
     let curve = tail(curve, 600);
     let mut recent_trades = tail(recent_trades, 60);
     recent_trades.reverse(); // newest first for the table
+    // RE-ENTRY per-side n + net P&L (A5): join settled trades to the reentry map.
+    let (mut re_same_n, mut re_same_net, mut re_opp_n, mut re_opp_net) = (0u64, 0.0f64, 0u64, 0.0f64);
+    for (_ts, r, token, _side, _e, _x, _iv) in &rev {
+        match reentry_side_map.get(token).map(String::as_str) {
+            Some("same") => { re_same_n += 1; re_same_net += *r; }
+            Some("opposite") => { re_opp_n += 1; re_opp_net += *r; }
+            _ => {}
+        }
+    }
 
     // Global scalars (the "All" view + the top-line P&L cards).
     let closed = g.closed;
@@ -531,6 +552,10 @@ fn compute_stats(
             "gross_loss": gross_loss,
             "blocked": blocked,
             "stops_fired": stops_fired,
+        },
+        "reentry": {
+            "same_n": re_same_n, "same_net": re_same_net,
+            "opposite_n": re_opp_n, "opposite_net": re_opp_net,
         },
         "by_interval": by_interval,
         "recal": {
@@ -677,6 +702,7 @@ tbody tr:hover{background:var(--panel2)}
     <div class="card"><div class="lbl">Settled WR</div><div class="val mono" id="wr">—</div><div class="sub" id="wr_sub"></div></div>
     <div class="card"><div class="lbl">Trades</div><div class="val mono" id="trades">—</div><div class="sub" id="trades_sub"></div></div>
     <div class="card"><div class="lbl">Recal bias</div><div class="val mono" id="recal">—</div><div class="sub" id="recal_sub"></div></div>
+    <div class="card"><div class="lbl">Re-entry (opp / same)</div><div class="val mono" id="reentry">—</div><div class="sub" id="reentry_sub">n · net P&L per side</div></div>
   </div>
   <div class="panel"><h2>Cumulative realized P&L</h2><canvas id="chart"></canvas></div>
   <div class="panel"><h2>Open positions (<span id="open_n">0</span>)</h2>
@@ -800,6 +826,14 @@ function render(){
   $("trades_sub").textContent=(FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.entries+" intents · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed");
   $("recal").textContent=(rc.bias>=0?"+":"")+rc.bias.toFixed(3);
   $("recal_sub").textContent=rc.samples+" samples ("+(FILT==="15m"?"15m":"5m")+")";
+  // Re-entry per-side cohort (A5): opposite is the validated leg, same is on
+  // probation (kill-rule: same_net < -$15 at same_n=100 → reentry_same_enabled=false).
+  const re=s.reentry||{same_n:0,same_net:0,opposite_n:0,opposite_net:0};
+  const rel=$("reentry"); if(rel){
+    rel.textContent=money(re.opposite_net)+" / "+money(re.same_net);
+    rel.className="val mono "+((re.opposite_net+re.same_net)>=0?"pos":"neg");
+    $("reentry_sub").textContent="opp n="+re.opposite_n+" · same n="+re.same_n+(re.same_n>=100&&re.same_net<-15?" · KILL same":"");
+  }
   $("open_n").textContent=opens.length;
   $("open_body").innerHTML=opens.map(p=>`<tr><td class="mono">${p.token}</td><td>${p.side}</td><td class="muted">${p.asset}/${p.interval}</td><td class="mono">${p.entry.toFixed(3)}</td><td class="mono">$${(+p.usd).toFixed(2)}</td><td class="mono">${p.bid.toFixed(3)}</td><td class="mono">${p.shares.toFixed(1)}</td><td class="mono ${cls(p.unreal)}">${money(p.unreal)}</td><td class="muted mono">${fmtAge(p.age_s)}</td></tr>`).join("")||`<tr><td colspan=9 class=muted>none</td></tr>`;
   const trs=(FILT==="all")?s.recent_trades:s.recent_trades.filter(x=>x.iv===FILT);

@@ -27,7 +27,11 @@ disabled_cells = []
 # capped by max_position_usdc. STARTUP defaults only — the dashboard overrides both
 # live (per-interval). Set to the live $1 size so a restart never jumps to big stakes.
 base_usdc = 1.05
-max_position_usdc = 2.0
+# 3.15 = base * stake_mult_cap (3) — the burst/tick-age sizing tiers (Order #5 A) can
+# push a single stake to base*3, so max_position (the exposure guard + burst clamp)
+# MUST accommodate it or high-burst trades get throttled. The dashboard "max" input
+# overrides this live; set it to >= 3.15 there too (per-interval) for tiers to size.
+max_position_usdc = 3.15
 max_open_positions = 20
 paper_initial_usdc = 1000.0
 

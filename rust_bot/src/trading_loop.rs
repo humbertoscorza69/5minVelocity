@@ -457,16 +457,17 @@ pub fn process_kline_v2(
         {
             continue;
         }
-        // Depth-aware edge-proportional sizing. No live book-depth feed yet, so the
-        // cap is max_pos_usd; the FOK worst-price protects fill quality. (Wire real
-        // depth via the book channel later to also avoid wasted FOK-kills.)
+        // BASE stake — FLAT at base_usd (Order #5 Part A: burst/tick-age tiers are
+        // the sizing dial now, applied at the consumption site; they supersede
+        // edge-proportional scaling, so edge_stake is capped at base_usd = flat
+        // base). max_pos_usd is the exposure guard the multiplied stake caps to.
         let stake = crate::v2::edge_stake(
             f.edge,
             s.base_usd,
             s.edge_ref,
-            s.base_usd.min(1.05),
-            s.max_pos_usd,
-            s.max_pos_usd,
+            s.base_usd,
+            s.base_usd,
+            s.base_usd,
         );
         if stake <= 0.0 {
             continue;
@@ -903,8 +904,8 @@ pub async fn run_decision_task(
                         &mut history, &kline, &catalog, &book, &strats,
                         &positions, now, &disabled_cells,
                     );
-                    for (cmd, pred) in cmds {
-                        if let ExecCommand::Open { intent, ctx } = &cmd {
+                    for (mut cmd, pred) in cmds {
+                        if let ExecCommand::Open { intent, ctx } = &mut cmd {
                             // DEDUP: one entry per market, lag-proof. The store_state
                             // positions check inside process_kline_v2 can be stale
                             // (execution task lags), so we ALSO gate on a local set of
@@ -976,6 +977,48 @@ pub async fn run_decision_task(
                                 }));
                                 continue;
                             }
+                            // SIZING TIERS (Order #5 A1 burst + A2 tick-age), applied
+                            // BEFORE the guard so it caps the REAL (multiplied) stake and
+                            // the daily-loss stop accrues on effective P&L. burst_bps =
+                            // max side-aligned 1s/3s Binance return over entry-5s..entry.
+                            let burst_bps = {
+                                let sign = if ctx.side.eq_ignore_ascii_case("up") { 1.0 } else { -1.0 };
+                                let mut b = 0.0_f64;
+                                for k in 0..5i64 {
+                                    let t = kline.t_s - k;
+                                    if let (Some(c), Some(c1)) =
+                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 1))
+                                        && c1 > 0.0
+                                    {
+                                        b = b.max(sign * (c / c1 - 1.0) * 1e4);
+                                    }
+                                    if let (Some(c), Some(c3)) =
+                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 3))
+                                        && c3 > 0.0
+                                    {
+                                        b = b.max(sign * (c / c3 - 1.0) * 1e4);
+                                    }
+                                }
+                                b
+                            };
+                            let burst_mult = if burst_bps >= vcfg.burst_hi_bps {
+                                vcfg.burst_mult_hi
+                            } else if burst_bps >= vcfg.burst_lo_bps {
+                                vcfg.burst_mult_lo
+                            } else {
+                                1.0
+                            };
+                            let tickage_mult = if ctx.tick_age_s == 0 { vcfg.tickage_mult } else { 1.0 };
+                            let stake_mult = (burst_mult * tickage_mult).min(vcfg.stake_mult_cap);
+                            if stake_mult > 1.0 {
+                                // Clamp to the per-interval max_pos (must be >= base*cap =
+                                // $3.15 to not throttle; the guard also enforces it).
+                                let cap = strats.get(intent.interval.as_str())
+                                    .map(|s| s.max_pos_usd).unwrap_or(ctx.stake_usd);
+                                let sized = ((ctx.stake_usd * stake_mult).min(cap) * 100.0).floor() / 100.0;
+                                ctx.stake_usd = sized;
+                                if intent.fill_price > 0.0 { intent.shares = sized / intent.fill_price; }
+                            }
                             let verdict = {
                                 let g = guards.lock().expect("guards mutex poisoned");
                                 eval_guards(&g, &state, &positions, intent, now)
@@ -1002,29 +1045,6 @@ pub async fn run_decision_task(
                             // (drained on resolution, routed to the interval's recal).
                             state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred));
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
-                            // BURST (LOG-ONLY; Part 4 sizing dial NOT built): max
-                            // side-aligned 1s/3s Binance return (bps) over entry-5s..entry.
-                            // Cheap now, builds the live validation set for burst sizing.
-                            let burst_bps = {
-                                let sign = if ctx.side.eq_ignore_ascii_case("up") { 1.0 } else { -1.0 };
-                                let mut b = 0.0_f64;
-                                for k in 0..5i64 {
-                                    let t = kline.t_s - k;
-                                    if let (Some(c), Some(c1)) =
-                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 1))
-                                        && c1 > 0.0
-                                    {
-                                        b = b.max(sign * (c / c1 - 1.0) * 1e4);
-                                    }
-                                    if let (Some(c), Some(c3)) =
-                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 3))
-                                        && c3 > 0.0
-                                    {
-                                        b = b.max(sign * (c / c3 - 1.0) * 1e4);
-                                    }
-                                }
-                                b
-                            };
                             oplog.sys("v2_intent_open", serde_json::json!({
                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,
                                 "side": ctx.side, "stake_usd": ctx.stake_usd,
@@ -1035,7 +1055,11 @@ pub async fn run_decision_task(
                                 "asleep": asleep_obs.map(|a| a.0),
                                 "mid_move_3s": asleep_obs.map(|a| a.1),
                                 "asleep_age_ms": asleep_obs.map(|a| a.2),
+                                // A1+A2 SIZING: burst tier + final stake multiplier (tier
+                                // attribution must survive — A3). stake_usd above is the
+                                // already-multiplied stake.
                                 "burst_bps": burst_bps,
+                                "stake_mult": stake_mult,
                                 // FEATURE A: re-entry telemetry (FCFS; both-sides-qualified
                                 // is reconstructable from reentry_side across the market's
                                 // intents + v2_reentry_capped events).

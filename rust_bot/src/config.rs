@@ -148,6 +148,26 @@ pub struct V2Config {
     pub reentry_same_enabled: bool,
     #[serde(default = "d_true")]
     pub reentry_opposite_enabled: bool,
+    /// SIZING TIERS (Order #5 Part A). Burst = max side-aligned 1s/3s Binance
+    /// return (bps) over entry-5s..entry (already logged as burst_bps). stake =
+    /// base × burst_mult, where burst_bps < lo → ×1, [lo,hi) → mult_lo, ≥ hi →
+    /// mult_hi. Pre-registered +26% $/day, EV/std +16%, no drawdown increase;
+    /// paper-confirmed above model twice. A2: tick_age_s == 0 stacks ×tickage_mult
+    /// multiplicatively. Total capped at stake_mult_cap (× base). All in config so
+    /// the ladder can retune without a redeploy. Defaults 3/8 bps, ×2/×3, ×1.25,
+    /// cap ×3 → stakes $1.05 / $2.10 / $2.63 / $3.15 at base $1.05.
+    #[serde(default = "d_burst_lo")]
+    pub burst_lo_bps: f64,
+    #[serde(default = "d_burst_hi")]
+    pub burst_hi_bps: f64,
+    #[serde(default = "d_burst_mult_lo")]
+    pub burst_mult_lo: f64,
+    #[serde(default = "d_burst_mult_hi")]
+    pub burst_mult_hi: f64,
+    #[serde(default = "d_tickage_mult")]
+    pub tickage_mult: f64,
+    #[serde(default = "d_stake_mult_cap")]
+    pub stake_mult_cap: f64,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -204,6 +224,12 @@ pub struct V2Config {
 
 fn d_stop_bid_hi() -> f64 { 0.50 }
 fn d_stop_bid_lo() -> f64 { 0.30 }
+fn d_burst_lo() -> f64 { 3.0 }
+fn d_burst_hi() -> f64 { 8.0 }
+fn d_burst_mult_lo() -> f64 { 2.0 }
+fn d_burst_mult_hi() -> f64 { 3.0 }
+fn d_tickage_mult() -> f64 { 1.25 }
+fn d_stake_mult_cap() -> f64 { 3.0 }
 fn d_edge_min() -> f64 { 0.04 }
 fn d_vol_cap() -> f64 { 1.0 }
 fn d_dvr_floor() -> f64 { 0.2 }
@@ -370,6 +396,12 @@ impl Default for V2Config {
             reentry_enabled: true,
             reentry_same_enabled: true,
             reentry_opposite_enabled: true,
+            burst_lo_bps: d_burst_lo(),
+            burst_hi_bps: d_burst_hi(),
+            burst_mult_lo: d_burst_mult_lo(),
+            burst_mult_hi: d_burst_mult_hi(),
+            tickage_mult: d_tickage_mult(),
+            stake_mult_cap: d_stake_mult_cap(),
             i15m: Interval15mCfg::default(),
         }
     }
