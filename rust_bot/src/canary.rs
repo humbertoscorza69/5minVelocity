@@ -247,6 +247,13 @@ impl Canary {
                 let pw = a.prob_w as f64 / a.prob_n.max(1) as f64;
                 a.prob_n = 0;
                 a.prob_w = 0;
+                // AUDIT fix #2: the rolling window still holds the pre-RED losses that
+                // caused the halt — they describe the OLD regime. Without clearing,
+                // a promoted GREEN is revoked by the very next settle (window still
+                // < wr_red) → RED↔GREEN flapping for hours on a recovered tape. The
+                // probation settles are the evidence about the NEW regime; start the
+                // window fresh from here.
+                a.hold.clear();
                 if pw >= prob_wr {
                     CanaryState::Green
                 } else {
@@ -409,6 +416,26 @@ mod tests {
             c.record_hold("BTC", i < 6, base + i as i64);
         }
         assert_eq!(c.state("BTC"), CanaryState::Green);
+    }
+
+    #[test]
+    fn promotion_to_green_is_not_instantly_revoked() {
+        // AUDIT #2 regression: a GREEN promotion must survive the next settles — the
+        // pre-RED losses that caused the halt must not flap it straight back to RED.
+        let mut c = Canary::new(cfg());
+        feed(&mut c, "BTC", 12, 30, 0); // RED
+        c.tick("BTC", 61 * 60 * 1000); // → AMBER probation
+        let base = 62 * 60 * 1000;
+        for i in 0..10 {
+            c.record_hold("BTC", i < 6, base + i as i64); // 60% → promote GREEN (window cleared)
+        }
+        assert_eq!(c.state("BTC"), CanaryState::Green);
+        // Five more mixed settles: still GREEN (stale pre-RED window is gone).
+        let b2 = base + 1000;
+        for i in 0..5 {
+            c.record_hold("BTC", i < 3, b2 + i as i64);
+        }
+        assert_eq!(c.state("BTC"), CanaryState::Green, "must not flap back to RED on a cleared window");
     }
 
     #[test]

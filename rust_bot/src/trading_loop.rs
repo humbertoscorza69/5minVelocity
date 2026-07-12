@@ -656,6 +656,11 @@ pub async fn run_decision_task(
     // updates after the (possibly slow) execution task records the order, so we
     // cannot rely on it to prevent same-market re-entry within the lag window.
     let mut v2_entered: HashSet<String> = HashSet::new();
+    // AUDIT fix #3: first-touch set for canary shadow intents — process_kline_v2
+    // re-emits a qualifying market every kline, so without this a halted market
+    // floods thousands of canary_shadow_intent rows/hour and wrecks the auditor's
+    // one-per-market saved-vs-cost accounting. Log only the first block per token.
+    let mut canary_shadowed: HashSet<String> = HashSet::new();
     // Throttle the settlement-booking sweep to once per wall-second.
     let mut last_settle_sweep_s: i64 = 0;
     loop {
@@ -713,17 +718,22 @@ pub async fn run_decision_task(
                 let now_s = now / 1000;
                 if vcfg.enabled && now_s > last_settle_sweep_s {
                     last_settle_sweep_s = now_s;
-                    // CANARY Arm 2 + time-tick (Order #7 C): refresh this asset's vol
-                    // acceleration and expire any RED cooldown / vol latch, once per
-                    // wall-second. Cheap; emits only on a state change.
+                    // CANARY Arm 2 + time-tick (Order #7 C): refresh vol acceleration
+                    // and expire any RED cooldown / vol latch, once per wall-second.
+                    // AUDIT fix #1: iterate BOTH assets — this block runs only for the
+                    // kline that won the once-per-second latch, and in RED (no open
+                    // positions → no settles) tick() is the ONLY thing that expires the
+                    // cooldown, so a starved asset would halt and never resume.
                     if let Ok(mut cy) = state.canary.lock() {
-                        if let Some((v10, v60)) = canary_vol(&history, &kline.asset, now_s) {
-                            if let Some(tr) = cy.update_vol(&kline.asset, v10, v60, now) {
+                        for a in ["BTC", "ETH"] {
+                            if let Some((v10, v60)) = canary_vol(&history, a, now_s) {
+                                if let Some(tr) = cy.update_vol(a, v10, v60, now) {
+                                    emit_canary_transition(&oplog, &tr);
+                                }
+                            }
+                            if let Some(tr) = cy.tick(a, now) {
                                 emit_canary_transition(&oplog, &tr);
                             }
-                        }
-                        if let Some(tr) = cy.tick(&kline.asset, now) {
-                            emit_canary_transition(&oplog, &tr);
                         }
                     }
                     let snap: Vec<OpenPosition> = store_state
@@ -992,13 +1002,17 @@ pub async fn run_decision_task(
                                 .map(|c| c.state(&ctx.asset))
                                 .unwrap_or(crate::canary::CanaryState::Green);
                             if canary_state.halted() {
-                                oplog.sys("canary_shadow_intent", serde_json::json!({
-                                    "token_id": intent.token_id, "signal_id": ctx.signal_id,
-                                    "asset": ctx.asset, "interval": intent.interval, "side": ctx.side,
-                                    "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
-                                    "disp_bps": ctx.binance_ret_bps, "tick_age_s": ctx.tick_age_s,
-                                    "stake_usd": ctx.stake_usd,
-                                }));
+                                // First-touch only (AUDIT #3): one shadow row per market.
+                                if canary_shadowed.len() > 50_000 { canary_shadowed.clear(); }
+                                if canary_shadowed.insert(intent.token_id.clone()) {
+                                    oplog.sys("canary_shadow_intent", serde_json::json!({
+                                        "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                        "asset": ctx.asset, "interval": intent.interval, "side": ctx.side,
+                                        "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
+                                        "disp_bps": ctx.binance_ret_bps, "tick_age_s": ctx.tick_age_s,
+                                        "stake_usd": ctx.stake_usd,
+                                    }));
+                                }
                                 continue;
                             }
                             let canary_derisk = canary_state.derisked(); // AMBER
