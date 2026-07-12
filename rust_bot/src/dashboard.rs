@@ -231,6 +231,7 @@ fn compute_stats(
     let (mut rolled_back, mut det_errors, mut fok_kills) = (0u64, 0u64, 0u64);
     let mut asleep_null = 0u64; // intents where the asleep telemetry logged null (regression)
     let mut stops_fired = 0u64; // invalidation stops that actually SOLD (action=sell)
+    let mut fill_anomalies = 0u64; // Order #8 C: buys that filled >5c better than quote
     // Trailing-window fill rate: each intent's signal_id in order + the set that
     // rolled back, so the alarm fires on a FRESH rejection storm within ~N intents
     // regardless of how long the session has been healthy (cumulative would dilute
@@ -304,6 +305,7 @@ fn compute_stats(
                         stops_fired += 1;
                     }
                 }
+                "live_fill_anomaly" => fill_anomalies += 1,
                 "live_open_rolled_back" => {
                     rolled_back += 1;
                     if let Some(s) = sid() { rolled_sids.insert(s.to_string()); }
@@ -342,12 +344,23 @@ fn compute_stats(
         }
     }
     // LIVE resolutions: PnlRecorder "recorded" rows carry net_pnl + resolved_price.
+    // Order #8 B: "corrected" rows carry a DELTA (net_pnl) that heals a lied-about
+    // booking — add it to realized (+ a curve point) but NOT to the trade stats
+    // (it's a P&L adjustment, not a trade), and count it for the banner ALERT.
+    let mut correction_total = 0.0_f64;
+    let mut corrections_n = 0u64;
     if let Ok(text) = std::fs::read_to_string(crate::pnl_recorder::DEFAULT_PNL_RECORDED_LOG) {
         for line in text.lines() {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
-            if v.get("kind").and_then(Value::as_str) != Some("recorded") { continue; }
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
             if ts < started_ms { continue; }
+            if kind == "corrected" {
+                correction_total += v.get("net_pnl").and_then(num).unwrap_or(0.0);
+                corrections_n += 1;
+                continue;
+            }
+            if kind != "recorded" { continue; }
             let np = v.get("net_pnl").and_then(num).unwrap_or(0.0);
             let rp = v.get("resolved_price").and_then(num);
             let side = match rp { Some(x) if x >= 0.5 => "win", Some(_) => "lose", None => "" };
@@ -415,7 +428,7 @@ fn compute_stats(
     let wins = g.wins;
     let gross_win = g.gross_win;
     let gross_loss = g.gross_loss;
-    let realized_total = g.realized;
+    let realized_total = g.realized + correction_total; // Order #8 B: heal corrections
     let win_rate = if closed > 0 { wins as f64 / closed as f64 } else { 0.0 };
     let profit_factor: Value = pf_value(gross_win, gross_loss);
     let m5 = per.get("5m").copied().unwrap_or_default();
@@ -492,10 +505,19 @@ fn compute_stats(
     let canary_state = canary_snap.get("state").and_then(Value::as_str).unwrap_or("green");
     let mut alerts: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
+    if corrections_n > 0 {
+        alerts.push(format!(
+            "{corrections_n} P&L correction(s) this session ({:+.2} net) — a booking path disagreed with the redeem payout",
+            correction_total
+        ));
+    }
     if canary_state == "red" {
         alerts.push("canary RED — entries HALTED (chop regime)".into());
     } else if canary_state == "amber" {
         warns.push("canary AMBER — de-risked (multipliers off, re-entries suspended)".into());
+    }
+    if fill_anomalies > 0 {
+        warns.push(format!("{fill_anomalies} favorable-fill anomaly(ies) — buy filled >5c better than quote (stale-mirror tell)"));
     }
     if stop_n >= 100 && stop_dev_per < 0.0 {
         warns.push(format!(

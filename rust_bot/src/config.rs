@@ -183,6 +183,12 @@ pub struct V2Config {
     /// (n=30, AMBER<0.50, RED<0.45, vol ratio 2.0/floor 2.0bpm, 60m cooldown).
     #[serde(default = "d_true")]
     pub canary_enabled: bool,
+    /// Order #8 D entry floors (5m), both 0.0 = OFF. See v2::floor_reject. Guard the
+    /// dead-tape z-explosion; sized on recorder data + flipped via config later.
+    #[serde(default)]
+    pub disp_floor_bps: f64,
+    #[serde(default)]
+    pub vol60_floor: f64,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -367,6 +373,8 @@ impl V2Config {
             max_pos_usd: 0.0,
             vol_lookback_s: self.vol_lookback_s,
             frozen_tape_secs: self.frozen_tape_secs, // 5m: validated
+            disp_floor_bps: self.disp_floor_bps,
+            vol60_floor: self.vol60_floor,
         }
     }
 }
@@ -393,6 +401,8 @@ impl Interval15mCfg {
             max_pos_usd: 0.0,
             vol_lookback_s: self.vol_lookback_s,
             frozen_tape_secs: 0, // 15m: not significant in validation → off
+            disp_floor_bps: 0.0, // 15m: floors are 5m-scoped (Order #8 D)
+            vol60_floor: 0.0,
         }
     }
 }
@@ -432,6 +442,8 @@ impl Default for V2Config {
             cal_z: d_cal_z(),
             cal_w: d_cal_w(),
             canary_enabled: true,
+            disp_floor_bps: 0.0,
+            vol60_floor: 0.0,
             i15m: Interval15mCfg::default(),
         }
     }

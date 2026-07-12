@@ -34,6 +34,34 @@ use crate::oplog::OpLog;
 use crate::rest::RestClient;
 use crate::trading_loop::DecisionCtx;
 
+/// Order #8 C: a BUY that filled more than $0.05 BETTER than the quoted ask — the
+/// real book repriced against our side (stale-mirror / adverse-selection tell).
+#[must_use]
+pub fn favorable_fill_anomaly(
+    quote: polymarket_client_sdk_v2::types::Decimal,
+    fill: polymarket_client_sdk_v2::types::Decimal,
+) -> bool {
+    quote - fill > polymarket_client_sdk_v2::types::Decimal::new(5, 2)
+}
+
+#[cfg(test)]
+mod order8_tests {
+    use super::favorable_fill_anomaly;
+    use polymarket_client_sdk_v2::types::Decimal;
+
+    #[test]
+    fn favorable_fill_anomaly_threshold() {
+        // The phantom: quote 0.32, fill 0.0746 → 0.2454 improvement → anomaly.
+        assert!(favorable_fill_anomaly(Decimal::new(32, 2), Decimal::new(746, 4)));
+        // 2c improvement (0.32 → 0.30) is normal book movement → silent.
+        assert!(!favorable_fill_anomaly(Decimal::new(32, 2), Decimal::new(30, 2)));
+        // exactly 5c is not > 5c → silent.
+        assert!(!favorable_fill_anomaly(Decimal::new(35, 2), Decimal::new(30, 2)));
+        // an ADVERSE fill (paid worse) is never an anomaly here.
+        assert!(!favorable_fill_anomaly(Decimal::new(30, 2), Decimal::new(35, 2)));
+    }
+}
+
 /// The LIVE-mode execution backend. Carries everything the execution + exit
 /// tasks need to POST a real order, plus the three safety gates.
 ///
@@ -281,6 +309,24 @@ pub async fn live_open(
             if adverse_beyond_max {
                 warn!(quote = %quote_dec, real = ?real_price, worst = %worst,
                     "live_open: real slippage exceeded max_slippage threshold (FOK should have killed this -- audit needed)");
+            }
+            // ORDER #8 C: FAVORABLE-FILL anomaly. A buy that filled > $0.05 BETTER
+            // than the quote means the real book repriced against our side (the
+            // stale-mirror tell — the phantom filled 25c better against a book that
+            // knew we were wrong). Instrument only: WARN + a log the auditor can
+            // cohort by token. Do NOT auto-exit (unvalidated; may still be correct).
+            if let Some(rp) = real_price {
+                let improvement = quote_dec - rp;
+                if favorable_fill_anomaly(quote_dec, rp) {
+                    oplog.sys("live_fill_anomaly", serde_json::json!({
+                        "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                        "quote": quote_dec.to_string(), "fill": rp.to_string(),
+                        "improvement": improvement.to_string(),
+                    }));
+                    warn!(token = %intent.token_id, quote = %quote_dec, fill = %rp,
+                        improvement = %improvement,
+                        "live_fill_anomaly: fill >5c better than quote (stale-mirror tell) — INSTRUMENT only");
+                }
             }
             info!(order_id = %resp.order_id, coid = %coid, token = %intent.token_id,
                 computed = intent.shares, real_shares = %real_shares, real_usdc = %real_usdc,

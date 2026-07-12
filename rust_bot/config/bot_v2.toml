@@ -171,6 +171,14 @@ reentry_opposite_enabled = true
 # RED (hold-WR<0.45) halts all entries for that asset until a 60m cooldown + a
 # clean probation. Per-asset, counterfactual-scored (stops included).
 canary_enabled = true
+# Order #8 D entry floors (5m), both 0.0 = OFF (default). Guard the dead-tape
+# z-explosion (tiny |disp| over a ~0 vol60 denom → huge z → false p on a nothing
+# move — the phantom's layer 3). The auditor sizes these on recorder data before
+# flipping them on; the burn-night |disp| averaged 1.5bps so a careless floor cuts
+# real volume. disp_floor_bps: reject if |disp_bps| below it. vol60_floor: reject
+# if vol60 below it (same units as vol_cap).
+disp_floor_bps = 0.0
+vol60_floor = 0.0
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50

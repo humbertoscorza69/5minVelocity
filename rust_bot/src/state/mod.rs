@@ -189,7 +189,8 @@ pub struct SharedState {
     /// NOT feed these into the recalibrator from the Binance settlement path — we
     /// leave them for the activity-feed TRUE payout to label. P&L still books
     /// normally (and self-corrects via activity). Prevents recal poisoning at ties.
-    pub v2_photofinish: DashMap<String, bool>,
+    /// Value = |fin−open| bps of the near-tie (Order #8 A: reported on the deferral).
+    pub v2_photofinish: DashMap<String, f64>,
     /// RE-ENTRY (Handoff #3 feature A): a market becomes eligible for ONE re-entry
     /// after a band-stop SELL. Keyed by "{asset}:{interval}:{epoch}" (stable per
     /// market, derivable at both stop time and decision time). Value =

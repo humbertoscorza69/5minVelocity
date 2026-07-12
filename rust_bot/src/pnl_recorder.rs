@@ -158,6 +158,19 @@ pub enum PnlRecord {
         #[serde(default = "d_interval_5m")]
         interval: String,
     },
+    /// Order #8 B: a booking path lied — a later REDEEM payout disagreed with the
+    /// already-recorded outcome. `net_pnl` is the DELTA (true − old) applied to the
+    /// dashboard realized sum + the daily-loss counter to heal both in place.
+    #[serde(rename = "corrected")]
+    Corrected {
+        token_id: String,
+        ts_ms: i64,
+        old_net: f64,
+        true_net: f64,
+        net_pnl: f64, // = true_net - old_net (the heal amount)
+        #[serde(default = "d_interval_5m")]
+        interval: String,
+    },
 }
 
 fn d_interval_5m() -> String {
@@ -169,6 +182,7 @@ impl PnlRecord {
         match self {
             PnlRecord::InitialSnapshot { token_id, .. } => token_id,
             PnlRecord::Recorded { token_id, .. } => token_id,
+            PnlRecord::Corrected { token_id, .. } => token_id,
         }
     }
 }
@@ -179,6 +193,10 @@ impl PnlRecord {
 pub struct PnlRecorder {
     path: PathBuf,
     done: HashSet<String>, // lowercased token_ids
+    /// Order #8 B: per-token booked outcome (shares, entry, resolved_price, net) so
+    /// a later disagreeing REDEEM can be detected + corrected. Session-scoped is
+    /// fine; rebuilt from the file on load.
+    outcomes: std::collections::HashMap<String, (f64, f64, f64, f64)>,
 }
 
 impl PnlRecorder {
@@ -186,6 +204,7 @@ impl PnlRecorder {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let mut done = HashSet::new();
+        let mut outcomes = std::collections::HashMap::new();
         if path.exists() {
             let body = std::fs::read_to_string(&path)
                 .with_context(|| format!("read pnl log: {}", path.display()))?;
@@ -198,9 +217,18 @@ impl PnlRecorder {
                     format!("parse line {} of {}: {line}", i + 1, path.display())
                 })?;
                 done.insert(rec.token_id().to_ascii_lowercase());
+                if let PnlRecord::Recorded { token_id, shares, entry_price, resolved_price, net_pnl, .. } = &rec {
+                    outcomes.insert(token_id.to_ascii_lowercase(), (*shares, *entry_price, *resolved_price, *net_pnl));
+                }
             }
         }
-        Ok(Self { path, done })
+        Ok(Self { path, done, outcomes })
+    }
+
+    /// Order #8 B: the recorded (shares, entry, resolved_price, net) for a token.
+    #[must_use]
+    pub fn recorded_outcome(&self, token_id: &str) -> Option<(f64, f64, f64, f64)> {
+        self.outcomes.get(&token_id.to_ascii_lowercase()).copied()
     }
 
     #[must_use]
@@ -222,8 +250,42 @@ impl PnlRecorder {
             .open(&self.path)
             .with_context(|| format!("open pnl log: {}", self.path.display()))?;
         writeln!(f, "{}", serde_json::to_string(&record)?)?;
-        self.done.insert(lower);
+        self.done.insert(lower.clone());
+        if let PnlRecord::Recorded { shares, entry_price, resolved_price, net_pnl, .. } = &record {
+            self.outcomes.insert(lower, (*shares, *entry_price, *resolved_price, *net_pnl));
+        }
         Ok(())
+    }
+
+    /// Order #8 B: persist a `Corrected` row (a redeem disagreed with the booked
+    /// outcome), update the retained outcome to the truth (so a repeat redeem does
+    /// NOT re-correct), and return the DELTA (true−old) for the caller to apply to
+    /// the daily counter. `None` if the token has no retained outcome.
+    pub fn record_correction(&mut self, token_id: &str, true_resolved: f64, true_net: f64, now_ms: i64) -> Result<Option<f64>> {
+        let lower = token_id.to_ascii_lowercase();
+        let Some((shares, entry, _old_resolved, old_net)) = self.outcomes.get(&lower).copied() else {
+            return Ok(None);
+        };
+        let delta = true_net - old_net;
+        let rec = PnlRecord::Corrected {
+            token_id: token_id.to_string(),
+            ts_ms: now_ms,
+            old_net,
+            true_net,
+            net_pnl: delta,
+            interval: d_interval_5m(),
+        };
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open pnl log: {}", self.path.display()))?;
+        writeln!(f, "{}", serde_json::to_string(&rec)?)?;
+        self.outcomes.insert(lower, (shares, entry, true_resolved, true_net));
+        Ok(Some(delta))
     }
 
     #[must_use]
@@ -591,9 +653,9 @@ pub fn record_from_activity(
         Ok(g) => g.positions.iter().map(|p| p.token_id.clone()).collect(),
         Err(_) => return booked,
     };
-    if bot_tokens.is_empty() {
-        return booked;
-    }
+    // NOTE: do NOT early-return when bot_tokens is empty — the Order #8 B correction
+    // pass must run for ALREADY-booked tokens (removed from bs) whose redeem now
+    // disagrees. The main booking loop is naturally a no-op when bs is empty.
 
     // token -> condition (from the bot's own BUY trade rows in the feed).
     let mut tok_cond: HashMap<String, String> = HashMap::new();
@@ -602,8 +664,11 @@ pub fn record_from_activity(
     for r in rows {
         match r.kind {
             ActivityKind::Trade => {
+                // ALL bot BUY rows (the wallet only trades via the bot) — not just
+                // tokens still in bs — so Order #8 B can check already-booked tokens
+                // (removed from bs) against a later disagreeing redeem.
                 if let Some(t) = &r.token_id {
-                    if bot_tokens.contains(t) && !r.condition_id.is_empty() {
+                    if !r.condition_id.is_empty() {
                         tok_cond.insert(t.clone(), r.condition_id.clone());
                     }
                 }
@@ -654,6 +719,41 @@ pub fn record_from_activity(
                     booked.push((token.clone(), false));
                 }
             }
+        }
+    }
+
+    // ORDER #8 B: CORRECTION PASS. A redeem that disagrees with an already-booked
+    // outcome means a booking path lied (the phantom: Binance-label win booked
+    // first, real $0 payout arrived 2 min later, idempotency made the lie stick).
+    // Heal the daily counter in the SAME tick + write a `corrected` row + alert.
+    for (token, cond) in &tok_cond {
+        if !recorder.already_recorded(token) {
+            continue;
+        }
+        let Some(payout) = cond_payout.get(cond) else { continue }; // no redeem yet
+        let truth_resolved = if *payout > 1e-9 { 1.0 } else { 0.0 };
+        let Some((shares, entry, recorded_resolved, recorded_net)) = recorder.recorded_outcome(token) else {
+            continue;
+        };
+        if (recorded_resolved - truth_resolved).abs() < 0.5 {
+            continue; // booked outcome agrees with the payout — nothing to correct
+        }
+        let true_net = compute_resolution_net_pnl(shares, entry, truth_resolved);
+        match recorder.record_correction(token, truth_resolved, true_net, now_ms_arg) {
+            Ok(Some(delta)) => {
+                if let Ok(mut g) = guards.lock() {
+                    g.record_net_pnl(Decimal::try_from(delta).unwrap_or_default(), now_ms_arg);
+                }
+                oplog.sys("pnl_corrected", serde_json::json!({
+                    "token_id": token, "old_net": recorded_net, "true_net": true_net,
+                    "delta": delta, "truth_resolved": truth_resolved,
+                    "recorded_resolved": recorded_resolved,
+                }));
+                warn!(token = %token, old_net = recorded_net, true_net, delta,
+                    "pnl CORRECTED — a booking path disagreed with the redeem payout");
+            }
+            Ok(None) => {}
+            Err(e) => warn!(token = %token, error = %e, "pnl correction persist failed"),
         }
     }
     booked
@@ -1179,5 +1279,69 @@ mod tests {
         g.lock().unwrap().reset_daily_pnl();
         assert_eq!(g.lock().unwrap().daily_net_pnl(), Decimal::ZERO,
             "reset must zero the counter without partial state");
+    }
+
+    // ---------- Order #8 ----------
+
+    fn buy_row(token: &str, cond: &str, usdc: f64) -> crate::rest::ActivityRow {
+        crate::rest::ActivityRow {
+            condition_id: cond.into(), token_id: Some(token.into()),
+            kind: crate::rest::ActivityKind::Trade, is_buy: true, usdc, ts: 1,
+        }
+    }
+    fn redeem_row(cond: &str, usdc: f64) -> crate::rest::ActivityRow {
+        crate::rest::ActivityRow {
+            condition_id: cond.into(), token_id: None,
+            kind: crate::rest::ActivityKind::Redeem, is_buy: false, usdc, ts: 2,
+        }
+    }
+
+    /// Order #8 A (testable slice): a photo-finish token is DEFERRED by the
+    /// settlement path (stays in bs), so the activity feed's real $0 payout books
+    /// it as a LOSS (truth), NOT the flipped Binance-label win.
+    #[test]
+    fn order8_a_activity_books_deferred_photofinish_as_loss() {
+        let bs = mk_bs(vec![bot_lot("tokpf", dec!(0.0746), dec!(15))]);
+        let guards = mk_guards();
+        let mut recorder = PnlRecorder::load(tmp_path("pfdefer")).unwrap();
+        let oplog = mk_oplog();
+        let rows = vec![buy_row("tokpf", "0xpf", 1.118), redeem_row("0xpf", 0.0)];
+        let booked = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
+        assert_eq!(booked, vec![("tokpf".to_string(), false)], "booked as LOSS from the $0 payout");
+        assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO, "counter reflects a loss, not +$13.88");
+    }
+
+    /// Order #8 B: a settlement booked as a WIN, then a real $0 redeem arrives →
+    /// a `corrected` row + the daily counter healed by the delta, and no
+    /// double-correction on a repeat redeem.
+    #[test]
+    fn order8_b_correction_on_payout_mismatch() {
+        let path = tmp_path("correct");
+        let _ = std::fs::remove_file(&path);
+        let bs = mk_bs(vec![bot_lot("tokw", dec!(0.40), dec!(2.625))]);
+        let guards = mk_guards();
+        let mut recorder = PnlRecorder::load(&path).unwrap();
+        let oplog = mk_oplog();
+        // Book the phantom WIN (record_settled removes it from bs, retains outcome).
+        assert!(record_settled("tokw", 1.0, "settlement", &bs, &guards, &mut recorder, &oplog, t0()));
+        let counter_after_win = guards.lock().unwrap().daily_net_pnl();
+        assert!(counter_after_win > Decimal::ZERO);
+
+        let rows = vec![buy_row("tokw", "0xcid", 1.05), redeem_row("0xcid", 0.0)];
+        let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"corrected\""), "a correction row must be written");
+        // Counter healed by delta = loss_net − win_net → ends near loss_net.
+        let win_net = compute_resolution_net_pnl(2.625, 0.40, 1.0);
+        let loss_net = compute_resolution_net_pnl(2.625, 0.40, 0.0);
+        let expected = counter_after_win + Decimal::try_from(loss_net - win_net).unwrap();
+        let healed = guards.lock().unwrap().daily_net_pnl();
+        assert!((healed - expected).abs() < dec!(0.001), "healed={healed} expected={expected}");
+        assert!(healed < Decimal::ZERO, "net now a loss after correction");
+        // Repeat redeem must NOT double-correct (outcome updated to truth).
+        let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
+        assert_eq!(healed, guards.lock().unwrap().daily_net_pnl(), "no double-correction");
+        let _ = std::fs::remove_file(&path);
     }
 }

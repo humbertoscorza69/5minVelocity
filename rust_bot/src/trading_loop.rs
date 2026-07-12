@@ -53,6 +53,10 @@ pub use crate::state::KlineClose;
 
 /// Execution-log path (one JSONL row per attempt; the autopsy source).
 const EXEC_LOG: &str = "data/live/execution_log.jsonl";
+/// Photo-finish band: |final−open| below this (bps) means the Binance settle label
+/// flips ~20% vs Chainlink. ONE definition, all consumers (recal skip, canary skip,
+/// Order #8 payout-truth deferral). Do not fork this constant.
+const PHOTO_FINISH_BPS: f64 = 2.0;
 
 /// Trade-log context captured at decision time, carried with the command so the
 /// execution task can stamp fill timestamps and emit the autopsy row.
@@ -484,6 +488,11 @@ pub fn process_kline_v2(
         ) else {
             continue;
         };
+        // ORDER #8 D entry floors (default 0.0 = OFF → byte-identical gate). Reject
+        // the dead-tape z-explosion (tiny disp over a ~0 vol60 denom) at the source.
+        if crate::v2::floor_reject(f.disp_bps, f.vol_bps, s.disp_floor_bps, s.vol60_floor).is_some() {
+            continue;
+        }
         // v2 gate uses edge_min/vol_cap/dvr_floor/z_min PER INTERVAL (5m base vs 15m
         // override). The z_min gate is the fix for firing on near-zero displacement
         // at the window open: require a REAL vol-normalized move before betting.
@@ -870,15 +879,19 @@ pub async fn run_decision_task(
                         };
                         let up = matches!(p.side, Outcome::Up);
                         let won = up == (fin >= op); // tie (fin==op) => Up wins
-                        // Photo-finish: |close-open| < ~2bps -> Binance label is
-                        // unreliable (flips ~20%). Flag so the recal feed skips it
-                        // (activity truth labels it instead). P&L still books.
-                        if op > 0.0 && (fin / op - 1.0).abs() * 1e4 < 2.0 {
-                            state.v2_photofinish.insert(p.token_id.clone(), true);
+                        // Photo-finish: |close-open| < PHOTO_FINISH_BPS -> the Binance
+                        // label is unreliable (flips ~20% vs Chainlink). Flag so the
+                        // recal AND the canary skip it, and Order #8 A defers the P&L
+                        // booking to the activity payout truth (was: booked the flip).
+                        let pf_disp = if op > 0.0 { (fin / op - 1.0).abs() * 1e4 } else { f64::INFINITY };
+                        let is_photofinish = pf_disp < PHOTO_FINISH_BPS;
+                        if is_photofinish {
+                            state.v2_photofinish.insert(p.token_id.clone(), pf_disp);
                         }
                         state.v2_settled.insert(p.token_id.clone(), won);
-                        // CANARY Arm 1 (Order #7 C): feed the 5m HOLD-to-settle outcome.
-                        if p.interval == "5m" {
+                        // CANARY Arm 1 (Order #7 C): feed the 5m HOLD-to-settle outcome —
+                        // but NOT a photo-finish label the recal is not allowed to eat.
+                        if p.interval == "5m" && !is_photofinish {
                             if let Ok(mut cy) = state.canary.lock() {
                                 if let Some(tr) = cy.record_hold(&p.asset, won, now) {
                                     emit_canary_transition(&oplog, &tr);
@@ -920,8 +933,11 @@ pub async fn run_decision_task(
                             "outcome": if won { "whipsawed" } else { "saved" },
                         }));
                         // CANARY Arm 1: a stopped 5m position's HOLD counterfactual is
-                        // part of the hold-WR window (realized WR is stop-distorted).
-                        if iv == "5m" {
+                        // part of the hold-WR window (realized WR is stop-distorted) —
+                        // but skip a photo-finish label (Order #8 A), same |fin−op| test
+                        // as the flag site (this path never set the flag).
+                        let pf = op > 0.0 && (fin / op - 1.0).abs() * 1e4 < PHOTO_FINISH_BPS;
+                        if iv == "5m" && !pf {
                             if let Ok(mut cy) = state.canary.lock() {
                                 if let Some(tr) = cy.record_hold(&asset, won, now) {
                                     emit_canary_transition(&oplog, &tr);
@@ -1481,8 +1497,9 @@ async fn settle_and_book(
             };
             let up = matches!(p.side, Outcome::Up);
             let won = up == (fin >= op); // tie => Up wins (same as the sweep)
-            if op > 0.0 && (fin / op - 1.0).abs() * 1e4 < 2.0 {
-                state.v2_photofinish.insert(p.token_id.clone(), true);
+            let pf_disp = if op > 0.0 { (fin / op - 1.0).abs() * 1e4 } else { f64::INFINITY };
+            if pf_disp < PHOTO_FINISH_BPS {
+                state.v2_photofinish.insert(p.token_id.clone(), pf_disp);
             }
             state.v2_settled.insert(p.token_id.clone(), won);
             oplog.sys("settlement_rest_fallback", serde_json::json!({
@@ -1504,6 +1521,20 @@ async fn settle_and_book(
             .collect();
         let mut booked = 0u32;
         for (token, won) in settled {
+            // ORDER #8 A: photo-finish tokens book from PAYOUT TRUTH (activity
+            // reconcile reads the real redeem), NOT the Binance kline label, which
+            // flips ~20% vs Chainlink at |disp| < PHOTO_FINISH_BPS. Skip the
+            // settlement write and REMOVE from the pipeline once — the recorder's
+            // idempotency then makes the truthful activity writer first. v2_pred is
+            // left intact (the recal already skips it here and the activity path
+            // feeds it the true outcome). Single event: removal stops the retry.
+            if let Some(disp) = state.v2_photofinish.get(&token).map(|v| *v) {
+                state.v2_settled.remove(&token);
+                oplog.sys("v2_photofinish_book_deferred", serde_json::json!({
+                    "token_id": token, "won_label": won, "disp_bps": disp,
+                }));
+                continue;
+            }
             let did = match recorder.lock() {
                 Ok(mut r) => crate::pnl_recorder::record_settled(
                     &token,

@@ -706,6 +706,26 @@ pub struct IntervalStrat {
     /// many seconds (stale displacement → no lag left to buy). `0` = gate off.
     /// Validated on 5m (−0.04/$1 for frozen entries); off for 15m (not significant).
     pub frozen_tape_secs: i64,
+    /// Order #8 D entry floors (0.0 = disabled). `disp_floor_bps`: reject if
+    /// |disp_bps| below it. `vol60_floor`: reject if vol60 below it (same units as
+    /// vol_cap). Both guard the z-explosion on dead tape (tiny disp / ~0 vol denom
+    /// → huge z → false p). Ship OFF; the auditor sizes them on recorder data.
+    pub disp_floor_bps: f64,
+    pub vol60_floor: f64,
+}
+
+/// Order #8 D: entry-floor rejection. `Some(reason)` if the candidate is below a
+/// configured floor; `None` (pass) when floors are 0.0 (disabled) — so the gate is
+/// byte-identical to today with defaults. Pure + testable.
+#[must_use]
+pub fn floor_reject(disp_bps: f64, vol_bps: f64, disp_floor_bps: f64, vol60_floor: f64) -> Option<&'static str> {
+    if disp_floor_bps > 0.0 && disp_bps.abs() < disp_floor_bps {
+        return Some("disp_floor");
+    }
+    if vol60_floor > 0.0 && vol_bps < vol60_floor {
+        return Some("vol60_floor");
+    }
+    None
 }
 
 /// Per-interval rolling recalibrators. 5m and 15m have different base win rates, so
@@ -833,6 +853,20 @@ mod tests {
         // displacement against us
         let mut nd = base; nd.disp_bps = -1.0;
         assert_eq!(gate(&nd), Gate::Skip("no_disp"));
+    }
+
+    /// Order #8 D: floors default 0.0 = OFF (pass); when set they reject with the
+    /// distinct reason. Byte-identical gate with defaults.
+    #[test]
+    fn floor_reject_defaults_off_and_reasons() {
+        // Defaults (0.0/0.0): never rejects, even on a dead-tape z-explosion input.
+        assert_eq!(floor_reject(0.1, 0.001, 0.0, 0.0), None);
+        // disp floor set: |disp| 0.1 < 1.0 → reject.
+        assert_eq!(floor_reject(0.1, 0.4, 1.0, 0.0), Some("disp_floor"));
+        assert_eq!(floor_reject(1.5, 0.4, 1.0, 0.0), None); // above the floor
+        // vol60 floor set: vol 0.05 < 0.2 → reject (disp fine).
+        assert_eq!(floor_reject(3.0, 0.05, 0.0, 0.2), Some("vol60_floor"));
+        assert_eq!(floor_reject(3.0, 0.4, 0.0, 0.2), None);
     }
 
     #[test]
