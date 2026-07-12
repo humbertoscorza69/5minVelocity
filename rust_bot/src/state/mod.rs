@@ -211,6 +211,11 @@ pub struct SharedState {
     /// in trading modes; `None` in tests and pure-baseline (→ no emission, zero
     /// behavior change). Passive observability only — never read by trading.
     pub oplog: OnceLock<Arc<crate::oplog::OpLog>>,
+    /// Order #7 Part C — the regime canary (per-asset GREEN/AMBER/RED). Fed by the
+    /// settlement path (hold-WR) + the kline stream (vol accel); read on every entry
+    /// to de-risk (AMBER) or halt (RED). Default config until main() overwrites it
+    /// with the operator's canary_enabled + thresholds.
+    pub canary: std::sync::Mutex<crate::canary::Canary>,
     pub started_at: Instant,
 }
 
@@ -237,6 +242,7 @@ impl SharedState {
             v2_photofinish: DashMap::new(),
             v2_reentry: DashMap::new(),
             v2_market_entries: DashMap::new(),
+            canary: std::sync::Mutex::new(crate::canary::Canary::new(crate::canary::CanaryConfig::default())),
             resolved_tokens: DashMap::new(),
             oplog: OnceLock::new(),
             started_at: Instant::now(),

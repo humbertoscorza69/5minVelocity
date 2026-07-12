@@ -179,8 +179,12 @@ pub struct Features {
     pub z: f64,
     pub dvr: f64,
     pub ask: f64,
-    /// (Recalibrated) win probability and resulting edge.
+    /// (Recalibrated) win probability and resulting edge. `p` is DEBIASED (used for
+    /// the gate, edge, sizing, logging). `p_raw` is the RAW curve output before the
+    /// recal de-bias — this is what MUST feed the recalibrator, or it records its own
+    /// already-corrected residual and chases the offset forever (Order #7 Part A).
     pub p: f64,
+    pub p_raw: f64,
     pub edge: f64,
 }
 
@@ -463,7 +467,8 @@ impl PriceHistory {
         let vel = self.vel_bps(asset, now_sec, 2, up).unwrap_or(0.0);
         let d = disp_bps(open, cur, up);
         let z = zscore(d, vol, ttl_s)?;
-        let p = (pcal_with(z, cal_z, cal_w) - recal_bias).clamp(0.0, 1.0);
+        let p_raw = pcal_with(z, cal_z, cal_w);
+        let p = (p_raw - recal_bias).clamp(0.0, 1.0);
         Some(Features {
             disp_bps: d,
             vel_bps: vel,
@@ -473,6 +478,7 @@ impl PriceHistory {
             dvr: dvr(d, vel),
             ask,
             p,
+            p_raw,
             edge: edge(p, ask),
         })
     }
@@ -812,7 +818,7 @@ mod tests {
     fn gate_rejects_high_vol_low_dvr_low_edge() {
         let base = Features {
             disp_bps: 5.0, vel_bps: 3.0, vol_bps: 0.4, ttl_s: 120.0,
-            z: 1.5, dvr: 1.6, ask: 0.60, p: 0.80, edge: 0.80 - 0.60 - fee(0.60),
+            z: 1.5, dvr: 1.6, ask: 0.60, p: 0.80, p_raw: 0.80, edge: 0.80 - 0.60 - fee(0.60),
         };
         assert_eq!(gate(&base), Gate::Take);
         // high vol
@@ -946,5 +952,32 @@ mod tests {
         // Cold start: window-open is BEFORE any history (earliest bar = 999) →
         // can't price the open → None (the correct skip).
         assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0, &CAL_Z, &CAL_W, 60).is_none());
+    }
+
+    /// Order #7 Part A: the recalibrator must be fed the RAW curve output (p_raw),
+    /// NOT the debiased p — else it records its own already-corrected residual and
+    /// chases the offset forever. features() exposes both: p_raw = pcal_with(z),
+    /// p (gate/edge/sizing/log) = (p_raw - bias).clamp. The single source of p_raw
+    /// is v2_pred, which BOTH recal feed paths (normal settle + stop counterfactual)
+    /// drain, so this one guarantee fixes both paths at the source.
+    #[test]
+    fn features_exposes_raw_pcal_for_recal_feed() {
+        let mut h = PriceHistory::new(1024);
+        let open = 100.0;
+        h.push("BTC", 999, open);
+        for t in 1000..=1080 {
+            let i = (t - 1000) as f64;
+            h.push("BTC", t, open + 0.01 * i + 0.02 * (i * 1.3).sin());
+        }
+        let bias = 0.10;
+        let f = h
+            .features("BTC", 1000, 1080, 120.0, true, 0.60, bias, &CAL_Z, &CAL_W, 60)
+            .expect("features computable");
+        assert!((f.p_raw - pcal_with(f.z, &CAL_Z, &CAL_W)).abs() < 1e-12,
+            "p_raw must equal the raw curve output — this is what the recal records");
+        assert!((f.p - (f.p_raw - bias).clamp(0.0, 1.0)).abs() < 1e-12,
+            "p (the gate/edge value) must be p_raw debiased");
+        assert!(f.p_raw > f.p, "positive bias => raw prediction exceeds the gated one");
+        assert!((f.edge - edge(f.p, f.ask)).abs() < 1e-12, "edge uses the DEBIASED p");
     }
 }

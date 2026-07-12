@@ -7,6 +7,7 @@
 
 mod backtest_tp;
 mod bbo_dump;
+mod canary;
 mod capa_b;
 mod config;
 mod dashboard;
@@ -794,6 +795,13 @@ async fn main() -> anyhow::Result<()> {
     // WS emits sub-second decision triggers (throttled) when enabled.
     state.tick_driven.store(config.v2.tick_driven, std::sync::atomic::Ordering::Relaxed);
     state.tick_throttle_ms.store(config.v2.tick_throttle_ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    // Order #7 C: configure the regime canary with the operator's kill switch
+    // (thresholds are the validated CanaryConfig defaults).
+    *state.canary.lock().expect("canary mutex") = canary::Canary::new(canary::CanaryConfig {
+        enabled: config.v2.canary_enabled,
+        ..canary::CanaryConfig::default()
+    });
+    info!(canary_enabled = config.v2.canary_enabled, "regime canary configured");
     if config.v2.tick_driven {
         info!(throttle_ms = config.v2.tick_throttle_ms,
             "v2 TICK-DRIVEN entry ENABLED — decisions fire on sub-second aggTrades");

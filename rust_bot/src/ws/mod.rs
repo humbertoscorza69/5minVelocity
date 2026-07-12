@@ -144,6 +144,10 @@ pub async fn run_with_reconnect<F, Fut>(
     // to hammering) and AUTO-CLEARS on the next stable session. Never stops the
     // loop — unlike the old human-in-loop latch.
     let mut cooling = false;
+    // Order #7 D.3: track the previous session's end so each reconnect can log the
+    // outage GAP (downtime ms), timestamped, to correlate reconnect clusters with
+    // regime breaks (last burn night: 118 reconnects, uncorrelatable without this).
+    let mut last_end: Option<Instant> = None;
 
     // Passive observability (#3): mirror the connection lifecycle into the oplog
     // the dashboard reads. `None` in tests / pure-baseline ⇒ a no-op. This NEVER
@@ -181,8 +185,15 @@ pub async fn run_with_reconnect<F, Fut>(
         skip_gate = false;
 
         let session_start = Instant::now();
+        // Timestamped per-reconnect record with the outage gap (D.3). Emitted on
+        // each reconnect ATTEMPT (reconnects>0); gap = downtime since last session.
+        if reconnects > 0 {
+            let gap_ms = last_end.map(|e| session_start.duration_since(e).as_millis() as u64).unwrap_or(0);
+            emit("ws_reconnect", json!({ "ws": name, "attempt": reconnects, "gap_ms": gap_ms }));
+        }
         let outcome = connect_and_run(reconnects).await;
         let uptime = session_start.elapsed();
+        last_end = Some(Instant::now());
 
         match outcome {
             SessionEnd::Shutdown => {

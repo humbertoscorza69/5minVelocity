@@ -486,8 +486,17 @@ fn compute_stats(
     let stop_dev_per = if stop_n > 0 {
         tail500.iter().map(|(d, _)| *d).sum::<f64>() / stop_n as f64
     } else { 0.0 };
+    // Regime canary (Order #7 C): RED = halting entries (ALERT), AMBER = de-risked
+    // (WARN). Per-asset detail is in the "canary" telemetry object below.
+    let canary_snap = state.canary.lock().map(|c| c.snapshot()).unwrap_or(Value::Null);
+    let canary_state = canary_snap.get("state").and_then(Value::as_str).unwrap_or("green");
     let mut alerts: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
+    if canary_state == "red" {
+        alerts.push("canary RED — entries HALTED (chop regime)".into());
+    } else if canary_state == "amber" {
+        warns.push("canary AMBER — de-risked (multipliers off, re-entries suspended)".into());
+    }
     if stop_n >= 100 && stop_dev_per < 0.0 {
         warns.push(format!(
             "stop probation: net dEV {:+.3}/stop over last {stop_n} ({stop_saved} saved / {stop_whipsawed} whipsawed) — stop bleeding vs hold, consider disarm",
@@ -516,6 +525,7 @@ fn compute_stats(
         "accounting_hole": accounting_hole,
         "stop_dev_per": stop_dev_per, "stop_n": stop_n,
         "stop_saved": stop_saved, "stop_whipsawed": stop_whipsawed,
+        "canary": canary_snap,
     });
 
     json!({

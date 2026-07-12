@@ -178,6 +178,11 @@ pub struct V2Config {
     pub cal_z: Vec<f64>,
     #[serde(default = "d_cal_w")]
     pub cal_w: Vec<f64>,
+    /// Regime canary (Order #7 Part C) kill switch. `false` = always GREEN (no
+    /// de-risk/halt). Thresholds are the validated defaults in CanaryConfig
+    /// (n=30, AMBER<0.50, RED<0.45, vol ratio 2.0/floor 2.0bpm, 60m cooldown).
+    #[serde(default = "d_true")]
+    pub canary_enabled: bool,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -426,6 +431,7 @@ impl Default for V2Config {
             stake_mult_cap: d_stake_mult_cap(),
             cal_z: d_cal_z(),
             cal_w: d_cal_w(),
+            canary_enabled: true,
             i15m: Interval15mCfg::default(),
         }
     }

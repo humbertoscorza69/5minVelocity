@@ -143,6 +143,42 @@ fn book_asleep(state: &SharedState, token: &str, now_ms: i64) -> Option<(bool, f
     Some((asleep, move_, age))
 }
 
+/// Canary Arm 2 (Order #7 C): trailing 10-min and 60-min mean |1-minute Binance
+/// return| in bps/min, from the 1s price ring. `None` until >= 10 one-minute
+/// returns are pricable (early warmup). rets[0] = most recent minute.
+fn canary_vol(history: &crate::v2::PriceHistory, asset: &str, now_s: i64) -> Option<(f64, f64)> {
+    let mut rets: Vec<f64> = Vec::with_capacity(60);
+    for i in 1..=60i64 {
+        if let (Some(c1), Some(c0)) = (
+            history.close_at(asset, now_s - (i - 1) * 60),
+            history.close_at(asset, now_s - i * 60),
+        ) {
+            if c0 > 0.0 {
+                rets.push((c1 / c0 - 1.0).abs() * 1e4);
+            }
+        }
+    }
+    if rets.len() < 10 {
+        return None;
+    }
+    let mean = |s: &[f64]| s.iter().sum::<f64>() / s.len().max(1) as f64;
+    Some((mean(&rets[..10]), mean(&rets)))
+}
+
+/// Emit a canary state-change to the oplog (dashboard + auditor).
+fn emit_canary_transition(oplog: &OpLog, tr: &crate::canary::Transition) {
+    use crate::canary::CanaryState;
+    let kind = match tr.to {
+        CanaryState::Red => "canary_red_halt",
+        CanaryState::Amber => "canary_amber",
+        CanaryState::Green => "canary_resume",
+    };
+    oplog.sys(kind, serde_json::json!({
+        "asset": tr.asset, "from": tr.from.as_str(), "to": tr.to.as_str(),
+        "wr30": tr.wr, "n30": tr.n, "vol_ratio": tr.vol_ratio, "reason": tr.reason,
+    }));
+}
+
 fn interval_secs(interval: &str) -> i64 {
     crate::signal::INTERVALS.iter().find(|(iv, _)| *iv == interval).map(|(_, s)| *s).unwrap_or(0)
 }
@@ -375,7 +411,9 @@ pub fn process_kline_v2(
     positions: &[OpenPosition],
     now_ms: i64,
     disabled: &[String],
-) -> Vec<(ExecCommand, f64)> {
+) -> Vec<(ExecCommand, f64, f64)> {
+    // Returns (cmd, p_gate, p_raw): p_gate (debiased) for log/attribution; p_raw
+    // (pre-debias) is stored in v2_pred and fed to the recalibrator (Order #7 A).
     history.push(&kline.asset, kline.t_s, kline.close);
     let mut out = Vec::new();
     for (interval, secs) in crate::signal::INTERVALS {
@@ -503,7 +541,7 @@ pub fn process_kline_v2(
             exit_ts_s,
             now_ms,
         };
-        out.push((ExecCommand::Open { intent, ctx }, f.p));
+        out.push((ExecCommand::Open { intent, ctx }, f.p, f.p_raw));
     }
     out
 }
@@ -610,7 +648,9 @@ pub async fn run_decision_task(
     let mut engine = SignalEngine::new();
     // v2 price-history ring (Binance 1s closes). 1024 covers a 15m window + the
     // 60s vol lookback + margin. Only consumed on the v2 path.
-    let mut history = crate::v2::PriceHistory::new(1024);
+    // 4096s (~68 min) so the canary's trailing-60-min vol window (Order #7 C, Arm 2)
+    // has coverage; the strategy itself only needs ~2 min.
+    let mut history = crate::v2::PriceHistory::new(4096);
     // v2 dedup: markets (token ids) this process has ALREADY fired an entry for.
     // Independent of execution lag — the store_state positions snapshot only
     // updates after the (possibly slow) execution task records the order, so we
@@ -673,6 +713,19 @@ pub async fn run_decision_task(
                 let now_s = now / 1000;
                 if vcfg.enabled && now_s > last_settle_sweep_s {
                     last_settle_sweep_s = now_s;
+                    // CANARY Arm 2 + time-tick (Order #7 C): refresh this asset's vol
+                    // acceleration and expire any RED cooldown / vol latch, once per
+                    // wall-second. Cheap; emits only on a state change.
+                    if let Ok(mut cy) = state.canary.lock() {
+                        if let Some((v10, v60)) = canary_vol(&history, &kline.asset, now_s) {
+                            if let Some(tr) = cy.update_vol(&kline.asset, v10, v60, now) {
+                                emit_canary_transition(&oplog, &tr);
+                            }
+                        }
+                        if let Some(tr) = cy.tick(&kline.asset, now) {
+                            emit_canary_transition(&oplog, &tr);
+                        }
+                    }
                     let snap: Vec<OpenPosition> = store_state
                         .lock()
                         .map(|bs| bs.positions.clone())
@@ -814,6 +867,14 @@ pub async fn run_decision_task(
                             state.v2_photofinish.insert(p.token_id.clone(), true);
                         }
                         state.v2_settled.insert(p.token_id.clone(), won);
+                        // CANARY Arm 1 (Order #7 C): feed the 5m HOLD-to-settle outcome.
+                        if p.interval == "5m" {
+                            if let Ok(mut cy) = state.canary.lock() {
+                                if let Some(tr) = cy.record_hold(&p.asset, won, now) {
+                                    emit_canary_transition(&oplog, &tr);
+                                }
+                            }
+                        }
                     }
                     // BUG #3: feed recal the counterfactual outcome of STOPPED-and-SOLD
                     // positions — they left bs before resolution, so the loop above
@@ -848,6 +909,15 @@ pub async fn run_decision_task(
                             "stop_bid": stop_bid, "shares": shares, "dev": dev,
                             "outcome": if won { "whipsawed" } else { "saved" },
                         }));
+                        // CANARY Arm 1: a stopped 5m position's HOLD counterfactual is
+                        // part of the hold-WR window (realized WR is stop-distorted).
+                        if iv == "5m" {
+                            if let Ok(mut cy) = state.canary.lock() {
+                                if let Some(tr) = cy.record_hold(&asset, won, now) {
+                                    emit_canary_transition(&oplog, &tr);
+                                }
+                            }
+                        }
                         state.v2_stop_recal.remove(&token);
                         state.v2_pred.remove(&token); // consumed by the counterfactual feed
                         cf_fed += 1;
@@ -904,7 +974,7 @@ pub async fn run_decision_task(
                         &mut history, &kline, &catalog, &book, &strats,
                         &positions, now, &disabled_cells,
                     );
-                    for (mut cmd, pred) in cmds {
+                    for (mut cmd, pred, pred_raw) in cmds {
                         if let ExecCommand::Open { intent, ctx } = &mut cmd {
                             // DEDUP: one entry per market, lag-proof. The store_state
                             // positions check inside process_kline_v2 can be stale
@@ -914,6 +984,24 @@ pub async fn run_decision_task(
                             if v2_entered.contains(&intent.token_id) {
                                 continue;
                             }
+                            // CANARY (Order #7 C): read this asset's regime. RED halts
+                            // ALL entries (5m+15m) — log the blocked signal as a shadow
+                            // intent so the halt's saved/cost is measurable. AMBER (de-
+                            // risk) caps stake_mult to 1.0 and suspends re-entries.
+                            let canary_state = state.canary.lock()
+                                .map(|c| c.state(&ctx.asset))
+                                .unwrap_or(crate::canary::CanaryState::Green);
+                            if canary_state.halted() {
+                                oplog.sys("canary_shadow_intent", serde_json::json!({
+                                    "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                    "asset": ctx.asset, "interval": intent.interval, "side": ctx.side,
+                                    "z": ctx.z, "ttl_s": ctx.ttl_s, "ask": ctx.ask_at_signal,
+                                    "disp_bps": ctx.binance_ret_bps, "tick_age_s": ctx.tick_age_s,
+                                    "stake_usd": ctx.stake_usd,
+                                }));
+                                continue;
+                            }
+                            let canary_derisk = canary_state.derisked(); // AMBER
                             // RE-ENTRY / MAX-ENTRIES gate (feature A). Per-market entry
                             // count caps at 2 (original + one re-entry). A 2nd entry is
                             // allowed ONLY as a re-entry after a band-stop (v2_reentry has
@@ -955,6 +1043,14 @@ pub async fn run_decision_task(
                                     }
                                     _ => continue, // 2nd entry only via a post-band-stop re-entry
                                 }
+                            }
+                            // CANARY AMBER: suspend re-entries (both sides) during chop.
+                            if is_reentry && canary_derisk {
+                                oplog.sys("canary_reentry_suppressed", serde_json::json!({
+                                    "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                    "side": reentry_side, "asset": ctx.asset,
+                                }));
+                                continue;
                             }
                             // BOOK-UNMOVED GATE (the PM-book side of the lag detector):
                             // skip the entry if the book's mid has ALREADY moved in the
@@ -1009,7 +1105,13 @@ pub async fn run_decision_task(
                                 1.0
                             };
                             let tickage_mult = if ctx.tick_age_s == 0 { vcfg.tickage_mult } else { 1.0 };
-                            let stake_mult = (burst_mult * tickage_mult).min(vcfg.stake_mult_cap);
+                            // CANARY AMBER caps the multiplier to 1.0 (kill burst +
+                            // tick-age amplification during chop; entries still fire).
+                            let stake_mult = if canary_derisk {
+                                1.0
+                            } else {
+                                (burst_mult * tickage_mult).min(vcfg.stake_mult_cap)
+                            };
                             if stake_mult > 1.0 {
                                 // Clamp to the per-interval max_pos (must be >= base*cap =
                                 // $3.15 to not throttle; the guard also enforces it).
@@ -1041,9 +1143,12 @@ pub async fn run_decision_task(
                             // Count this entry against the per-market max-2 cap (feature A).
                             if state.v2_market_entries.len() > 50_000 { state.v2_market_entries.clear(); }
                             *state.v2_market_entries.entry(mkey.clone()).or_insert(0) += 1;
-                            // Record (interval, predicted-p) for the recalibrator
-                            // (drained on resolution, routed to the interval's recal).
-                            state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred));
+                            // Record (interval, RAW predicted-p) for the recalibrator
+                            // (drained on resolution). Order #7 A: store p_raw (pre-
+                            // debias), NOT the gated pred — every recal.record path reads
+                            // this, incl. the stop counterfactual feed, so both are fixed
+                            // at the source. The logged "p" below stays the gated pred.
+                            state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred_raw));
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
                             oplog.sys("v2_intent_open", serde_json::json!({
                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,

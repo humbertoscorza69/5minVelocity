@@ -79,7 +79,10 @@ enabled = true
 # halve volume + lose money; 0.02 ok, 0.03 falls off a cliff — all tested). Refit
 # passed both hold-outs (recorder 9d +$23.4 vs +$20.3/day; July live +$12.0 vs
 # +$10.5, EV/trade +29%). Deploy step: delete data/v2/recal.json (5m only).
-edge_min = 0.01
+edge_min = 0.02   # Order #7 D: 0.01 -> 0.02 (5m). Inside the validated plateau
+                  # (0.01-0.02 flat; cliff at 0.03 — do NOT go there). Trims the
+                  # bottom half of the thinnest honest band [0.01,0.03) which lost
+                  # -$9.07 on the burn night, at ~zero expected cost per the refit.
 # 5m calibration curve (A4 → config). cal_z UNCHANGED; cal_w re-based to the honest
 # scale (the May curve ran +7.8pts hot, which is why recal bias climbed to 0.175).
 cal_z = [0.14, 0.45, 0.80, 1.24, 1.74, 2.46, 3.82, 10.49]
@@ -157,8 +160,17 @@ reentry_enabled = true
 # probation: pre-registered kill-rule = if same-side cumulative net < -$15 at n=100,
 # set reentry_same_enabled = false (no redeploy needed — dashboard-persisted controls
 # not required; a config flip + restart suffices). Opposite is the validated winner.
-reentry_same_enabled = true
+# Order #7 B: SAME-side re-entry OFF. Live 25% WR, -$3.89 cumulative; its failure
+# mechanism (re-firing into the whipsaw that just stopped entry #1) IS the burn-night
+# regime. Opposite stays ON (validated +0.144/$1). Re-arm same-side only after the
+# canary (Part C) can cut chop exposure and n grows under paper.
+reentry_same_enabled = false
 reentry_opposite_enabled = true
+# Order #7 C: regime canary. false = kill switch (always GREEN, no de-risk/halt).
+# AMBER (hold-WR<0.50 or vol-accel) caps stake mult to 1.0 + suspends re-entries;
+# RED (hold-WR<0.45) halts all entries for that asset until a 60m cooldown + a
+# clean probation. Per-asset, counterfactual-scored (stops included).
+canary_enabled = true
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50
