@@ -345,8 +345,9 @@ fn compute_stats(
     }
     // LIVE resolutions: PnlRecorder "recorded" rows carry net_pnl + resolved_price.
     // Order #8 B: "corrected" rows carry a DELTA (net_pnl) that heals a lied-about
-    // booking — add it to realized (+ a curve point) but NOT to the trade stats
-    // (it's a P&L adjustment, not a trade), and count it for the banner ALERT.
+    // booking — add it to realized but NOT to the trade stats (it's a P&L
+    // adjustment, not a trade), and count it for the banner ALERT. (The cumulative
+    // chart doesn't show the step; realized still heals.)
     let mut correction_total = 0.0_f64;
     let mut corrections_n = 0u64;
     if let Ok(text) = std::fs::read_to_string(crate::pnl_recorder::DEFAULT_PNL_RECORDED_LOG) {

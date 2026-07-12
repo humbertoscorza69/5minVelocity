@@ -661,6 +661,9 @@ pub fn record_from_activity(
     let mut tok_cond: HashMap<String, String> = HashMap::new();
     // condition -> total redeem payout (USDC); presence => the market settled.
     let mut cond_payout: HashMap<String, f64> = HashMap::new();
+    // condition -> latest redeem unix-seconds (Order #8 B day-scoping: a correction
+    // only heals the daily-loss counter when the redeem is from the CURRENT day).
+    let mut cond_redeem_ts: HashMap<String, i64> = HashMap::new();
     for r in rows {
         match r.kind {
             ActivityKind::Trade => {
@@ -676,6 +679,8 @@ pub fn record_from_activity(
             ActivityKind::Redeem => {
                 if !r.condition_id.is_empty() {
                     *cond_payout.entry(r.condition_id.clone()).or_insert(0.0) += r.usdc;
+                    let e = cond_redeem_ts.entry(r.condition_id.clone()).or_insert(r.ts);
+                    *e = (*e).max(r.ts);
                 }
             }
             ActivityKind::Other => {}
@@ -739,17 +744,29 @@ pub fn record_from_activity(
             continue; // booked outcome agrees with the payout — nothing to correct
         }
         let true_net = compute_resolution_net_pnl(shares, entry, truth_resolved);
+        // AUDIT (Order #8): the daily-loss counter is a DAY-SCOPED risk gauge. Apply
+        // the heal to it ONLY when the redeem is from the CURRENT UTC day — else a
+        // retroactive correction of yesterday's lie (e.g. the −$15 phantom) lands in
+        // a fresh day's counter and can trip the daily-loss stop at the boundary.
+        // The ledger row, the dashboard heal, and the alert always happen; only the
+        // guards application is gated. Normal same-tick corrections are same-day, so
+        // the real protection is untouched. UTC day = ts / 86400 (epoch-aligned).
+        let redeem_ts = cond_redeem_ts.get(cond).copied().unwrap_or(0);
+        let same_utc_day = redeem_ts / 86_400 == (now_ms_arg / 1000) / 86_400;
         match recorder.record_correction(token, truth_resolved, true_net, now_ms_arg) {
             Ok(Some(delta)) => {
-                if let Ok(mut g) = guards.lock() {
-                    g.record_net_pnl(Decimal::try_from(delta).unwrap_or_default(), now_ms_arg);
+                if same_utc_day {
+                    if let Ok(mut g) = guards.lock() {
+                        g.record_net_pnl(Decimal::try_from(delta).unwrap_or_default(), now_ms_arg);
+                    }
                 }
                 oplog.sys("pnl_corrected", serde_json::json!({
                     "token_id": token, "old_net": recorded_net, "true_net": true_net,
                     "delta": delta, "truth_resolved": truth_resolved,
                     "recorded_resolved": recorded_resolved,
+                    "redeem_ts": redeem_ts, "counter_healed": same_utc_day,
                 }));
-                warn!(token = %token, old_net = recorded_net, true_net, delta,
+                warn!(token = %token, old_net = recorded_net, true_net, delta, same_utc_day,
                     "pnl CORRECTED — a booking path disagreed with the redeem payout");
             }
             Ok(None) => {}
@@ -1289,11 +1306,15 @@ mod tests {
             kind: crate::rest::ActivityKind::Trade, is_buy: true, usdc, ts: 1,
         }
     }
-    fn redeem_row(cond: &str, usdc: f64) -> crate::rest::ActivityRow {
+    fn redeem_row(cond: &str, usdc: f64, ts: i64) -> crate::rest::ActivityRow {
         crate::rest::ActivityRow {
             condition_id: cond.into(), token_id: None,
-            kind: crate::rest::ActivityKind::Redeem, is_buy: false, usdc, ts: 2,
+            kind: crate::rest::ActivityKind::Redeem, is_buy: false, usdc, ts,
         }
+    }
+    // A redeem timestamp on the SAME UTC day as t0() (the tests' `now`).
+    fn same_day_ts() -> i64 {
+        t0() / 1000
     }
 
     /// Order #8 A (testable slice): a photo-finish token is DEFERRED by the
@@ -1305,7 +1326,7 @@ mod tests {
         let guards = mk_guards();
         let mut recorder = PnlRecorder::load(tmp_path("pfdefer")).unwrap();
         let oplog = mk_oplog();
-        let rows = vec![buy_row("tokpf", "0xpf", 1.118), redeem_row("0xpf", 0.0)];
+        let rows = vec![buy_row("tokpf", "0xpf", 1.118), redeem_row("0xpf", 0.0, same_day_ts())];
         let booked = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
         assert_eq!(booked, vec![("tokpf".to_string(), false)], "booked as LOSS from the $0 payout");
         assert!(guards.lock().unwrap().daily_net_pnl() < Decimal::ZERO, "counter reflects a loss, not +$13.88");
@@ -1327,7 +1348,8 @@ mod tests {
         let counter_after_win = guards.lock().unwrap().daily_net_pnl();
         assert!(counter_after_win > Decimal::ZERO);
 
-        let rows = vec![buy_row("tokw", "0xcid", 1.05), redeem_row("0xcid", 0.0)];
+        // SAME-day redeem → the counter heals (the defense this was built for).
+        let rows = vec![buy_row("tokw", "0xcid", 1.05), redeem_row("0xcid", 0.0, same_day_ts())];
         let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -1342,6 +1364,31 @@ mod tests {
         // Repeat redeem must NOT double-correct (outcome updated to truth).
         let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
         assert_eq!(healed, guards.lock().unwrap().daily_net_pnl(), "no double-correction");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AUDIT patch: a correction whose redeem is from a PRIOR UTC day writes the
+    /// ledger row (+ alert) but must NOT move the daily-loss counter — else a
+    /// retroactive heal of yesterday's phantom trips the day cap at the boundary.
+    #[test]
+    fn order8_correction_stale_redeem_does_not_move_daily_counter() {
+        let path = tmp_path("stalecorrect");
+        let _ = std::fs::remove_file(&path);
+        let bs = mk_bs(vec![bot_lot("tokw", dec!(0.40), dec!(2.625))]);
+        let guards = mk_guards();
+        let mut recorder = PnlRecorder::load(&path).unwrap();
+        let oplog = mk_oplog();
+        assert!(record_settled("tokw", 1.0, "settlement", &bs, &guards, &mut recorder, &oplog, t0()));
+        let counter_before = guards.lock().unwrap().daily_net_pnl();
+        // Redeem two days earlier (different UTC day) than now = t0().
+        let stale_ts = t0() / 1000 - 2 * 86_400;
+        let rows = vec![buy_row("tokw", "0xcid", 1.05), redeem_row("0xcid", 0.0, stale_ts)];
+        let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
+        // Ledger row STILL written (books stay honest)...
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"corrected\""));
+        // ...but the day-scoped counter is UNMOVED (no boundary trip).
+        assert_eq!(counter_before, guards.lock().unwrap().daily_net_pnl(),
+            "stale-day correction must not move the daily-loss counter");
         let _ = std::fs::remove_file(&path);
     }
 }
