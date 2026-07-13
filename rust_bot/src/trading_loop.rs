@@ -470,8 +470,10 @@ pub fn process_kline_v2(
             Some(a) if a > 0.0 => a,
             _ => continue,
         };
-        // Max-ask quality cap (15m: 0.70). 0.0 (or >=1.0) = no cap (5m).
-        if s.max_ask > 0.0 && ask > s.max_ask {
+        // Ask-BAND gate: max-ask quality cap (15m: 0.70; 5m: none) + Order #9 B
+        // min-ask floor (0.30 both) — keep entries inside the validated [0.30,0.97]
+        // envelope; extreme-ask books are where the curve is maximally wrong.
+        if crate::v2::ask_out_of_band(ask, s.min_ask, s.max_ask) {
             continue;
         }
         let Some(f) = history.features(

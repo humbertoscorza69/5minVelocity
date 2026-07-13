@@ -144,6 +144,11 @@ inval_stop_dry_run = false
 # lo=0.0 to revert to the unconditional stop.
 stop_bid_hi = 0.50
 stop_bid_lo = 0.30
+# Order #9 B: ask FLOOR (both intervals), 0.30 = ON. Every validated study gated
+# ask >= 0.30; below it the win-prob curve is maximally wrong (dead-tape z-explosion
+# → a 7c ask scored "edge +0.50"). Rare (1/122 live) — a hole, not a volume change.
+# 0 = disable. 15m composes it with max_ask = 0.70 → band [0.30, 0.70].
+min_ask = 0.30
 # BOOK-UNMOVED entry gate: skip an entry unless the PM book's mid was UNMOVED in
 # the ~3s before the decision (the book-side half of the lag detector; the
 # Binance-side half is frozen_tape_secs). Entries where the book had already

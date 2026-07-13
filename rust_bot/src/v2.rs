@@ -691,6 +691,10 @@ pub struct IntervalStrat {
     pub late_entry_max_ttl_s: i64,
     /// Skip when `ask > max_ask` (quality cap). `0` (or `>=1`) = no cap.
     pub max_ask: f64,
+    /// Order #9 B: skip when `ask < min_ask` (envelope floor). `0` = no floor.
+    /// Ships 0.30 both intervals — every validated study gated ask ∈ [0.30, 0.97];
+    /// below it the calibration is maximally wrong (the 7¢ phantom).
+    pub min_ask: f64,
     /// Win-prob calibration knots for this interval.
     pub cal_z: Vec<f64>,
     pub cal_w: Vec<f64>,
@@ -712,6 +716,15 @@ pub struct IntervalStrat {
     /// → huge z → false p). Ship OFF; the auditor sizes them on recorder data.
     pub disp_floor_bps: f64,
     pub vol60_floor: f64,
+}
+
+/// Order #9 B: ask-band gate. `true` = reject. Below `min_ask` (0 = no floor) OR
+/// above `max_ask` (0 / >=1 = no cap). The floor keeps entries inside the validated
+/// [0.30, 0.97] envelope — extreme-ask books are exactly where the win-prob curve
+/// is most wrong (three studies closed on it).
+#[must_use]
+pub fn ask_out_of_band(ask: f64, min_ask: f64, max_ask: f64) -> bool {
+    (min_ask > 0.0 && ask < min_ask) || (max_ask > 0.0 && ask > max_ask)
 }
 
 /// Order #8 D: entry-floor rejection. `Some(reason)` if the candidate is below a
@@ -853,6 +866,23 @@ mod tests {
         // displacement against us
         let mut nd = base; nd.disp_bps = -1.0;
         assert_eq!(gate(&nd), Gate::Skip("no_disp"));
+    }
+
+    /// Order #9 B: ask floor rejects extreme-ask books; band passes the validated
+    /// [0.30, 0.97] range; 15m's max cap composes with the floor.
+    #[test]
+    fn ask_band_floor_and_cap() {
+        // 5m: floor 0.30, no cap (max_ask 0.0).
+        assert!(ask_out_of_band(0.29, 0.30, 0.0), "0.29 below floor → reject");
+        assert!(ask_out_of_band(0.07, 0.30, 0.0), "the 7c phantom → reject");
+        assert!(!ask_out_of_band(0.30, 0.30, 0.0), "exactly the floor → pass");
+        assert!(!ask_out_of_band(0.96, 0.30, 0.0), "high ask, no 5m cap → pass");
+        // 15m: floor 0.30 + cap 0.70.
+        assert!(ask_out_of_band(0.71, 0.30, 0.70), "above 15m cap → reject");
+        assert!(!ask_out_of_band(0.65, 0.30, 0.70), "inside 15m band → pass");
+        assert!(ask_out_of_band(0.20, 0.30, 0.70), "below 15m floor → reject");
+        // floor 0.0 = disabled → only the cap applies.
+        assert!(!ask_out_of_band(0.07, 0.0, 0.0), "floor disabled → cheap passes");
     }
 
     /// Order #8 D: floors default 0.0 = OFF (pass); when set they reject with the

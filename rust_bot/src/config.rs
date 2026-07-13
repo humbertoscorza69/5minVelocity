@@ -189,6 +189,10 @@ pub struct V2Config {
     pub disp_floor_bps: f64,
     #[serde(default)]
     pub vol60_floor: f64,
+    /// Order #9 B: ask floor (5m), default 0.30 = ON — envelope conformity with every
+    /// validated study (ask ∈ [0.30, 0.97]). 0 = disabled. See v2::ask_out_of_band.
+    #[serde(default = "d_min_ask")]
+    pub min_ask: f64,
     /// Rolling recalibration window (closed trades retained).
     #[serde(default = "d_recal_capacity")]
     pub recal_capacity: usize,
@@ -245,6 +249,7 @@ pub struct V2Config {
 
 fn d_stop_bid_hi() -> f64 { 0.50 }
 fn d_stop_bid_lo() -> f64 { 0.30 }
+fn d_min_ask() -> f64 { 0.30 }
 fn d_cal_z() -> Vec<f64> { crate::v2::CAL_Z.to_vec() }
 fn d_cal_w() -> Vec<f64> { crate::v2::CAL_W.to_vec() }
 fn d_cal_z_15m() -> Vec<f64> { crate::v2::CAL_Z_15M.to_vec() }
@@ -294,6 +299,9 @@ pub struct Interval15mCfg {
     /// Skip when `ask > max_ask` (quality cap). `>=1.0` disables the cap.
     #[serde(default = "d_i15m_max_ask")]
     pub max_ask: f64,
+    /// Order #9 B: ask floor (15m), default 0.30 = ON.
+    #[serde(default = "d_min_ask")]
+    pub min_ask: f64,
     /// Only enter when `ttl <= late_entry_max_ttl_s` (the late-entry edge). `0` = off.
     #[serde(default = "d_i15m_late_ttl")]
     pub late_entry_max_ttl_s: i64,
@@ -335,6 +343,7 @@ impl Default for Interval15mCfg {
             z_min: d_i15m_z_min(),
             edge_min: d_i15m_edge_min(),
             max_ask: d_i15m_max_ask(),
+            min_ask: d_min_ask(),
             late_entry_max_ttl_s: d_i15m_late_ttl(),
             recal_path: d_i15m_recal_path(),
             recal_capacity: d_recal_capacity(),
@@ -366,6 +375,7 @@ impl V2Config {
             min_ttl_s: self.min_ttl_s,
             late_entry_max_ttl_s: self.max_ttl_s, // 5m late gate (0 = off)
             max_ask: 0.0,            // 5m: no price cap (its live edge includes cheap)
+            min_ask: self.min_ask,   // Order #9 B: 0.30 floor (envelope conformity)
             cal_z: self.cal_z.clone(),
             cal_w: self.cal_w.clone(),
             recal_bias,
@@ -394,6 +404,7 @@ impl Interval15mCfg {
             min_ttl_s: self.min_ttl_s,
             late_entry_max_ttl_s: self.late_entry_max_ttl_s,
             max_ask: self.max_ask,
+            min_ask: self.min_ask,
             cal_z: self.cal_z.clone(),
             cal_w: self.cal_w.clone(),
             recal_bias,
@@ -444,6 +455,7 @@ impl Default for V2Config {
             canary_enabled: true,
             disp_floor_bps: 0.0,
             vol60_floor: 0.0,
+            min_ask: d_min_ask(),
             i15m: Interval15mCfg::default(),
         }
     }

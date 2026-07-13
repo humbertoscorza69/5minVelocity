@@ -181,6 +181,14 @@ fn apply_control(controls: &crate::v2::Controls, path: &str) {
 
 /// Compute the full stats payload from live state + the oplog firehose.
 #[allow(clippy::too_many_arguments)]
+/// Order #9 A: a correction belongs to the current session iff its ORIGINAL booking
+/// (Recorded row) was in this session. `orig_ts == 0` (original not found) → treat
+/// as prior (conservative: keep it out of the session headline).
+#[must_use]
+fn correction_is_session(orig_ts: i64, started_ms: i64) -> bool {
+    orig_ts >= started_ms && orig_ts > 0
+}
+
 fn compute_stats(
     state: &SharedState,
     store_state: &SharedBotState,
@@ -344,23 +352,41 @@ fn compute_stats(
         }
     }
     // LIVE resolutions: PnlRecorder "recorded" rows carry net_pnl + resolved_price.
-    // Order #8 B: "corrected" rows carry a DELTA (net_pnl) that heals a lied-about
-    // booking — add it to realized but NOT to the trade stats (it's a P&L
-    // adjustment, not a trade), and count it for the banner ALERT. (The cumulative
-    // chart doesn't show the step; realized still heals.)
-    let mut correction_total = 0.0_f64;
+    // Order #9 A: a "corrected" row heals a lied-about booking. Scope it by the
+    // ORIGINAL Recorded row's session: if that booking was in THIS session, fold the
+    // delta into session realized (as Order #8 did); otherwise it's a ledger
+    // correction for a prior session (e.g. the −$16.11 that landed in a fresh
+    // session's headline) → a separate `prior_corrections` line, NOT in session
+    // realized / Δsession / awaiting-redeem. The ALERT fires for both.
+    let mut correction_total = 0.0_f64;       // session-scoped (original in-session)
+    let mut prior_corrections_total = 0.0_f64; // original from a prior session
     let mut corrections_n = 0u64;
+    let mut recorded_ts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Ok(text) = std::fs::read_to_string(crate::pnl_recorder::DEFAULT_PNL_RECORDED_LOG) {
         for line in text.lines() {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
-            if ts < started_ms { continue; }
+            // Track EVERY Recorded row's ts (LIFETIME, before the session filter) so a
+            // later corrected row can find its original's session.
+            if kind == "recorded" {
+                if let Some(t) = v.get("token_id").and_then(Value::as_str) {
+                    recorded_ts.insert(t.to_string(), ts);
+                }
+            }
             if kind == "corrected" {
-                correction_total += v.get("net_pnl").and_then(num).unwrap_or(0.0);
+                let d = v.get("net_pnl").and_then(num).unwrap_or(0.0);
+                let orig_ts = v.get("token_id").and_then(Value::as_str)
+                    .and_then(|t| recorded_ts.get(t)).copied().unwrap_or(0);
+                if correction_is_session(orig_ts, started_ms) {
+                    correction_total += d;
+                } else {
+                    prior_corrections_total += d;
+                }
                 corrections_n += 1;
                 continue;
             }
+            if ts < started_ms { continue; }
             if kind != "recorded" { continue; }
             let np = v.get("net_pnl").and_then(num).unwrap_or(0.0);
             let rp = v.get("resolved_price").and_then(num);
@@ -508,8 +534,8 @@ fn compute_stats(
     let mut warns: Vec<String> = Vec::new();
     if corrections_n > 0 {
         alerts.push(format!(
-            "{corrections_n} P&L correction(s) this session ({:+.2} net) — a booking path disagreed with the redeem payout",
-            correction_total
+            "{corrections_n} P&L correction(s) — a booking path disagreed with the redeem payout (session {:+.2}, prior-session ledger {:+.2})",
+            correction_total, prior_corrections_total
         ));
     }
     if canary_state == "red" {
@@ -572,6 +598,7 @@ fn compute_stats(
             "wallet_start": wallet_start,
             "wallet_delta": wallet_delta,
             "in_flight": in_flight,
+            "prior_corrections": prior_corrections_total, // Order #9 A: ledger fixes for prior sessions
         },
         "stats": {
             "entries": entries,
@@ -840,7 +867,10 @@ function render(){
   const rc=(FILT==="15m")?s.recal.m15:s.recal.m5;
   $("filt_note").textContent=(FILT==="all")?"combined 5m + 15m":(FILT+" only");
   const t=$("pnl_total");t.textContent=money(total);t.className="val mono "+cls(total);
-  $("pnl_split").textContent="real "+money(realized)+" · unrl "+money(unreal);
+  // Order #9 A: prior-session ledger corrections shown separately, NOT in the
+  // session headline (they heal historical rows, not this session's trades).
+  const pc=(FILT==="all"&&s.pnl&&s.pnl.prior_corrections)?s.pnl.prior_corrections:0;
+  $("pnl_split").textContent="real "+money(realized)+" · unrl "+money(unreal)+(Math.abs(pc)>0.005?" · ledger corr (prior) "+money(pc):"");
   const r=$("pnl_real");r.textContent=money(realized);r.className="val mono "+cls(realized);
   const u=$("pnl_unreal");u.textContent=money(unreal);u.className="val mono "+cls(unreal);
   $("pf").textContent=(typeof st.profit_factor==="number")?st.profit_factor.toFixed(2):st.profit_factor;
@@ -897,3 +927,20 @@ $("kill").onclick=async()=>{const on=$("kill").classList.contains("killon");
   try{await fetch("/api/control?kill="+(on?"false":"true"),{method:"POST"})}catch(e){}tick()};
 tick();setInterval(tick,3000);window.addEventListener("resize",()=>{});
 </script></body></html>"##;
+
+#[cfg(test)]
+mod order9_tests {
+    use super::correction_is_session;
+
+    /// Order #9 A: a correction is folded into the session headline ONLY when its
+    /// ORIGINAL booking was in this session; a prior-session original goes to the
+    /// separate ledger line (the −$16.11 that wrongly hit the fresh headline).
+    #[test]
+    fn correction_scope_by_original_session() {
+        let started = 1_000_i64;
+        assert!(correction_is_session(1_500, started), "in-session original → session");
+        assert!(correction_is_session(1_000, started), "boundary = in-session");
+        assert!(!correction_is_session(999, started), "prior-session original → prior line");
+        assert!(!correction_is_session(0, started), "original not found → prior (conservative)");
+    }
+}
