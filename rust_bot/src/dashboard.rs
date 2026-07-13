@@ -359,10 +359,13 @@ fn compute_stats(
     // delta into session realized (as Order #8 did); otherwise it's a ledger
     // correction for a prior session (e.g. the −$16.11 that landed in a fresh
     // session's headline) → a separate `prior_corrections` line, NOT in session
-    // realized / Δsession / awaiting-redeem. The ALERT fires for both.
+    // realized / Δsession / awaiting-redeem. SEVERITY (fixed): a SESSION correction
+    // is an active lie caught now → ALERT; a PRIOR-session correction is a healed
+    // historical ledger fix → WARN, not a persistent RED.
     let mut correction_total = 0.0_f64;       // session-scoped (original in-session)
     let mut prior_corrections_total = 0.0_f64; // original from a prior session
-    let mut corrections_n = 0u64;
+    let mut session_corrections_n = 0u64;
+    let mut prior_corrections_n = 0u64;
     let mut recorded_ts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Ok(text) = std::fs::read_to_string(crate::pnl_recorder::DEFAULT_PNL_RECORDED_LOG) {
         for line in text.lines() {
@@ -382,10 +385,11 @@ fn compute_stats(
                     .and_then(|t| recorded_ts.get(t)).copied().unwrap_or(0);
                 if correction_is_session(orig_ts, started_ms) {
                     correction_total += d;
+                    session_corrections_n += 1;
                 } else {
                     prior_corrections_total += d;
+                    prior_corrections_n += 1;
                 }
-                corrections_n += 1;
                 continue;
             }
             if ts < started_ms { continue; }
@@ -534,10 +538,18 @@ fn compute_stats(
     let canary_state = canary_snap.get("state").and_then(Value::as_str).unwrap_or("green");
     let mut alerts: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
-    if corrections_n > 0 {
+    // ACTIVE lie caught THIS session → hard ALERT (needs eyes now).
+    if session_corrections_n > 0 {
         alerts.push(format!(
-            "{corrections_n} P&L correction(s) — a booking path disagreed with the redeem payout (session {:+.2}, prior-session ledger {:+.2})",
-            correction_total, prior_corrections_total
+            "{session_corrections_n} P&L correction(s) THIS SESSION ({:+.2}) — a booking path disagreed with the redeem payout",
+            correction_total
+        ));
+    }
+    // Healed HISTORICAL ledger fixes for prior sessions → WARN, not a persistent RED.
+    if prior_corrections_n > 0 {
+        warns.push(format!(
+            "{prior_corrections_n} ledger correction(s) for prior sessions ({:+.2}) — historical, already healed",
+            prior_corrections_total
         ));
     }
     if canary_state == "red" {
