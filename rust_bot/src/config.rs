@@ -183,6 +183,12 @@ pub struct V2Config {
     /// (n=30, AMBER<0.50, RED<0.45, vol ratio 2.0/floor 2.0bpm, 60m cooldown).
     #[serde(default = "d_true")]
     pub canary_enabled: bool,
+    /// Order #9 C3: strict book-gate. When true, an entry whose PM book is
+    /// UNOBSERVABLE (no/thin mid-ring coverage — typically a WS-gap window) is
+    /// BLOCKED instead of passed. Default false = today's behavior + C2 logging
+    /// only. Do NOT enable until the item-E study reads the measured rates.
+    #[serde(default)]
+    pub book_gate_strict: bool,
     /// Order #8 D entry floors (5m), both 0.0 = OFF. See v2::floor_reject. Guard the
     /// dead-tape z-explosion; sized on recorder data + flipped via config later.
     #[serde(default)]
@@ -453,6 +459,7 @@ impl Default for V2Config {
             cal_z: d_cal_z(),
             cal_w: d_cal_w(),
             canary_enabled: true,
+            book_gate_strict: false,
             disp_floor_bps: 0.0,
             vol60_floor: 0.0,
             min_ask: d_min_ask(),

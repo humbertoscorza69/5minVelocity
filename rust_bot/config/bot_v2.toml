@@ -176,6 +176,12 @@ reentry_opposite_enabled = true
 # RED (hold-WR<0.45) halts all entries for that asset until a 60m cooldown + a
 # clean probation. Per-asset, counterfactual-scored (stops included).
 canary_enabled = true
+# Order #9 C3: strict book-gate. false = today's behavior + C2 measurement only
+# (v2_book_gate_unobservable events + stats.book_unobservable count). true = BLOCK
+# entries whose PM book is unobservable (WS-gap/thin coverage). Ships OFF; the
+# item-E study decides on the measured rate (recorder implied ~60% block, live ~17%
+# — the gap is the leading suspect for these blind passes). Do NOT enable yet.
+book_gate_strict = false
 # Order #8 D entry floors (5m), both 0.0 = OFF (default). Guard the dead-tape
 # z-explosion (tiny |disp| over a ~0 vol60 denom → huge z → false p on a nothing
 # move — the phantom's layer 3). The auditor sizes these on recorder data before

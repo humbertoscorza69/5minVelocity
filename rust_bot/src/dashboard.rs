@@ -240,6 +240,7 @@ fn compute_stats(
     let mut asleep_null = 0u64; // intents where the asleep telemetry logged null (regression)
     let mut stops_fired = 0u64; // invalidation stops that actually SOLD (action=sell)
     let mut fill_anomalies = 0u64; // Order #8 C: buys that filled >5c better than quote
+    let mut unobservable_n = 0u64; // Order #9 C2: entries that passed a blind book gate
     // Trailing-window fill rate: each intent's signal_id in order + the set that
     // rolled back, so the alarm fires on a FRESH rejection storm within ~N intents
     // regardless of how long the session has been healthy (cumulative would dilute
@@ -314,6 +315,7 @@ fn compute_stats(
                     }
                 }
                 "live_fill_anomaly" => fill_anomalies += 1,
+                "v2_book_gate_unobservable" => unobservable_n += 1,
                 "live_open_rolled_back" => {
                     rolled_back += 1;
                     if let Some(s) = sid() { rolled_sids.insert(s.to_string()); }
@@ -575,6 +577,7 @@ fn compute_stats(
         "stop_dev_per": stop_dev_per, "stop_n": stop_n,
         "stop_saved": stop_saved, "stop_whipsawed": stop_whipsawed,
         "canary": canary_snap,
+        "book_unobservable": unobservable_n,
     });
 
     json!({

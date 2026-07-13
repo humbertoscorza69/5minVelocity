@@ -1105,6 +1105,30 @@ pub async fn run_decision_task(
                                 }));
                                 continue;
                             }
+                            // C2/C3 (Order #9): the gate did NOT block above (book not
+                            // affirmatively moved), but was the book actually OBSERVABLE?
+                            // No/thin mid-ring coverage = a structurally-blind pass, the
+                            // leading suspect for the recorder-60% vs live-17% block gap
+                            // (the 7c phantom passed with mid3s=0.0). Log the rate for the
+                            // item-E study; if book_gate_strict, BLOCK it (default OFF).
+                            if book_gate_on {
+                                let cause = match asleep_obs {
+                                    Some((true, _, _)) => None,           // affirmatively unmoved (observable)
+                                    None => Some("gap"),                  // no coverage → likely a WS gap
+                                    Some((false, _, _)) => Some("stale"), // 1-sample / thin coverage
+                                };
+                                if let Some(c) = cause {
+                                    oplog.sys("v2_book_gate_unobservable", serde_json::json!({
+                                        "token_id": intent.token_id, "signal_id": ctx.signal_id,
+                                        "interval": intent.interval, "cause": c,
+                                        "asleep_age_ms": asleep_obs.map(|a| a.2),
+                                        "strict": vcfg.book_gate_strict,
+                                    }));
+                                    if vcfg.book_gate_strict {
+                                        continue;
+                                    }
+                                }
+                            }
                             // SIZING TIERS (Order #5 A1 burst + A2 tick-age), applied
                             // BEFORE the guard so it caps the REAL (multiplied) stake and
                             // the daily-loss stop accrues on effective P&L. burst_bps =
