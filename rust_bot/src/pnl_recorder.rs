@@ -220,6 +220,18 @@ impl PnlRecorder {
                 if let PnlRecord::Recorded { token_id, shares, entry_price, resolved_price, net_pnl, .. } = &rec {
                     outcomes.insert(token_id.to_ascii_lowercase(), (*shares, *entry_price, *resolved_price, *net_pnl));
                 }
+                // Order #10 A: REPLAY corrections into the retained outcome (last wins),
+                // else after a restart the activity pass re-detects the same payout
+                // mismatch and re-corrects the SAME row every time (the −$48.32 = 3×
+                // −16.11 across three restarts). true_resolved is derived from the
+                // correction's true_net sign (a win redeems > 0; a loss = 0), which is
+                // exactly the outcome the reconcile compares the redeem payout against.
+                if let PnlRecord::Corrected { token_id, true_net, .. } = &rec {
+                    if let Some(o) = outcomes.get_mut(&token_id.to_ascii_lowercase()) {
+                        o.2 = if *true_net > 1e-9 { 1.0 } else { 0.0 };
+                        o.3 = *true_net;
+                    }
+                }
             }
         }
         Ok(Self { path, done, outcomes })
@@ -1364,6 +1376,37 @@ mod tests {
         // Repeat redeem must NOT double-correct (outcome updated to truth).
         let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
         assert_eq!(healed, guards.lock().unwrap().daily_net_pnl(), "no double-correction");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Order #10 A: a correction must survive a restart — reloading the file and
+    /// re-running the activity pass with the same disagreeing redeem must NOT write
+    /// a second `corrected` row (the −$48.32 = 3 restarts × the same 3 corrections).
+    #[test]
+    fn order10_a_correction_idempotent_across_reload() {
+        let path = tmp_path("idempotent");
+        let _ = std::fs::remove_file(&path);
+        let rows = vec![buy_row("tokw", "0xcid", 1.05), redeem_row("0xcid", 0.0, same_day_ts())];
+        // Session 1: book a WIN, then a $0 redeem corrects it to a LOSS.
+        {
+            let bs = mk_bs(vec![bot_lot("tokw", dec!(0.40), dec!(2.625))]);
+            let guards = mk_guards();
+            let mut recorder = PnlRecorder::load(&path).unwrap();
+            let oplog = mk_oplog();
+            assert!(record_settled("tokw", 1.0, "settlement", &bs, &guards, &mut recorder, &oplog, t0()));
+            let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("\"corrected\"").count(), 1);
+        // Session 2: RELOAD (restart) → the same redeem must NOT re-correct.
+        {
+            let bs = mk_bs(vec![]);
+            let guards = mk_guards();
+            let mut recorder = PnlRecorder::load(&path).unwrap();
+            let oplog = mk_oplog();
+            let _ = record_from_activity(&rows, &bs, &guards, &mut recorder, &oplog, t0());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("\"corrected\"").count(), 1,
+            "reload must NOT re-correct — corrections are idempotent across restart");
         let _ = std::fs::remove_file(&path);
     }
 

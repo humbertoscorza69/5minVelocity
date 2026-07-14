@@ -188,7 +188,15 @@ book_gate_strict = false
 # flipping them on; the burn-night |disp| averaged 1.5bps so a careless floor cuts
 # real volume. disp_floor_bps: reject if |disp_bps| below it. vol60_floor: reject
 # if vol60 below it (same units as vol_cap).
-disp_floor_bps = 0.0
+# Order #10 B — 5m POPULATION RESCUE. disp_floor_bps 0.0 -> 2.0. Three witnesses
+# agree the |disp| < 2bps cell was NEVER edge: recorder WR 0.575 and -0.017/trade
+# EVEN idealized; live fills WR 0.546, -0.003/$1 (n=423); 49% end photo-finish (the
+# 7c phantom's home). |disp| >= 2bps: recorder 0.704, live 0.671 +0.088/$1 (n=170).
+# The junk drove the pooled recal bias to 0.231, which strangled the whole interval.
+# Floor removes it; the fresh recal (recal.json deleted at deploy) re-measures the
+# clean cell. vol60_floor stays 0 — the disp floor subsumes the z-explosion.
+# Expected steady-state ~50 trades/day (recorder 7-88 by regime), NOT 150-240.
+disp_floor_bps = 2.0
 vol60_floor = 0.0
 vol_lookback_s = 60
 recal_capacity = 300
