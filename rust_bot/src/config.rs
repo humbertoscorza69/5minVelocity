@@ -340,6 +340,13 @@ pub struct Interval15mCfg {
     pub cal_z: Vec<f64>,
     #[serde(default = "d_cal_w_15m")]
     pub cal_w: Vec<f64>,
+    /// Order #11 B entry floors (15m), both 0.0 = OFF. See v2::floor_reject. Own
+    /// scale from 5m (15m tape has more room, less noise) — sized on recorder data,
+    /// wired to config so the 15m taker cell is guardable independently.
+    #[serde(default)]
+    pub disp_floor_bps: f64,
+    #[serde(default)]
+    pub vol60_floor: f64,
 }
 
 impl Default for Interval15mCfg {
@@ -362,6 +369,8 @@ impl Default for Interval15mCfg {
             book_unmoved_gate: true,
             cal_z: d_cal_z_15m(),
             cal_w: d_cal_w_15m(),
+            disp_floor_bps: 0.0,
+            vol60_floor: 0.0,
         }
     }
 }
@@ -418,8 +427,8 @@ impl Interval15mCfg {
             max_pos_usd: 0.0,
             vol_lookback_s: self.vol_lookback_s,
             frozen_tape_secs: 0, // 15m: not significant in validation → off
-            disp_floor_bps: 0.0, // 15m: floors are 5m-scoped (Order #8 D)
-            vol60_floor: 0.0,
+            disp_floor_bps: self.disp_floor_bps, // Order #11 B: now config-wired
+            vol60_floor: self.vol60_floor,
         }
     }
 }

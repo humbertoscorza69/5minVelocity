@@ -58,6 +58,17 @@ const EXEC_LOG: &str = "data/live/execution_log.jsonl";
 /// Order #8 payout-truth deferral). Do not fork this constant.
 const PHOTO_FINISH_BPS: f64 = 2.0;
 
+/// Photo-finish test from raw window open/close prices: is `|fin−op|` (in bps) below
+/// PHOTO_FINISH_BPS? A photo-finish Binance label flips ~20% vs Chainlink, so it must
+/// train NEITHER a recalibrator NOR the canary hold-WR. Shared by the stop-path recal
+/// gate and the canary skip (Order #11 C). A non-positive open is never a photo finish
+/// (guards div-by-zero → no spurious skip).
+#[inline]
+#[must_use]
+fn photo_finish_prices(op: f64, fin: f64) -> bool {
+    op > 0.0 && (fin / op - 1.0).abs() * 1e4 < PHOTO_FINISH_BPS
+}
+
 /// Trade-log context captured at decision time, carried with the command so the
 /// execution task can stamp fill timestamps and emit the autopsy row.
 #[derive(Debug, Clone)]
@@ -921,7 +932,15 @@ pub async fn run_decision_task(
                             history.close_at(&asset, resolution - 1),
                         ) else { continue }; // ring cold → retry next tick
                         let won = up == (fin >= op);
-                        if let Ok(mut r) = recal.for_interval(&iv).lock() { r.record(pred, won); }
+                        // Order #11 C: PF-guard the stop-counterfactual recal feed. A
+                        // photo-finish label (|fin−op| < PHOTO_FINISH_BPS) flips ~20% vs
+                        // Chainlink, so it must NOT train the recal — the normal settle
+                        // path (recal skip at the booking drain) and record_hold below
+                        // already exclude it; this was the last unguarded feed.
+                        let pf = photo_finish_prices(op, fin);
+                        if !pf {
+                            if let Ok(mut r) = recal.for_interval(&iv).lock() { r.record(pred, won); }
+                        }
                         // STOP PROBATION GAUGE (Decision 2): net dEV of the stop vs
                         // HOLDING = shares*(stop_bid - resolved). Saved a loser
                         // (won=false) banks +bid; whipsawed a winner (won=true) forfeits
@@ -936,9 +955,7 @@ pub async fn run_decision_task(
                         }));
                         // CANARY Arm 1: a stopped 5m position's HOLD counterfactual is
                         // part of the hold-WR window (realized WR is stop-distorted) —
-                        // but skip a photo-finish label (Order #8 A), same |fin−op| test
-                        // as the flag site (this path never set the flag).
-                        let pf = op > 0.0 && (fin / op - 1.0).abs() * 1e4 < PHOTO_FINISH_BPS;
+                        // but skip a photo-finish label (shares the `pf` test above).
                         if iv == "5m" && !pf {
                             if let Ok(mut cy) = state.canary.lock() {
                                 if let Some(tr) = cy.record_hold(&asset, won, now) {
@@ -2809,6 +2826,53 @@ mod tests {
         KlineClose { asset: asset.into(), t_s, close, received_at_ms: recv }
     }
     fn no_rest(_t: &str) -> RestProbe { RestProbe::Skip }
+
+    /// Order #11 C: a stopped position whose settle window is a PHOTO FINISH
+    /// (|fin−op| < PHOTO_FINISH_BPS) must train NEITHER the stop-counterfactual
+    /// recal NOR the canary hold-WR — the Binance label flips ~20% vs Chainlink
+    /// there. Drives a real Recalibrator + Canary through the EXACT `!pf` gate the
+    /// stop path uses (photo_finish_prices), proving both feeds are suppressed for
+    /// a PF label and both fire for a decisive one.
+    #[test]
+    fn order11_c_photo_finish_feeds_neither_recal_nor_canary() {
+        use crate::canary::{Canary, CanaryConfig};
+        use crate::v2::Recalibrator;
+        use serde_json::json;
+
+        let op = 100_000.0;
+        let pf_fin = op * (1.0 + 1.0e-4); // +1.0 bps → photo finish
+        let dec_fin = op * (1.0 + 3.0e-4); // +3.0 bps → decisive
+        assert!(photo_finish_prices(op, pf_fin), "1bps must be a photo finish");
+        assert!(!photo_finish_prices(op, dec_fin), "3bps must be decisive");
+        assert!(!photo_finish_prices(0.0, 100.0), "non-positive open is never a PF");
+
+        let mut recal = Recalibrator::new(300, 50);
+        let mut canary = Canary::new(CanaryConfig::default());
+
+        // Photo-finish stop → the gate blocks BOTH feeds (mirrors the stop path).
+        let pf = photo_finish_prices(op, pf_fin);
+        if !pf {
+            recal.record(0.7, true);
+            canary.record_hold("BTC", true, 1_000);
+        }
+        assert_eq!(recal.samples(), 0, "PF must NOT feed the stop recal");
+        assert!(
+            canary.snapshot()["assets"].get("BTC").is_none(),
+            "PF must NOT feed the canary hold-WR window"
+        );
+
+        // Decisive stop → the gate lets BOTH through.
+        let pf2 = photo_finish_prices(op, dec_fin);
+        if !pf2 {
+            recal.record(0.7, true);
+            canary.record_hold("BTC", true, 2_000);
+        }
+        assert_eq!(recal.samples(), 1, "a decisive label feeds the stop recal");
+        assert_eq!(
+            canary.snapshot()["assets"]["BTC"]["n30"], json!(1),
+            "a decisive label feeds the canary hold-WR window"
+        );
+    }
 
     /// +6bps kline over a fresh in-band book → one Open with the right token, fill,
     /// shares, exit_ts, and populated ctx (t_signal/latency).

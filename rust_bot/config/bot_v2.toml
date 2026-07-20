@@ -194,10 +194,16 @@ book_gate_strict = false
 # 7c phantom's home). |disp| >= 2bps: recorder 0.704, live 0.671 +0.088/$1 (n=170).
 # The junk drove the pooled recal bias to 0.231, which strangled the whole interval.
 # Floor removes it; the fresh recal (recal.json deleted at deploy) re-measures the
-# clean cell. vol60_floor stays 0 — the disp floor subsumes the z-explosion.
-# Expected steady-state ~50 trades/day (recorder 7-88 by regime), NOT 150-240.
+# clean cell.
+# Order #11 A — 5m REGIME FLOOR. vol60_floor 0.0 -> 0.12. The disp floor cut the
+# photo-finish junk but NOT the dead-tape regime itself: entries where vol60 (the
+# realized-vol denom, vol_cap units) is near-zero are the flat-tape grind that ate
+# the $25 death — no lag to harvest, book already fair. 0.12 sits below the live
+# median vol60 on lively tape (keeps real volume) and above the dead-grind cluster.
+# Composes WITH disp_floor_bps: an entry must clear BOTH (real move AND live tape).
+# Expected steady-state ~40-50 trades/day; re-measured by the fresh recal at deploy.
 disp_floor_bps = 2.0
-vol60_floor = 0.0
+vol60_floor = 0.12
 vol_lookback_s = 60
 recal_capacity = 300
 recal_warmup = 50
@@ -231,6 +237,15 @@ edge_ref = 0.08
 min_ttl_s = 30
 # Book-unmoved gate for 15m (same as 5m; paper-log). Default ON for comparability.
 book_unmoved_gate = true
+# Order #11 B — 15m REGIME FLOORS (now config-wired; were hard-0.0 = 5m-scoped).
+# The 15m tape breathes more than 5m (900s horizon, vol120 denom), so the floors
+# scale DOWN from 5m: disp_floor_bps 2.0 (same absolute move threshold — a <2bps
+# displacement is noise at any horizon), vol60_floor 0.07 (lower than 5m's 0.12 —
+# a 15m market clears on thinner realized vol, so a 0.12 floor would cut real
+# late-entry edge). Both compose with the existing z_min/edge_min gates. Reject if
+# |disp_bps| < 2.0 OR vol60 < 0.07. 0.0 = OFF (reverts to un-floored 15m).
+disp_floor_bps = 2.0
+vol60_floor = 0.07
 
 # No [exits.cells] → every cell uses Baseline (hold-to-settle). v2 positions
 # carry exit_ts_s past resolution; the redemption task claims the winner.
