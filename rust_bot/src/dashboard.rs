@@ -39,6 +39,8 @@ pub async fn run_dashboard(
     bind: String,
     port: u16,
     started_ms: i64,
+    // Order #13 A/D: stake_mult_cap for the sizing-clip WARN (max_pos < base×cap).
+    stake_mult_cap: f64,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let listener = match TcpListener::bind((bind.as_str(), port)).await {
@@ -100,6 +102,7 @@ pub async fn run_dashboard(
                         &state, &store_state, &recal, &controls,
                         &mode, &live_armed_path, &kill_switch_path,
                         &oplog_path, started_ms, session_start_bal_milli,
+                        stake_mult_cap, &controls_path,
                     ).to_string();
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path == "/" || path.starts_with("/?") || path.starts_with("/index") {
@@ -189,6 +192,40 @@ fn correction_is_session(orig_ts: i64, started_ms: i64) -> bool {
     orig_ts >= started_ms && orig_ts > 0
 }
 
+/// Order #13 A: the burst/tick-age tiers can't express when `max_pos < base × cap`
+/// (the stake gets pinned flat). Pure so the guard is unit-tested.
+#[must_use]
+fn sizing_clipped(base_usd: f64, max_pos: f64, stake_mult_cap: f64) -> bool {
+    max_pos + 1e-6 < base_usd * stake_mult_cap
+}
+
+/// Order #13 D: the re-entry-opposite probation verdict from the LIFETIME counters
+/// (the registered kill-rule, automated). Pure so the thresholds are unit-tested
+/// without the dashboard scaffolding.
+#[derive(Debug, PartialEq, Eq)]
+enum ReentryProbation {
+    /// Nothing to do (below the warn floor, net non-negative, or already disabled).
+    Ok,
+    /// Negative past n=60 — early-warning banner, still accumulating to the verdict.
+    Warn,
+    /// n≥100 with cumulative net < 0 — the validated +EV expectation failed → disable.
+    Disable,
+}
+
+#[must_use]
+fn reentry_opp_probation(on: bool, n: u64, net: f64) -> ReentryProbation {
+    if !on {
+        return ReentryProbation::Ok; // already disabled → no re-fire, no re-emit
+    }
+    if n >= 100 && net < 0.0 {
+        ReentryProbation::Disable
+    } else if n >= 60 && net < 0.0 {
+        ReentryProbation::Warn
+    } else {
+        ReentryProbation::Ok
+    }
+}
+
 fn compute_stats(
     state: &SharedState,
     store_state: &SharedBotState,
@@ -200,6 +237,8 @@ fn compute_stats(
     oplog_path: &str,
     started_ms: i64,
     session_start_bal_milli: i64,
+    stake_mult_cap: f64,
+    controls_path: &str,
 ) -> Value {
     let now = crate::state::now_ms();
 
@@ -268,6 +307,13 @@ fn compute_stats(
     // rows with reentry=true, then joined to realized P&L for the per-side n + net
     // that back the same-side kill-rule (net < -$15 at n=100).
     let mut reentry_side_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // RE-ENTRY OPPOSITE PROBATION (Order #13 D): LIFETIME (cross-restart, like
+    // stop_devs) so the registered n=100 verdict accumulates across the audition's
+    // sessions instead of resetting each restart. Single pass over the append-only
+    // oplog: an intent always precedes its settlement, so join each opposite-reentry
+    // token to its later pnl_recorder_recorded net.
+    let mut re_opp_life_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let (mut re_opp_life_n, mut re_opp_life_net) = (0u64, 0.0f64);
     if let Ok(text) = std::fs::read_to_string(oplog_path) {
         for line in text.lines() {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
@@ -277,6 +323,24 @@ fn compute_stats(
                 if let Some(d) = v.get("data").and_then(|d| d.get("dev")).and_then(num) {
                     let won = v.get("data").and_then(|d| d.get("won")).and_then(Value::as_bool).unwrap_or(false);
                     stop_devs.push((d, won));
+                }
+            }
+            // Lifetime re-entry-opposite cohort (before the session filter below).
+            if kind == "v2_intent_open"
+                && v.get("data").and_then(|d| d.get("reentry_side")).and_then(Value::as_str) == Some("opposite")
+            {
+                if let Some(t) = v.get("data").and_then(|d| d.get("token_id")).and_then(Value::as_str) {
+                    re_opp_life_tokens.insert(short_tok(t));
+                }
+            }
+            if kind == "pnl_recorder_recorded" {
+                if let Some(t) = v.get("data").and_then(|d| d.get("token_id")).and_then(Value::as_str) {
+                    if re_opp_life_tokens.contains(&short_tok(t)) {
+                        if let Some(net) = v.get("data").and_then(|d| d.get("net_pnl")).and_then(num) {
+                            re_opp_life_n += 1;
+                            re_opp_life_net += net;
+                        }
+                    }
                 }
             }
             if ts < started_ms { continue; } // session-scope
@@ -577,6 +641,46 @@ fn compute_stats(
     if recon_per_hr > 20.0 { warns.push(format!("WS unstable: {:.0} reconnects/hr", recon_per_hr)); }
     if entries >= 20 && (asleep_null as f64 / entries as f64) > 0.30 { warns.push(format!("asleep telemetry null on {:.0}% of intents", 100.0 * asleep_null as f64 / entries as f64)); }
     if win_n >= 20 && (0.50..0.70).contains(&fill_rate_win) { warns.push(format!("fill rate {:.0}% (last {win_n})", fill_rate_win * 100.0)); }
+    // Order #13 A: sizing-tier clip guard. If max_pos < base × stake_mult_cap, the
+    // burst/tick-age tiers can't express (silently pinned flat) — the trap that
+    // neutered them three separate times. Persistent WARN per interval so it can
+    // never be fallen into silently again.
+    let clip_warn = |label: &str, base: f64, max: f64| -> Option<String> {
+        if sizing_clipped(base, max, stake_mult_cap) {
+            Some(format!(
+                "sizing tiers clipped ({label}): max_pos ${max:.2} < required ${:.2} (base ${base:.2} × cap {stake_mult_cap:.1})",
+                base * stake_mult_cap
+            ))
+        } else { None }
+    };
+    if let Some(w) = clip_warn("5m", controls.base_usd(), controls.max_pos_usd()) { warns.push(w); }
+    if let Some(w) = clip_warn("15m", controls.base_usd_15m(), controls.max_pos_15m()) { warns.push(w); }
+    // Order #13 D: re-entry-opposite probation — the registered kill-rule, automated
+    // (this project's written rules have gone unexecuted between exports). At n≥100
+    // with cumulative net < 0 the validated +EV expectation FAILED → auto-disable the
+    // leg (runtime toggle + persist so it survives restart), emit the verdict, raise
+    // an ALERT. WARN once negative past n=60 (early banner). Manual re-enable only
+    // (config true + clear the persisted controls) — a deliberate human decision.
+    let mut re_opp_auto_disabled = false;
+    match reentry_opp_probation(controls.reentry_opp_on(), re_opp_life_n, re_opp_life_net) {
+        ReentryProbation::Disable => {
+            controls.set_reentry_opp_on(false);
+            controls.save(controls_path); // persist so the disable survives restart
+            re_opp_auto_disabled = true;
+            if let Some(op) = state.oplog.get() {
+                op.sys("reentry_opp_probation_disable", json!({
+                    "n": re_opp_life_n, "net": re_opp_life_net, "rule": "n>=100 && cum_net<0",
+                }));
+            }
+            alerts.push(format!(
+                "re-entry(opp) AUTO-DISABLED: cum net {re_opp_life_net:+.2} at n={re_opp_life_n} (< $0 at the n=100 verdict) — manual re-enable via config"
+            ));
+        }
+        ReentryProbation::Warn => warns.push(format!(
+            "re-entry(opp) probation: net {re_opp_life_net:+.2} at n={re_opp_life_n} — verdict at n=100"
+        )),
+        ReentryProbation::Ok => {}
+    }
     let status = if !alerts.is_empty() { "alert" } else if !warns.is_empty() { "warn" } else { "ok" };
     let issues: Vec<String> = alerts.into_iter().chain(warns).collect();
     let health_report = json!({
@@ -631,6 +735,10 @@ fn compute_stats(
         "reentry": {
             "same_n": re_same_n, "same_net": re_same_net,
             "opposite_n": re_opp_n, "opposite_net": re_opp_net,
+            // Order #13 D: lifetime opposite probation (cross-restart) + toggle state.
+            "opp_on": controls.reentry_opp_on(),
+            "opp_life_n": re_opp_life_n, "opp_life_net": re_opp_life_net,
+            "opp_auto_disabled": re_opp_auto_disabled,
         },
         "by_interval": by_interval,
         "recal": {
@@ -646,6 +754,8 @@ fn compute_stats(
             "max_pos_15m": controls.max_pos_15m(),
             "inval_stop": controls.inval_stop_on(),
             "inval_stop_dry": controls.inval_stop_dry(),
+            // Order #13 A: so the frontend can flag max_pos < base × cap inline on Apply.
+            "stake_mult_cap": stake_mult_cap,
         },
         "live": {
             "mode": mode,
@@ -910,7 +1020,11 @@ function render(){
   const rel=$("reentry"); if(rel){
     rel.textContent=money(re.opposite_net)+" / "+money(re.same_net);
     rel.className="val mono "+((re.opposite_net+re.same_net)>=0?"pos":"neg");
-    $("reentry_sub").textContent="opp n="+re.opposite_n+" · same n="+re.same_n+(re.same_n>=100&&re.same_net<-15?" · KILL same":"");
+    // Order #13 D: opposite lifetime probation gauge (verdict at n=100) + toggle state.
+    let opp=" · opp(life) net "+money(re.opp_life_net||0)+" n="+(re.opp_life_n||0)+"/100";
+    if(re.opp_auto_disabled||re.opp_on===false)opp+=" · ⛔ opp DISABLED";
+    else if((re.opp_life_n||0)>=60&&(re.opp_life_net||0)<0)opp+=" · ▲ probation";
+    $("reentry_sub").textContent="opp n="+re.opposite_n+" · same n="+re.same_n+(re.same_n>=100&&re.same_net<-15?" · KILL same":"")+opp;
   }
   $("open_n").textContent=opens.length;
   $("open_body").innerHTML=opens.map(p=>`<tr><td class="mono">${p.token}</td><td>${p.side}</td><td class="muted">${p.asset}/${p.interval}</td><td class="mono">${p.entry.toFixed(3)}</td><td class="mono">$${(+p.usd).toFixed(2)}</td><td class="mono">${p.bid.toFixed(3)}</td><td class="mono">${p.shares.toFixed(1)}</td><td class="mono ${cls(p.unreal)}">${money(p.unreal)}</td><td class="muted mono">${fmtAge(p.age_s)}</td></tr>`).join("")||`<tr><td colspan=9 class=muted>none</td></tr>`;
@@ -926,7 +1040,14 @@ document.querySelectorAll(".btn.seg").forEach(b=>b.onclick=()=>{
   render();
 });
 $("toggle").onclick=async()=>{const on=$("toggle").classList.contains("on");try{await fetch("/api/control?enabled="+(on?"false":"true"),{method:"POST"})}catch(e){}tick()};
-$("apply").onclick=async()=>{const b=$("in_base").value,m=$("in_max").value,b15=$("in_base15").value,m15=$("in_max15").value;try{await fetch(`/api/control?base_usd=${encodeURIComponent(b)}&max_pos=${encodeURIComponent(m)}&base_usd_15m=${encodeURIComponent(b15)}&max_pos_15m=${encodeURIComponent(m15)}`,{method:"POST"})}catch(e){}$("ctl_msg").textContent="applied ✓";setTimeout(()=>$("ctl_msg").textContent="",1800);tick()};
+$("apply").onclick=async()=>{const b=$("in_base").value,m=$("in_max").value,b15=$("in_base15").value,m15=$("in_max15").value;
+  // Order #13 A: inline sizing-clip check — max_pos must be >= base × stake_mult_cap
+  // or the burst/tick-age tiers can't express (silently pinned flat).
+  const cap=(LAST&&LAST.controls&&+LAST.controls.stake_mult_cap)||3;const w=[];
+  if((+m)+1e-6<(+b)*cap)w.push("5m max $"+(+m).toFixed(2)+" < $"+((+b)*cap).toFixed(2));
+  if((+m15)+1e-6<(+b15)*cap)w.push("15m max $"+(+m15).toFixed(2)+" < $"+((+b15)*cap).toFixed(2));
+  try{await fetch(`/api/control?base_usd=${encodeURIComponent(b)}&max_pos=${encodeURIComponent(m)}&base_usd_15m=${encodeURIComponent(b15)}&max_pos_15m=${encodeURIComponent(m15)}`,{method:"POST"})}catch(e){}
+  $("ctl_msg").textContent=w.length?("applied — ⚠ sizing tiers clipped: "+w.join(" · ")):"applied ✓";setTimeout(()=>$("ctl_msg").textContent="",w.length?6000:1800);tick()};
 // Invalidation stop: cycle OFF -> DRY-RUN -> LIVE -> OFF. LIVE prompts (it sells).
 $("stopbtn").onclick=async()=>{const t=$("stopbtn").textContent;let q;
   if(t.includes("OFF"))q="inval_stop=true&inval_stop_dry=true";        // -> DRY
@@ -957,5 +1078,57 @@ mod order9_tests {
         assert!(correction_is_session(1_000, started), "boundary = in-session");
         assert!(!correction_is_session(999, started), "prior-session original → prior line");
         assert!(!correction_is_session(0, started), "original not found → prior (conservative)");
+    }
+}
+
+#[cfg(test)]
+mod order13_tests {
+    use super::{reentry_opp_probation, sizing_clipped, ReentryProbation};
+
+    /// Order #13 A: the sizing-clip guard — max_pos must be >= base × stake_mult_cap
+    /// or the burst/tick-age tiers pin flat (the trap that neutered them 3×).
+    #[test]
+    fn sizing_clip_guard() {
+        // The canonical trap: base 1.05, cap 3.0 → need 3.15, max sat at 1.05.
+        assert!(sizing_clipped(1.05, 1.05, 3.0), "max == base clips the tiers");
+        assert!(sizing_clipped(1.05, 3.14, 3.0), "just under 3.15 still clips");
+        // Fixed: max at/above 3.15 lets the tiers express.
+        assert!(!sizing_clipped(1.05, 3.15, 3.0), "exactly base×cap is fine");
+        assert!(!sizing_clipped(1.05, 5.00, 3.0), "headroom is fine");
+    }
+
+    /// Order #13 D: the registered re-entry-opposite kill-rule, as a verdict table.
+    /// Crossing n=100 negative → Disable; crossing n=100 positive → Ok (banner clears).
+    #[test]
+    fn reentry_opp_probation_verdict() {
+        use ReentryProbation::*;
+        // Below the warn floor: nothing, regardless of sign (the current n=42 state).
+        assert_eq!(reentry_opp_probation(true, 42, -2.63), Ok);
+        // Negative past n=60 → early-warning banner.
+        assert_eq!(reentry_opp_probation(true, 60, -0.01), Warn);
+        assert_eq!(reentry_opp_probation(true, 99, -5.0), Warn);
+        // n≥100 && net<0 → the auto-disable verdict.
+        assert_eq!(reentry_opp_probation(true, 100, -0.01), Disable);
+        assert_eq!(reentry_opp_probation(true, 150, -20.0), Disable);
+        // n≥100 but net≥0 → validated leg survives (net==0 is NOT < 0).
+        assert_eq!(reentry_opp_probation(true, 100, 6.0), Ok);
+        assert_eq!(reentry_opp_probation(true, 120, 0.0), Ok);
+        // Already off → always Ok (no re-fire / no re-emit on later polls & restarts).
+        assert_eq!(reentry_opp_probation(false, 200, -50.0), Ok);
+    }
+
+    /// Order #13 D: the runtime toggle flips off and the disable survives a
+    /// snapshot round-trip (persisted → survives restart; manual re-enable only).
+    #[test]
+    fn reentry_opp_toggle_persists() {
+        let c = crate::v2::Controls::new(true, 1.05, 3.15, 1.05, 3.15, false, true, true);
+        assert!(c.reentry_opp_on(), "inits on from config");
+        c.set_reentry_opp_on(false);
+        assert!(!c.reentry_opp_on());
+        let snap = c.snapshot();
+        assert!(!snap.reentry_opp_on, "snapshot carries the disable");
+        let c2 = crate::v2::Controls::new(true, 1.05, 3.15, 1.05, 3.15, false, true, true);
+        c2.apply_snapshot(&snap);
+        assert!(!c2.reentry_opp_on(), "disable survives a restart (snapshot restore)");
     }
 }

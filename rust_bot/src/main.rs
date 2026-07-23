@@ -1135,6 +1135,7 @@ async fn main() -> anyhow::Result<()> {
                 config.stakes.max_position_usdc,
                 config.v2.inval_stop_enabled,       // stop master switch from config
                 config.v2.inval_stop_dry_run,       // stop dry-run from config
+                config.v2.reentry_opposite_enabled, // Order #13 D: opp re-entry from config
             ),
         );
         // Restore persisted operator controls (stakes, stop) so dashboard settings
@@ -1205,6 +1206,7 @@ async fn main() -> anyhow::Result<()> {
                 config.dashboard.bind.clone(),
                 config.dashboard.port,
                 state::now_ms(),
+                config.v2.stake_mult_cap, // Order #13 A: sizing-clip WARN threshold
                 shutdown_rx.clone(),
             )));
         }

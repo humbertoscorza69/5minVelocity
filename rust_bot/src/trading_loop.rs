@@ -126,6 +126,10 @@ pub struct DecisionCtx {
     pub binance_ret_bps: f64,
     pub window_s: i64,
     pub stake_usd: f64,
+    /// Order #13 C: the raw pre-cap edge-proportional stake the sizer wanted
+    /// (base·edge/edge_ref, before min/max/depth clamps + burst/tick tiers). Logged
+    /// for the sizing-fraction study; nothing consumes it. 0.0 on the legacy path.
+    pub stake_raw: f64,
     /// Vol-normalized displacement at entry (the PRIMARY gate variable). Logged so
     /// live z-analysis needs no reconstruction. 0.0 on the legacy (non-v2) path.
     pub z: f64,
@@ -408,6 +412,7 @@ pub fn process_kline(
                     binance_ret_bps: trig.ret_bps,
                     window_s: trig.window_s as i64,
                     stake_usd: cfg.stake_usd,
+                    stake_raw: 0.0, // legacy path: no edge-proportional sizer
                     z: 0.0, // legacy path: z not computed
                     ttl_s: 0,
                     tick_age_s: 0,
@@ -574,6 +579,9 @@ pub fn process_kline_v2(
         if stake <= 0.0 {
             continue;
         }
+        // Order #13 C: what the edge-proportional sizer WANTED before the flat clamp
+        // above pinned it to base_usd. Telemetry only — nothing consumes stake_raw.
+        let stake_raw = crate::v2::edge_stake_raw(f.edge, s.base_usd, s.edge_ref);
         let shares = stake / ask;
         let dir = if up { Direction::Up } else { Direction::Down };
         let sid = signal_id(&kline.asset, kline.t_s, interval, dir);
@@ -590,6 +598,7 @@ pub fn process_kline_v2(
             binance_ret_bps: f.disp_bps,
             window_s: 0,
             stake_usd: stake,
+            stake_raw,
             z: f.z,
             ttl_s: ttl,
             tick_age_s: tick_age,
@@ -1116,10 +1125,14 @@ pub async fn run_decision_task(
                                         let side = if up == stopped_up { "same" } else { "opposite" };
                                         // Decision-3 per-side kill-rule: each side toggles
                                         // independently (same-side is the probationary leg).
+                                        // Order #13 D: opposite side ANDs config with
+                                        // the runtime toggle (the probation gauge auto-
+                                        // disables it at n≥100 net<0). config-false is
+                                        // always off; the toggle can only cut an on side.
                                         let side_on = if side == "same" {
                                             vcfg.reentry_same_enabled
                                         } else {
-                                            vcfg.reentry_opposite_enabled
+                                            vcfg.reentry_opposite_enabled && controls.reentry_opp_on()
                                         };
                                         if !side_on {
                                             oplog.sys("v2_reentry_side_off", serde_json::json!({
@@ -1280,6 +1293,9 @@ pub async fn run_decision_task(
                                 // already-multiplied stake.
                                 "burst_bps": burst_bps,
                                 "stake_mult": stake_mult,
+                                // Order #13 C: pre-cap edge-proportional stake (what
+                                // the sizer wanted) vs stake_usd (what caps allowed).
+                                "stake_raw": ctx.stake_raw,
                                 // FEATURE A: re-entry telemetry (FCFS; both-sides-qualified
                                 // is reconstructable from reentry_side across the market's
                                 // intents + v2_reentry_capped events).
@@ -3930,7 +3946,7 @@ mod tests {
             false,    // G5-test-rig: default OFF = no filter
             vec![],   // disabled_cells: default OFF = no production filter
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
-            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true)),
+            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true, true)),
             crate::v2::RecalSet {
                 m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
                 m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
@@ -4037,7 +4053,7 @@ mod tests {
             false,    // G5-test-rig: default OFF = no filter
             vec![],   // disabled_cells: default OFF = no production filter
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
-            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true)),
+            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true, true)),
             crate::v2::RecalSet {
                 m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
                 m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
@@ -4254,7 +4270,7 @@ mod tests {
             false,            // G5-test-rig: OFF
             disabled.clone(), // PRODUCTION filter: drop ETH:15m
             crate::config::V2Config::default(), // v2 disabled → legacy path under test
-            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true)),
+            Arc::new(crate::v2::Controls::new(true, 10.0, 100.0, 10.0, 100.0, false, true, true)),
             crate::v2::RecalSet {
                 m5: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),
                 m15: Arc::new(Mutex::new(crate::v2::Recalibrator::default())),

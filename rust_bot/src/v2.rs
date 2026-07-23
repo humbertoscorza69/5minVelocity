@@ -255,6 +255,20 @@ pub fn edge_stake(
     (stake * 100.0).floor() / 100.0
 }
 
+/// Order #13 C: the RAW pre-cap edge-proportional stake the sizer *wants* —
+/// `base_usd * (edge / edge_ref)`, before the min/max/depth clamps in `edge_stake`
+/// pin it flat (today base==max==base_usd → the desire is invisible in stake_usd).
+/// Logged next to stake_usd so the sizing-fraction study can compare want-vs-allowed.
+/// Cent-quantized to match stake_usd; NO behavior change (nothing consumes this).
+#[must_use]
+pub fn edge_stake_raw(edge: f64, base_usd: f64, edge_ref: f64) -> f64 {
+    if edge <= 0.0 || edge_ref <= 0.0 {
+        return 0.0;
+    }
+    let raw = base_usd * (edge / edge_ref);
+    (raw * 100.0).floor() / 100.0
+}
+
 /// Fractional-Kelly stake (alternative to edge-proportional). `b = (1-ask)/ask`,
 /// `f* = p - (1-p)/b`; stake = `bankroll * kelly_frac * f*`, depth+max capped.
 /// Edge-proportional ≈ Kelly in our study; this is provided for A/B.
@@ -500,6 +514,13 @@ pub struct Controls {
     max_pos_15m_milli: AtomicU64,   // 15m cap
     inval_stop_on: AtomicBool,      // invalidation stop master switch (dashboard)
     inval_stop_dry: AtomicBool,     // stop DRY-RUN (log would-fires, no sell)
+    // Order #13 D: opposite-side re-entry runtime toggle. Inits from config
+    // (reentry_opposite_enabled); the dashboard probation gauge auto-flips it OFF at
+    // n≥100 with cumulative net < 0 (the registered kill-rule). Persisted, so the
+    // disable survives restarts — re-enable is a deliberate human act (config true +
+    // clear the persisted controls). The gate ANDs this with config, so config-false
+    // is always off regardless of a stale persisted true.
+    reentry_opp_on: AtomicBool,
 }
 
 impl Controls {
@@ -513,6 +534,7 @@ impl Controls {
         max_pos_15m: f64,
         inval_stop_on: bool,
         inval_stop_dry: bool,
+        reentry_opp_on: bool,
     ) -> Self {
         let m = |v: f64| AtomicU64::new((v.max(0.0) * 1000.0) as u64);
         Self {
@@ -523,6 +545,7 @@ impl Controls {
             max_pos_15m_milli: m(max_pos_15m),
             inval_stop_on: AtomicBool::new(inval_stop_on),
             inval_stop_dry: AtomicBool::new(inval_stop_dry),
+            reentry_opp_on: AtomicBool::new(reentry_opp_on),
         }
     }
     #[must_use]
@@ -586,6 +609,14 @@ impl Controls {
     pub fn set_inval_stop_dry(&self, v: bool) {
         self.inval_stop_dry.store(v, Ordering::Relaxed);
     }
+    // --- Order #13 D: opposite-side re-entry runtime toggle ---
+    #[must_use]
+    pub fn reentry_opp_on(&self) -> bool {
+        self.reentry_opp_on.load(Ordering::Relaxed)
+    }
+    pub fn set_reentry_opp_on(&self, v: bool) {
+        self.reentry_opp_on.store(v, Ordering::Relaxed);
+    }
 
     /// Serializable snapshot of every operator-adjustable control, so dashboard
     /// changes SURVIVE a restart (systemd auto-restart, reboot, redeploy). Without
@@ -601,6 +632,7 @@ impl Controls {
             max_pos_15m: self.max_pos_15m(),
             inval_stop_on: self.inval_stop_on(),
             inval_stop_dry: self.inval_stop_dry(),
+            reentry_opp_on: self.reentry_opp_on(),
         }
     }
 
@@ -613,6 +645,7 @@ impl Controls {
         self.set_max_pos_15m(s.max_pos_15m);
         self.set_inval_stop_on(s.inval_stop_on);
         self.set_inval_stop_dry(s.inval_stop_dry);
+        self.set_reentry_opp_on(s.reentry_opp_on);
     }
 
     /// Persist the current controls to `path` (best-effort; creates parent dirs).
@@ -639,7 +672,15 @@ pub struct ControlsSnapshot {
     pub max_pos_15m: f64,
     pub inval_stop_on: bool,
     pub inval_stop_dry: bool,
+    /// Order #13 D. `#[serde(default)]`=true so an OLD controls.json (written before
+    /// this field existed) restores with re-entry-opposite ON, matching the config
+    /// default — a missing field must not silently disable the leg on first restart.
+    #[serde(default = "default_true")]
+    pub reentry_opp_on: bool,
 }
+
+#[must_use]
+fn default_true() -> bool { true }
 
 /// Load a persisted controls snapshot from `path` (None if missing/unparseable).
 #[must_use]
@@ -915,6 +956,22 @@ mod tests {
         assert!(approx(s4, 7.0, 1e-9));
         // no edge -> no stake
         assert_eq!(edge_stake(0.0, 10.0, 0.08, 1.05, 50.0, 1000.0), 0.0);
+    }
+
+    /// Order #13 C: edge_stake_raw is the UNCAPPED edge-proportional want
+    /// (base·edge/edge_ref), cent-quantized. Telemetry only — no clamps.
+    #[test]
+    fn edge_stake_raw_is_uncapped_proportional() {
+        // At edge_ref → base. Double edge → double. NO min/max/depth clamp.
+        assert!(approx(edge_stake_raw(0.08, 1.05, 0.08), 1.05, 1e-9));
+        assert!(approx(edge_stake_raw(0.16, 1.05, 0.08), 2.10, 1e-9));
+        // Way past any cap: raw keeps climbing (this is the point — want vs allowed).
+        assert!(approx(edge_stake_raw(0.80, 1.05, 0.08), 10.5, 1e-9));
+        // Cent-quantized (floored) like stake_usd.
+        assert!(approx(edge_stake_raw(0.10, 1.05, 0.08), 1.31, 1e-9)); // 1.3125 → 1.31
+        // Degenerate inputs → 0.
+        assert_eq!(edge_stake_raw(0.0, 1.05, 0.08), 0.0);
+        assert_eq!(edge_stake_raw(0.08, 1.05, 0.0), 0.0);
     }
 
     #[test]
