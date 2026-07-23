@@ -1379,6 +1379,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Order #12 B: a stale paper orphan (kline-labeled a winner) booked via
+    /// record_settled with source "paper_backfill" → exactly one recorded row, the
+    /// position removed from bs, the counter moved, and a repeat call is a no-op
+    /// (idempotent via the recorder set). This is the one-time orphan heal.
+    #[test]
+    fn order12_b_paper_backfill_books_and_removes() {
+        let path = tmp_path("backfill");
+        let _ = std::fs::remove_file(&path);
+        let bs = mk_bs(vec![bot_lot("tokbf", dec!(0.45), dec!(2.2))]);
+        let guards = mk_guards();
+        let mut recorder = PnlRecorder::load(&path).unwrap();
+        let oplog = mk_oplog();
+        // Stale orphan → booked from the kline label with the backfill source.
+        assert!(record_settled("tokbf", 1.0, "paper_backfill", &bs, &guards, &mut recorder, &oplog, t0()));
+        // Removed from bs (frees the exposure guard).
+        assert_eq!(bs.lock().unwrap().positions.len(), 0, "backfill must remove the orphan from bs");
+        // Exactly one recorded row persisted.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("\"recorded\"").count(), 1, "one pnl row");
+        // Winner → counter positive.
+        assert!(guards.lock().unwrap().daily_net_pnl() > Decimal::ZERO, "winner books positive net");
+        // Idempotent: re-booking the same token does nothing.
+        assert!(!record_settled("tokbf", 1.0, "paper_backfill", &bs, &guards, &mut recorder, &oplog, t0()),
+            "already-recorded orphan must not double-book");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Order #10 A: a correction must survive a restart — reloading the file and
     /// re-running the activity pass with the same disagreeing redeem must NOT write
     /// a second `corrected` row (the −$48.32 = 3 restarts × the same 3 corrections).

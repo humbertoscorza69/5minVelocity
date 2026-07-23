@@ -191,6 +191,12 @@ pub struct SharedState {
     /// normally (and self-corrects via activity). Prevents recal poisoning at ties.
     /// Value = |fin−open| bps of the near-tie (Order #8 A: reported on the deferral).
     pub v2_photofinish: DashMap<String, f64>,
+    /// Order #12 A — LIVE-mode defer-once dedup. A pf token stays in `bs` until the
+    /// activity payout books it, so the settlement sweep re-encounters it every pass
+    /// and (pre-fix) re-logged `v2_photofinish_book_deferred` each time (127k events
+    /// for 79 tokens). First-touch set: one deferral event per token, ever. Same
+    /// pattern as `canary_shadowed`. Live-only (paper books at the kline label now).
+    pub v2_defer_logged: DashMap<String, ()>,
     /// RE-ENTRY (Handoff #3 feature A): a market becomes eligible for ONE re-entry
     /// after a band-stop SELL. Keyed by "{asset}:{interval}:{epoch}" (stable per
     /// market, derivable at both stop time and decision time). Value =
@@ -241,6 +247,7 @@ impl SharedState {
             mid_ring: DashMap::new(),
             v2_stop_recal: DashMap::new(),
             v2_photofinish: DashMap::new(),
+            v2_defer_logged: DashMap::new(),
             v2_reentry: DashMap::new(),
             v2_market_entries: DashMap::new(),
             canary: std::sync::Mutex::new(crate::canary::Canary::new(crate::canary::CanaryConfig::default())),

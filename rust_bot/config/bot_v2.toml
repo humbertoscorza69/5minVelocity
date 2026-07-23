@@ -132,7 +132,15 @@ inval_stop_enabled = true
 # inval_stop_dry_run: when the stop is enabled, DRY-RUN first — compute + log every
 # would-fire (oplog "inval_stop" dry_run=true) but send NO sell, even 5m while armed.
 # Run ~1 day, confirm trigger fires on ~55% of positions, THEN set false to go live.
-inval_stop_dry_run = false
+# Order #12 C — VERDICT: back to DRY (true). The stop-probation gauge completed its
+# registered n=500 at net dEV −0.001/stop (338 saved / 162 whipsawed) — the re-
+# registered bar "rolling net dEV/stop > 0 over trailing 500" FAILED. The regime
+# floors (Order #10/#11) removed the chop population where the stop earned its keep;
+# what remains is value-neutral churn. Stop keeps evaluating + logging (dry A/B
+# gauge continues); positions HOLD to settle. Requires Order #12 A in the same
+# deploy (more positions reach settlement → pf ones must not orphan). Flip false to
+# re-arm live only if a future regime shifts the gauge back positive.
+inval_stop_dry_run = true
 # BID-BAND conditional stop (dynstop_study, 26 recorder days post-frozen-gate):
 # the stop only fires when the live bid is in an OVERPAY band (>= hi OR <= lo) —
 # the fair mid-band (0.30,0.50) has no stale-bid premium to harvest and whipsaws,

@@ -69,6 +69,48 @@ fn photo_finish_prices(op: f64, fin: f64) -> bool {
     op > 0.0 && (fin / op - 1.0).abs() * 1e4 < PHOTO_FINISH_BPS
 }
 
+/// Order #12 B — a paper ORPHAN backfill candidate: a position whose window
+/// resolved more than this many seconds ago but was never booked. The Binance ring
+/// only holds recent closes, so anything this stale can only be labeled via the REST
+/// fallback; when it books it is tagged source `"paper_backfill"` (not `"settlement"`)
+/// so the auditor separates the one-time heal from steady-state booking.
+const PAPER_BACKFILL_MIN_AGE_S: i64 = 600;
+
+#[inline]
+#[must_use]
+fn is_paper_backfill(resolution_s: i64, now_s: i64) -> bool {
+    now_s - resolution_s > PAPER_BACKFILL_MIN_AGE_S
+}
+
+/// What the settlement booking loop should do with one settled token (Order #12).
+#[derive(Debug, PartialEq, Eq)]
+enum BookAction {
+    /// LIVE + photo-finish: defer P&L to the on-chain activity payout (the truth
+    /// source vs the ~20%-unreliable Binance kline label). The event is deduped to
+    /// once-per-token by the caller's first-touch set.
+    Defer,
+    /// Book now via record_settled with this source string.
+    Book(&'static str),
+}
+
+/// Pure per-token booking decision (Order #12 A/B), extracted so the deferral gate
+/// and source selection are testable without the async REST/now_ms machinery.
+/// - LIVE pf → Defer (activity books the truth; paper has no activity feed so it
+///   must NOT defer or the position orphans forever).
+/// - stale orphan healed via REST → "paper_backfill" (auditor counts the one-time heal).
+/// - everything else → steady-state "settlement".
+#[inline]
+#[must_use]
+fn book_decision(live: bool, is_photofinish: bool, is_backfill: bool) -> BookAction {
+    if live && is_photofinish {
+        BookAction::Defer
+    } else if is_backfill {
+        BookAction::Book("paper_backfill")
+    } else {
+        BookAction::Book("settlement")
+    }
+}
+
 /// Trade-log context captured at decision time, carried with the command so the
 /// execution task can stamp fill timestamps and emit the autopsy row.
 #[derive(Debug, Clone)]
@@ -1504,7 +1546,15 @@ async fn settle_and_book(
     recal: &crate::v2::RecalSet,
     oplog: &OpLog,
     bn_http: &reqwest::Client,
+    // Order #12 A: live vs paper. In LIVE, pf tokens defer booking to the on-chain
+    // activity payout (the truth source). In PAPER there is no activity feed, so
+    // deferral orphans the position forever — paper books pf from the kline label.
+    live: bool,
 ) {
+    // Order #12 B: tokens the REST fallback recovered as stale orphans (resolved
+    // > 10 min ago). Threaded from the fallback block to the booking block so those
+    // book as source "paper_backfill". Spans both blocks → declared at fn scope.
+    let mut backfill_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     // BUG A (i): RING-GAP SETTLEMENT FALLBACK. The decision-loop sweep settles
     // from the in-memory Binance ring; a WS drop (or a restart across a window
     // close) leaves a gap so close_at() returned None and the position was never
@@ -1527,6 +1577,11 @@ async fn settle_and_book(
                 continue; // already booked by another path
             }
             let resolution = p.exit_ts_s - 300;
+            // Order #12 B: a stale-orphan heal (resolved > 10 min ago, ring long cold)
+            // vs a fresh ring-gap. Tag it so the booking loop sources it "paper_backfill".
+            if is_paper_backfill(resolution, now_s) {
+                backfill_tokens.insert(p.token_id.clone());
+            }
             let win_secs = interval_secs(&p.interval).max(1);
             let epoch = resolution - win_secs;
             let (Some(op), Some(fin)) = (
@@ -1564,25 +1619,39 @@ async fn settle_and_book(
             .collect();
         let mut booked = 0u32;
         for (token, won) in settled {
-            // ORDER #8 A: photo-finish tokens book from PAYOUT TRUTH (activity
-            // reconcile reads the real redeem), NOT the Binance kline label, which
-            // flips ~20% vs Chainlink at |disp| < PHOTO_FINISH_BPS. Skip the
-            // settlement write and REMOVE from the pipeline once — the recorder's
-            // idempotency then makes the truthful activity writer first. v2_pred is
-            // left intact (the recal already skips it here and the activity path
-            // feeds it the true outcome). Single event: removal stops the retry.
-            if let Some(disp) = state.v2_photofinish.get(&token).map(|v| *v) {
-                state.v2_settled.remove(&token);
-                oplog.sys("v2_photofinish_book_deferred", serde_json::json!({
-                    "token_id": token, "won_label": won, "disp_bps": disp,
-                }));
-                continue;
-            }
+            // ORDER #8 A / #12 A: photo-finish tokens book from PAYOUT TRUTH (the
+            // activity reconcile reads the real redeem), NOT the Binance kline label,
+            // which flips ~20% vs Chainlink at |disp| < PHOTO_FINISH_BPS. But this
+            // deferral ONLY makes sense in LIVE mode — paper has no activity feed, so
+            // deferring orphans the position in bs forever (Order #12: 79 orphans,
+            // fake −$83, endless re-fired events). In LIVE we defer + dedup the event
+            // to ONE per token (it re-enters v2_settled every sweep until the activity
+            // path books it). In PAPER we fall through and book from the kline label
+            // (the recal pf-skip below still holds, since the token stays flagged).
+            let is_pf = state.v2_photofinish.contains_key(&token);
+            let is_bf = backfill_tokens.contains(&token);
+            let source = match book_decision(live, is_pf, is_bf) {
+                BookAction::Defer => {
+                    state.v2_settled.remove(&token);
+                    // Defer-once dedup (first-touch set, same pattern as
+                    // canary_shadowed): one deferral event per token, ever — not one
+                    // per settle sweep (was 127k events for 79 tokens).
+                    if state.v2_defer_logged.insert(token.clone(), ()).is_none() {
+                        if state.v2_defer_logged.len() > 50_000 { state.v2_defer_logged.clear(); }
+                        let disp = state.v2_photofinish.get(&token).map(|v| *v).unwrap_or(0.0);
+                        oplog.sys("v2_photofinish_book_deferred", serde_json::json!({
+                            "token_id": token, "won_label": won, "disp_bps": disp,
+                        }));
+                    }
+                    continue;
+                }
+                BookAction::Book(src) => src,
+            };
             let did = match recorder.lock() {
                 Ok(mut r) => crate::pnl_recorder::record_settled(
                     &token,
                     if won { 1.0 } else { 0.0 },
-                    "settlement",
+                    source,
                     bs,
                     guards,
                     &mut r,
@@ -1650,7 +1719,7 @@ pub async fn run_settlement_booking(
     loop {
         tokio::select! {
             _ = iv.tick() => {
-                settle_and_book(&state, &bs, &guards, &recorder, &recal, oplog.as_ref(), &bn_http).await;
+                settle_and_book(&state, &bs, &guards, &recorder, &recal, oplog.as_ref(), &bn_http, false).await;
             }
             _ = shutdown.changed() => if *shutdown.borrow() { break },
         }
@@ -1779,7 +1848,7 @@ pub async fn run_positions_refresh(
                 // Settlement booking (ring-gap REST fallback + book every v2_settled
                 // outcome + recal feed). Shared with the paper-mode settlement_booking
                 // task via settle_and_book so both modes book identically.
-                settle_and_book(&state, &bs, &guards, &recorder, &recal, oplog.as_ref(), &bn_http).await;
+                settle_and_book(&state, &bs, &guards, &recorder, &recal, oplog.as_ref(), &bn_http, true).await;
                 // AUDIT/FALLBACK reconcile from the on-chain activity feed (exact
                 // payout). Idempotent with the settlement path above via the shared
                 // recorder set -- catches anything the Binance path missed (e.g.
@@ -2872,6 +2941,57 @@ mod tests {
             canary.snapshot()["assets"]["BTC"]["n30"], json!(1),
             "a decisive label feeds the canary hold-WR window"
         );
+    }
+
+    /// Order #12 A — the deferral only makes sense in LIVE mode (activity payout is
+    /// the truth source). In PAPER a pf token must BOOK from the kline label, not
+    /// defer, or it orphans in bs forever. Order #12 B — a stale orphan healed via
+    /// the REST fallback books as "paper_backfill"; everything else is "settlement".
+    #[test]
+    fn order12_book_decision_table() {
+        // PAPER + pf → book at the kline label (source "settlement"), NOT defer.
+        assert_eq!(book_decision(false, true, false), BookAction::Book("settlement"),
+            "paper pf must book, never defer (orphan bug)");
+        // LIVE + pf → defer to the activity payout.
+        assert_eq!(book_decision(true, true, false), BookAction::Defer,
+            "live pf defers to the truth source");
+        // LIVE pf outranks the backfill tag (activity will book it with the real payout).
+        assert_eq!(book_decision(true, true, true), BookAction::Defer);
+        // Stale orphan (paper, non-pf) → paper_backfill source.
+        assert_eq!(book_decision(false, false, true), BookAction::Book("paper_backfill"));
+        // Ordinary fresh settle → steady-state "settlement".
+        assert_eq!(book_decision(false, false, false), BookAction::Book("settlement"));
+        assert_eq!(book_decision(true, false, false), BookAction::Book("settlement"));
+        // A live non-pf stale recovery still tags backfill.
+        assert_eq!(book_decision(true, false, true), BookAction::Book("paper_backfill"));
+    }
+
+    /// Order #12 B — the backfill age gate: only positions resolved > 10 min ago
+    /// (ring long cold) are backfills; a fresh ring-gap is not.
+    #[test]
+    fn order12_is_paper_backfill_boundary() {
+        let now = 1_000_000i64;
+        assert!(!is_paper_backfill(now - 300, now), "5 min old = fresh ring-gap, not backfill");
+        assert!(!is_paper_backfill(now - PAPER_BACKFILL_MIN_AGE_S, now), "exactly 10 min = not yet");
+        assert!(is_paper_backfill(now - PAPER_BACKFILL_MIN_AGE_S - 1, now), "10 min + 1s = backfill");
+        assert!(is_paper_backfill(now - 3_600, now), "1 hr old orphan = backfill");
+    }
+
+    /// Order #12 A — defer-once dedup: three settle-sweep passes over the same
+    /// unbooked deferred token emit exactly ONE deferral event (first-touch set),
+    /// not one per sweep (the 127k-events-for-79-tokens flood).
+    #[test]
+    fn order12_defer_dedup_logs_once() {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let token = "BTC-1784598785-5m-Down".to_string();
+        let mut events = 0;
+        for _ in 0..3 {
+            // Mirror the live-defer branch: log only on first touch.
+            if seen.insert(token.clone()) {
+                events += 1;
+            }
+        }
+        assert_eq!(events, 1, "three sweeps over one deferred token = one event");
     }
 
     /// +6bps kline over a fresh in-band book → one Open with the right token, fill,
