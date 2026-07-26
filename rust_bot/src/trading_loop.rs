@@ -707,6 +707,20 @@ pub async fn run_decision_task(
     info!(%config_hash, %era, "decision_loop: config era");
     oplog.sys("decision_loop_start", serde_json::json!({
         "config_hash": config_hash, "era": era,
+        // ORDER #14 D: the EFFECTIVE (post-controls.json-override) values actually in
+        // force. `era` above is built from the CONFIG, which is exactly how the whole
+        // audition looked dry while the stop was selling for real. Log analysis should
+        // read these, not infer from the toml.
+        "effective": {
+            "trading_enabled": controls.enabled(),
+            "base_usd": controls.base_usd(),
+            "max_pos": controls.max_pos_usd(),
+            "base_usd_15m": controls.base_usd_15m(),
+            "max_pos_15m": controls.max_pos_15m(),
+            "inval_stop_on": controls.inval_stop_on(),
+            "inval_stop_dry": controls.inval_stop_dry(),
+            "reentry_opp_on": controls.reentry_opp_on(),
+        },
     }));
     if vcfg.enabled {
         info!(edge_min = vcfg.edge_min, vol_cap = vcfg.vol_cap, dvr_floor = vcfg.dvr_floor,
@@ -1041,6 +1055,15 @@ pub async fn run_decision_task(
                     // Operator OFF switch (dashboard): pause NEW entries. Open
                     // positions still exit/redeem; the price history still updates.
                     if !controls.enabled() {
+                        history.push(&kline.asset, kline.t_s, kline.close);
+                        continue;
+                    }
+                    // ORDER #14 C: FEED-WATCHDOG HALT. No new opens while the Binance
+                    // feed is dead or still inside its post-recovery warmup — a
+                    // partially refilled ring yields a bogus vol denominator (and so a
+                    // bogus z). Exits, stops, settlement and redemption are unaffected.
+                    // The history push keeps the ring refilling during the warmup.
+                    if state.entries_halted() {
                         history.push(&kline.asset, kline.t_s, kline.close);
                         continue;
                     }

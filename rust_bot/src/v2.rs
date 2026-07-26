@@ -682,6 +682,49 @@ pub struct ControlsSnapshot {
 #[must_use]
 fn default_true() -> bool { true }
 
+/// ORDER #14 D — one field where the persisted `controls.json` disagrees with the
+/// config file. The 2026-07-25 export showed `inval_stop_dry:false` in controls.json
+/// silently overriding Order #12 C's `inval_stop_dry_run = true` in bot_v2.toml: the
+/// stop fired real paper sells for the whole audition while the config said dry.
+/// The override is legitimate (operator settings must survive restarts) — what was
+/// missing is that it was INVISIBLE. This makes it loud, without changing precedence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlOverride {
+    pub field: &'static str,
+    pub config: String,
+    pub control: String,
+}
+
+/// Every field where the persisted controls differ from the config defaults.
+/// Empty when they agree. Pure — the caller decides how to shout about it.
+#[must_use]
+pub fn control_overrides(cfg: &ControlsSnapshot, ctl: &ControlsSnapshot) -> Vec<ControlOverride> {
+    let mut out = Vec::new();
+    let mut cmp_b = |field: &'static str, c: bool, k: bool| {
+        if c != k {
+            out.push(ControlOverride { field, config: c.to_string(), control: k.to_string() });
+        }
+    };
+    cmp_b("trading_enabled", cfg.trading_enabled, ctl.trading_enabled);
+    cmp_b("inval_stop_on", cfg.inval_stop_on, ctl.inval_stop_on);
+    cmp_b("inval_stop_dry", cfg.inval_stop_dry, ctl.inval_stop_dry);
+    cmp_b("reentry_opp_on", cfg.reentry_opp_on, ctl.reentry_opp_on);
+    let mut cmp_f = |field: &'static str, c: f64, k: f64| {
+        if (c - k).abs() > 1e-9 {
+            out.push(ControlOverride {
+                field,
+                config: format!("{c:.2}"),
+                control: format!("{k:.2}"),
+            });
+        }
+    };
+    cmp_f("base_usd", cfg.base_usd, ctl.base_usd);
+    cmp_f("max_pos", cfg.max_pos, ctl.max_pos);
+    cmp_f("base_usd_15m", cfg.base_usd_15m, ctl.base_usd_15m);
+    cmp_f("max_pos_15m", cfg.max_pos_15m, ctl.max_pos_15m);
+    out
+}
+
 /// Load a persisted controls snapshot from `path` (None if missing/unparseable).
 #[must_use]
 pub fn load_controls(path: &str) -> Option<ControlsSnapshot> {
@@ -1073,6 +1116,47 @@ mod tests {
         // Cold start: window-open is BEFORE any history (earliest bar = 999) →
         // can't price the open → None (the correct skip).
         assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0, &CAL_Z, &CAL_W, 60).is_none());
+    }
+
+    /// ORDER #14 B/C — VERIFICATION of the post-reconnect COLD RING, which the order
+    /// asked be confirmed. Result: two of the three layers hold, one does NOT.
+    ///
+    ///  1. A ring with < 2 closes cannot produce an intent at all: `vol_bps` needs two
+    ///     samples, and `features()` propagates that `None` with `?`. STRUCTURAL. ✔
+    ///  2. `frozen_tape_secs` does NOT protect a partial ring. `secs_since_change`
+    ///     returns `k-1` when it runs OUT of history (v2.rs:420), so a freshly
+    ///     refilled ring reads `tick_age = 0` — indistinguishable from "the tape just
+    ///     ticked", and it even earns the ×1.25 tick-age sizing multiplier. ✘
+    ///     (The order assumed this gate covered the case; it does not.)
+    ///  3. Therefore the load-bearing protection is the Order #14 C warmup halt (no
+    ///     entries until a full `vol_lookback_s` of fresh klines), backed by
+    ///     `vol60_floor`, which rejects the near-zero vol a thin ring produces.
+    #[test]
+    fn order14_cold_ring_cannot_trade_but_frozen_tape_is_not_what_stops_it() {
+        let mut h = PriceHistory::new(1024);
+        // A single bar, exactly as after a reconnect.
+        h.push("BTC", 1_000, 100.0);
+        // (1) One sample → no vol → no features → no intent. The structural floor.
+        assert!(
+            h.features("BTC", 1_000, 1_000, 120.0, true, 0.60, 0.0, &CAL_Z, &CAL_W, 60).is_none(),
+            "a 1-bar ring must not be tradable"
+        );
+        // (2) THE GAP: the cold ring reads as a freshly-moving tape, not a frozen one.
+        assert_eq!(
+            h.secs_since_change("BTC", 1_000, 10),
+            0,
+            "running out of history reports age 0 — frozen_tape_secs=3 would NOT block, \
+             and tick_age==0 even grants the x1.25 sizing multiplier"
+        );
+        // (3) A partial ring (3 bars) DOES yield features — computed on 3 samples
+        // instead of 60. This is the untrustworthy z the warmup halt exists to prevent.
+        h.push("BTC", 1_001, 100.02);
+        h.push("BTC", 1_002, 100.01);
+        let partial = h.features("BTC", 1_001, 1_002, 120.0, true, 0.60, 0.0, &CAL_Z, &CAL_W, 60);
+        assert!(
+            partial.is_some(),
+            "a 3-bar ring computes a vol from 3 samples — hence Order #14 C's warmup halt"
+        );
     }
 
     /// Order #7 Part A: the recalibrator must be fed the RAW curve output (p_raw),

@@ -56,6 +56,19 @@ polymarket_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws"
 polymarket_rest_url = "https://clob.polymarket.com"
 reconnect_max_attempts_per_60s = 5
 connect_timeout_s = 10
+# ORDER #14 — BINANCE FEED WATCHDOG. On 2026-07-25 02:26 UTC the Binance socket went
+# half-open (server gone, no FIN/RST) and the read loop, which had no timeout branch,
+# parked forever: 45 HOURS with zero klines and zero decisions while the bot reported
+# healthy=true, binance_connected=true, and never attempted a reconnect.
+#   binance_idle_timeout_s: break the session (→ existing reconnect path) after this
+#     many seconds with no INBOUND frame of any kind. Normal gap is <1s and the server
+#     pings every ~20s, so 30 is ~30x headroom. Floored at 5s in code.
+#   binance_feed_dead_ms: no kline for this long ⇒ feed DEAD ⇒ health false, feed_dead
+#     event, NEW ENTRIES HALTED (exits/stops/settlement continue). Entries resume only
+#     after a full vol-lookback warmup of fresh klines. Twin of the PM-side
+#     guards.rs feed_dead_ms (30_000). 0 disables the guard — do not.
+binance_idle_timeout_s = 30
+binance_feed_dead_ms = 60000
 polymarket_gamma_url = "https://gamma-api.polymarket.com"
 
 [logging]

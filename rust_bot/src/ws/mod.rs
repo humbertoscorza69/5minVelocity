@@ -399,6 +399,10 @@ pub async fn stats_loop(state: Shared, mut shutdown: watch::Receiver<bool>) {
                     bn_connected = state.binance_connected.load(Ordering::Relaxed),
                     pm_connected = state.polymarket_connected.load(Ordering::Relaxed),
                     healthy = state.is_healthy(),
+                    // ORDER #14 B: the number whose absence hid a 45-hour outage. A
+                    // healthy feed reads < 5; the incident would have read 162,000.
+                    bn_kline_age_s = state.feed_stale_ms(now_ms()) / 1000,
+                    entries_halted = state.entries_halted(),
                     bn_msgs = c.binance_msgs.load(Ordering::Relaxed),
                     bn_klines = c.binance_klines.load(Ordering::Relaxed),
                     bn_aggtrades = c.binance_aggtrades.load(Ordering::Relaxed),

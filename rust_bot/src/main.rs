@@ -18,6 +18,7 @@ mod discovery;
 mod events;
 mod exec;
 mod exit_rules;
+mod feed_watchdog;
 mod guards;
 mod hold_recovery;
 mod idempotency;
@@ -802,6 +803,18 @@ async fn main() -> anyhow::Result<()> {
         ..canary::CanaryConfig::default()
     });
     info!(canary_enabled = config.v2.canary_enabled, "regime canary configured");
+    // ORDER #14 B: arm the Binance feed-liveness guard. Until this is set the check
+    // is disabled (0), which is what keeps pure-WS/ingestion tests unaffected — so
+    // this line is what makes health measure DATA in every real run.
+    state.feed_dead_ms.store(
+        config.connections.binance_feed_dead_ms,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    info!(
+        feed_dead_ms = config.connections.binance_feed_dead_ms,
+        idle_timeout_s = config.connections.binance_idle_timeout_s,
+        "binance feed watchdog armed (Order #14)"
+    );
     if config.v2.tick_driven {
         info!(throttle_ms = config.v2.tick_throttle_ms,
             "v2 TICK-DRIVEN entry ENABLED — decisions fire on sub-second aggTrades");
@@ -1142,10 +1155,36 @@ async fn main() -> anyhow::Result<()> {
         // SURVIVE restarts (systemd auto-restart / reboot / redeploy). Config values
         // above are only the first-boot fallback.
         let controls_path = "data/v2/controls.json".to_string();
+        // ORDER #14 D: what the CONFIG asked for, captured before the persisted file
+        // is applied over it. Used to make any override visible (never to win).
+        let config_controls = controls_shared.snapshot();
         if let Some(snap) = v2::load_controls(&controls_path) {
             controls_shared.apply_snapshot(&snap);
             info!(?snap, "controls: restored persisted operator settings from {controls_path}");
+            // ORDER #14 D: controls.json legitimately outranks config (operator
+            // settings must survive restarts) — but silently. `inval_stop_dry:false`
+            // overrode Order #12 C's config `true` for the entire audition and the
+            // stop fired real paper sells while every log said it was dry. Precedence
+            // is UNCHANGED; the divergence is now shouted, per field, with both values.
+            let overrides = v2::control_overrides(&config_controls, &snap);
+            for o in &overrides {
+                warn!(
+                    field = o.field, config = %o.config, control = %o.control,
+                    "controls_override: controls.json is OVERRIDING the config file"
+                );
+                oplog_shared.sys("controls_override", serde_json::json!({
+                    "field": o.field, "config": o.config, "control": o.control,
+                    "source": controls_path,
+                }));
+            }
+            if overrides.is_empty() {
+                info!("controls: persisted settings agree with config (no overrides)");
+            }
         }
+        // The values actually in force after the restore — logged once so any future
+        // analysis reads the REAL running config instead of inferring it from the toml.
+        let effective_controls = controls_shared.snapshot();
+        info!(?effective_controls, "controls: EFFECTIVE values in force");
         let mut handles: Vec<JoinHandle<()>> = vec![
             tokio::spawn(trading_loop::run_decision_task(
                 state.clone(),
@@ -1207,6 +1246,7 @@ async fn main() -> anyhow::Result<()> {
                 config.dashboard.port,
                 state::now_ms(),
                 config.v2.stake_mult_cap, // Order #13 A: sizing-clip WARN threshold
+                config_controls.clone(),  // Order #14 D: config-vs-controls divergence
                 shutdown_rx.clone(),
             )));
         }
@@ -1292,6 +1332,23 @@ async fn main() -> anyhow::Result<()> {
                 recal_shared.clone(),
                 oplog_shared.clone(),
                 Duration::from_secs(30),
+                shutdown_rx.clone(),
+            )));
+        }
+        // ORDER #14 C: feed watchdog — BOTH modes. Halts new entries while the
+        // Binance feed is dead and through the post-recovery warmup, records the
+        // outage in the oplog, and escalates to an alert file past 10 min. Warmup is
+        // the LARGEST vol lookback across intervals so both 5m and 15m see a full
+        // ring before they are allowed to compute z again.
+        {
+            let warmup_s = config.v2.vol_lookback_s.max(config.v2.i15m.vol_lookback_s);
+            info!(warmup_s, "spawning feed_watchdog task (Order #14 C)");
+            handles.push(tokio::spawn(feed_watchdog::run_feed_watchdog(
+                state.clone(),
+                oplog_shared.clone(),
+                config.paths.alert_dir.clone(),
+                warmup_s,
+                Duration::from_secs(5),
                 shutdown_rx.clone(),
             )));
         }

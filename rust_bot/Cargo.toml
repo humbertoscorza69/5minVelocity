@@ -58,3 +58,9 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.7"
+
+[dev-dependencies]
+# `test-util` gives tokio::time::pause()/advance() so the Order #14 A idle-watchdog
+# tests drive 30s+ of virtual time instantly. Test-only: the release binary never
+# links it (dev-dependency features do not leak into the normal build).
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

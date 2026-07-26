@@ -599,6 +599,22 @@ pub struct ConnectionsConfig {
     /// forever and leaving the bot silently dead while reporting healthy.
     #[serde(default = "default_connect_timeout_s")]
     pub connect_timeout_s: u64,
+    /// ORDER #14 A — Binance WS IDLE WATCHDOG. Break the session (→ reconnect) when
+    /// no inbound frame has arrived for this many seconds. Guards the half-open
+    /// socket that ran the bot blind for 45 h on 2026-07-25 while it reported
+    /// healthy: with no timeout branch, `read.next()` on a dead-but-unclosed TCP
+    /// connection never resolves. Normal inter-message gap is well under 1s and the
+    /// server pings every ~20s, so 30 is ~30× headroom and still 5,400× faster than
+    /// that incident. Floored at 5s in code.
+    #[serde(default = "default_binance_idle_timeout_s")]
+    pub binance_idle_timeout_s: u64,
+    /// ORDER #14 B/C — the feed is DEAD when no Binance kline has arrived for this
+    /// many ms: health goes false, `feed_dead` is emitted, and NEW ENTRIES halt
+    /// (exits/settlement untouched). Twin of the PM-side `guards.rs feed_dead_ms`
+    /// (30_000) which already existed for the price_change feed. 60_000 leaves room
+    /// for one reconnect cycle before the halt trips. `0` disables the guard.
+    #[serde(default = "default_binance_feed_dead_ms")]
+    pub binance_feed_dead_ms: i64,
     /// Polymarket Gamma API base (REST market discovery). The dynamic
     /// market-discovery task lists active 5m/15m up/down markets here.
     #[serde(default = "default_gamma_url")]
@@ -607,6 +623,14 @@ pub struct ConnectionsConfig {
 
 fn default_connect_timeout_s() -> u64 {
     10
+}
+
+fn default_binance_idle_timeout_s() -> u64 {
+    30
+}
+
+fn default_binance_feed_dead_ms() -> i64 {
+    60_000
 }
 
 fn default_gamma_url() -> String {

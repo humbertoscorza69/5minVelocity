@@ -55,6 +55,9 @@ pub async fn run(state: Shared, cfg: Config, shutdown: watch::Receiver<bool>, lo
 
     let policy = ReconnectPolicy::from_config(cfg.connections.reconnect_max_attempts_per_60s);
     let connect_timeout = Duration::from_secs(cfg.connections.connect_timeout_s);
+    // ORDER #14 A: idle watchdog threshold. Floor at 5s so a fat-fingered config
+    // can't make it fire on normal jitter.
+    let idle_limit = Duration::from_secs(cfg.connections.binance_idle_timeout_s.max(5));
     let alert_dir = cfg.paths.alert_dir.clone();
     let loop_state = state.clone();
 
@@ -79,6 +82,7 @@ pub async fn run(state: Shared, cfg: Config, shutdown: watch::Receiver<bool>, lo
                     &logger,
                     &mut shutdown,
                     connect_timeout,
+                    idle_limit,
                 )
                 .await
             }
@@ -96,6 +100,7 @@ async fn session(
     logger: &EventLogger,
     shutdown: &mut watch::Receiver<bool>,
     connect_timeout: Duration,
+    idle_limit: Duration,
 ) -> SessionEnd {
     let ws = match connect_with_timeout(url, connect_timeout).await {
         Ok(ws) => ws,
@@ -125,7 +130,69 @@ async fn session(
         }
     }
 
-    let end = loop {
+    let end = read_until_end(
+        &mut read,
+        &mut write,
+        state,
+        logger,
+        shutdown,
+        idle_limit,
+        Duration::from_secs(KEEPALIVE_SECS),
+    )
+    .await;
+
+    state.binance_connected.store(false, Ordering::Relaxed);
+    end
+}
+
+/// Client keepalive period. Mirrors the Polymarket client (cc61a53): proactively
+/// pinging turns some silent half-open sockets into an observable WRITE error, an
+/// independent detector alongside the idle watchdog below.
+const KEEPALIVE_SECS: u64 = 15;
+
+/// ORDER #14 A — the read loop, with an IDLE WATCHDOG.
+///
+/// The 2026-07-25 incident: the Binance socket went half-open (server gone, no FIN,
+/// no RST — the classic cloud/NAT idle drop). Every exit path here required the
+/// stream to *produce* something (error / close frame / EOF), so `read.next()` never
+/// resolved and this loop parked forever: 45 hours, zero klines, zero decisions,
+/// `binance_connected=true`, `healthy=true`, no reconnect, no alert.
+///
+/// The fix is the `ticker` arm: track the instant of the last INBOUND frame (any
+/// frame — text, ping, pong, binary) and break `SessionEnd::Lost` once it exceeds
+/// `idle_limit`, which puts the session on the existing, proven reconnect path.
+///
+/// Sizing: 2 symbols × 1s klines + aggTrades means the normal inter-message gap is
+/// well under a second, and Binance's server pings every ~20s even on a silent tape
+/// — so a 30s default is ~30× the normal gap yet safely above the ping interval.
+///
+/// Split out of `session` (which owns the connect) so the watchdog is unit-testable
+/// against a synthetic stream. Uses `tokio::time::Instant` (NOT `std::time::Instant`)
+/// so `tokio::time::pause()` drives the tests deterministically.
+async fn read_until_end<R, W, E>(
+    read: &mut R,
+    write: &mut W,
+    state: &Shared,
+    logger: &EventLogger,
+    shutdown: &mut watch::Receiver<bool>,
+    idle_limit: Duration,
+    keepalive_every: Duration,
+) -> SessionEnd
+where
+    R: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    W: futures_util::Sink<Message, Error = E> + Unpin,
+{
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut keepalive = tokio::time::interval(keepalive_every);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // First tick of a tokio interval completes immediately — burn both so neither
+    // fires before any real time has passed.
+    ticker.tick().await;
+    keepalive.tick().await;
+    let mut last_frame = tokio::time::Instant::now();
+
+    loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -133,23 +200,40 @@ async fn session(
                     break SessionEnd::Shutdown;
                 }
             }
-            msg = read.next() => match msg {
-                Some(Ok(Message::Text(txt))) => handle_text(&txt, state, logger),
-                Some(Ok(Message::Ping(payload))) => {
-                    let _ = write.send(Message::Pong(payload)).await;
+            _ = ticker.tick() => {
+                let idle = last_frame.elapsed();
+                if idle >= idle_limit {
+                    warn!(
+                        ws = "binance_ws", idle_s = idle.as_secs(),
+                        "ws_idle_timeout: no inbound frame — treating socket as dead"
+                    );
+                    break SessionEnd::Lost(format!("idle timeout: no frame for {}s", idle.as_secs()));
                 }
-                Some(Ok(Message::Close(frame))) => {
-                    break SessionEnd::Lost(format!("server close: {frame:?}"));
+            }
+            _ = keepalive.tick() => {
+                if write.send(Message::Ping(Default::default())).await.is_err() {
+                    break SessionEnd::Lost("keepalive ping send failed".into());
                 }
-                Some(Ok(_)) => {} // Pong / Binary / Frame — ignore
-                Some(Err(e)) => break SessionEnd::Lost(format!("read error: {e}")),
-                None => break SessionEnd::Lost("stream ended".into()),
+            }
+            msg = read.next() => {
+                // EVERY inbound frame refreshes the watchdog, including Ping/Pong —
+                // liveness is what we are measuring, not payload usefulness.
+                last_frame = tokio::time::Instant::now();
+                match msg {
+                    Some(Ok(Message::Text(txt))) => handle_text(&txt, state, logger),
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = write.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        break SessionEnd::Lost(format!("server close: {frame:?}"));
+                    }
+                    Some(Ok(_)) => {} // Pong / Binary / Frame — ignore
+                    Some(Err(e)) => break SessionEnd::Lost(format!("read error: {e}")),
+                    None => break SessionEnd::Lost("stream ended".into()),
+                }
             }
         }
-    };
-
-    state.binance_connected.store(false, Ordering::Relaxed);
-    end
+    }
 }
 
 /// Parse one Binance text frame and update shared state + the event log.
@@ -255,6 +339,10 @@ fn handle_text(txt: &str, state: &Shared, logger: &EventLogger) {
                 e.updated_ms = recv;
             }
             state.counters.binance_klines.fetch_add(1, Ordering::Relaxed);
+            // ORDER #14 B: DATA liveness. The counter above is what froze (identical
+            // value for 45 h) while `binance_connected` still read true; this stamp is
+            // what makes that condition observable to health + the feed watchdog.
+            state.last_kline_ms.store(recv, Ordering::Relaxed);
             // Phase 6 D1: feed FINALIZED bars to the decision loop (open-second keyed,
             // matching the Capa B replay's `t_open_ms / 1000`). `kline_tx` is unset in
             // ingestion-only runs, so this is a no-op there.
@@ -279,5 +367,131 @@ fn handle_text(txt: &str, state: &Shared, logger: &EventLogger) {
             });
         }
         other => debug!(ws = "binance_ws", etype = other, "unhandled binance event"),
+    }
+}
+
+#[cfg(test)]
+mod order14_tests {
+    use super::*;
+    use crate::state::SharedState;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    fn logger() -> EventLogger {
+        // Disabled logger: returns before touching the filesystem.
+        crate::events::spawn(std::path::Path::new("unused"), false).unwrap().0
+    }
+
+    /// ORDER #14 A — THE REGRESSION TEST FOR THE 45-HOUR OUTAGE.
+    /// A half-open socket produces nothing at all: no error, no close frame, no EOF.
+    /// Before the watchdog, `read.next()` never resolved and this loop parked forever
+    /// while the bot reported healthy. Now it must break `Lost("idle timeout…")` and
+    /// hand the session to the existing (proven) reconnect path.
+    /// `start_paused` auto-advances virtual time, so 30s elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_breaks_a_half_open_session() {
+        let state = SharedState::new();
+        let lg = logger();
+        let (_tx, mut rx) = watch::channel(false);
+        // The exact incident shape: a stream that never yields anything, ever.
+        let mut read = futures_util::stream::pending::<Result<Message, WsError>>();
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let end = read_until_end(
+            &mut read, &mut write, &state, &lg, &mut rx,
+            Duration::from_secs(30), Duration::from_secs(15),
+        ).await;
+
+        match end {
+            SessionEnd::Lost(r) => assert!(
+                r.contains("idle timeout"),
+                "half-open socket must end as an idle timeout, got: {r}"
+            ),
+            SessionEnd::Refresh => panic!("expected Lost(idle timeout), got Refresh"),
+            SessionEnd::Shutdown => panic!("expected Lost(idle timeout), got Shutdown"),
+        }
+        // And the session must mark the feed disconnected on the way out (the caller
+        // does this; here we assert the watchdog didn't silently keep it "connected").
+        assert!(!state.binance_connected.load(Ordering::Relaxed));
+    }
+
+    /// Regression against a TOO-TIGHT threshold: a live-but-quiet socket that delivers
+    /// a frame every idle_limit/2 must NEVER trip the watchdog. It ends only when the
+    /// stream genuinely ends. (Binance server-pings every ~20s even on a silent tape,
+    /// which is why 30s is safe.)
+    #[tokio::test(start_paused = true)]
+    async fn frames_at_half_the_limit_never_time_out() {
+        let state = SharedState::new();
+        let lg = logger();
+        let (_tx, mut rx) = watch::channel(false);
+        // A subscribe-ack every 15s, ten times, then EOF.
+        let mut read = Box::pin(futures_util::stream::unfold(0u32, |i| async move {
+            if i >= 10 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Some((Ok(Message::Text(r#"{"result":null,"id":1}"#.into())), i + 1))
+        }));
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let end = read_until_end(
+            &mut read, &mut write, &state, &lg, &mut rx,
+            Duration::from_secs(30), Duration::from_secs(15),
+        ).await;
+
+        match end {
+            SessionEnd::Lost(r) => assert!(
+                r.contains("stream ended") && !r.contains("idle timeout"),
+                "a frame every idle/2 must not trip the watchdog; got: {r}"
+            ),
+            SessionEnd::Refresh => panic!("expected Lost(stream ended), got Refresh"),
+            SessionEnd::Shutdown => panic!("expected Lost(stream ended), got Shutdown"),
+        }
+    }
+
+    /// A PING counts as liveness (the watchdog measures frames, not payloads) — a
+    /// tape so quiet that only server pings arrive must stay connected.
+    #[tokio::test(start_paused = true)]
+    async fn server_pings_alone_hold_the_session_open() {
+        let state = SharedState::new();
+        let lg = logger();
+        let (_tx, mut rx) = watch::channel(false);
+        let mut read = Box::pin(futures_util::stream::unfold(0u32, |i| async move {
+            if i >= 5 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(20)).await; // Binance's ~20s ping
+            Some((Ok(Message::Ping(Default::default())), i + 1))
+        }));
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let end = read_until_end(
+            &mut read, &mut write, &state, &lg, &mut rx,
+            Duration::from_secs(30), Duration::from_secs(15),
+        ).await;
+
+        match end {
+            SessionEnd::Lost(r) => assert!(
+                !r.contains("idle timeout"),
+                "server pings must refresh the watchdog; got: {r}"
+            ),
+            _ => panic!("expected Lost(stream ended)"),
+        }
+    }
+
+    /// Shutdown still wins over the watchdog (graceful stop must not look like a loss).
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_beats_the_watchdog() {
+        let state = SharedState::new();
+        let lg = logger();
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).unwrap();
+        let mut read = futures_util::stream::pending::<Result<Message, WsError>>();
+        let mut write = futures_util::sink::drain::<Message>();
+
+        let end = read_until_end(
+            &mut read, &mut write, &state, &lg, &mut rx,
+            Duration::from_secs(30), Duration::from_secs(15),
+        ).await;
+        assert!(matches!(end, SessionEnd::Shutdown), "shutdown must not report Lost");
     }
 }

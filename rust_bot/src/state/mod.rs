@@ -148,6 +148,29 @@ pub struct SharedState {
     /// bar close. `tick_throttle_ms` bounds the rate. Set from config at startup.
     pub tick_driven: AtomicBool,
     pub tick_throttle_ms: AtomicI64,
+    /// ORDER #14 B — DATA liveness. Wall-clock ms of the last Binance kline actually
+    /// parsed. `binance_connected` only records "a socket was opened and we haven't
+    /// seen it fail", which stayed `true` through a 45-hour dead feed (2026-07-25);
+    /// THIS is the signal that says the feed is delivering. Stamped in
+    /// `ws::binance::handle_text` beside the `binance_klines` counter.
+    pub last_kline_ms: AtomicI64,
+    /// Staleness threshold (ms) above which the feed counts as DEAD in
+    /// [`Shared::is_healthy`]. `0` = disabled, which is the default so pure-WS and
+    /// ingestion-only tests (which never feed klines) are unaffected; `main` sets it
+    /// from `connections.binance_feed_dead_ms` (default 60_000) in every trading run.
+    /// The PM-side twin already existed as `guards.rs feed_dead_ms`; this is the
+    /// Binance-side one, which never did.
+    pub feed_dead_ms: AtomicI64,
+    /// ORDER #14 C — entry halt latched by the feed watchdog while the Binance feed
+    /// is dead (and through the post-recovery warmup). Read by the decision loop to
+    /// block NEW OPENS only: exits, stops, settlement and redemption are untouched,
+    /// and this is deliberately NOT the operator's `Controls::trading_enabled` (which
+    /// is persisted — auto-restoring it could resurrect trading a human had paused).
+    pub feed_halt: AtomicBool,
+    /// Wall-clock ms at which the feed last transitioned back to live. The watchdog
+    /// keeps `feed_halt` set until `vol_lookback_s` of fresh klines have accumulated,
+    /// so z/vol are never computed on a partially-refilled ring. `0` = never stale.
+    pub feed_recovered_ms: AtomicI64,
     /// Wallet USDC balance in milli-dollars (balance * 1000), refreshed by
     /// `run_positions_refresh` every cycle. `-1` = not yet known (paper mode, or
     /// before the first REST balance fetch). Read by the dashboard.
@@ -240,6 +263,13 @@ impl SharedState {
             kline_tx: OnceLock::new(),
             tick_driven: AtomicBool::new(false),
             tick_throttle_ms: AtomicI64::new(200),
+            // Stamped "now" at construction so the first staleness window is measured
+            // from process start, not from the epoch (which would read as instantly
+            // dead). `feed_dead_ms: 0` keeps the check disabled until main wires it.
+            last_kline_ms: AtomicI64::new(now_ms()),
+            feed_dead_ms: AtomicI64::new(0),
+            feed_halt: AtomicBool::new(false),
+            feed_recovered_ms: AtomicI64::new(0),
             balance_milli: AtomicI64::new(-1),
             v2_pred: DashMap::new(),
             v2_settled: DashMap::new(),
@@ -271,8 +301,32 @@ impl SharedState {
         self.health_failed.store(false, Ordering::Relaxed);
     }
 
+    /// ORDER #14 B — age (ms) of the newest Binance kline. Negative clock skew is
+    /// clamped to 0. This is the number the 45-hour outage had no way to express.
+    pub fn feed_stale_ms(&self, now: i64) -> i64 {
+        (now - self.last_kline_ms.load(Ordering::Relaxed)).max(0)
+    }
+
+    /// Is the Binance feed DEAD (no kline for longer than the configured threshold)?
+    /// Always false when the threshold is 0 (disabled — see [`Shared::feed_dead_ms`]).
+    pub fn feed_is_dead(&self, now: i64) -> bool {
+        let limit = self.feed_dead_ms.load(Ordering::Relaxed);
+        limit > 0 && self.feed_stale_ms(now) > limit
+    }
+
+    /// Health = the supervisor saw no session failure AND the feed is actually
+    /// DELIVERING DATA. The second clause is Order #14 B: `health_failed` is only
+    /// ever set on an *observed* session failure, so a half-open socket that never
+    /// errors kept this `true` for 45 hours while zero klines arrived.
     pub fn is_healthy(&self) -> bool {
-        !self.health_failed.load(Ordering::Relaxed)
+        !self.health_failed.load(Ordering::Relaxed) && !self.feed_is_dead(now_ms())
+    }
+
+    /// ORDER #14 C — may the decision loop open a NEW position? False while the feed
+    /// watchdog holds the halt (dead feed, or inside the post-recovery warmup).
+    /// Exits/stops/settlement never consult this.
+    pub fn entries_halted(&self) -> bool {
+        self.feed_halt.load(Ordering::Relaxed)
     }
 
     /// Install the oplog sink the WS supervisor uses for connection-lifecycle
@@ -294,4 +348,80 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod order14_tests {
+    use super::*;
+
+    /// ORDER #14 B — health must follow the DATA, not the socket flag. This is the
+    /// exact 2026-07-25 condition: the socket believed itself connected
+    /// (`binance_connected = true`), the supervisor saw no failure
+    /// (`health_failed = false`), and yet no kline had arrived for 45 hours.
+    /// Pre-fix `is_healthy()` returned true throughout. It must now return false.
+    #[test]
+    fn health_follows_kline_liveness_not_the_socket_flag() {
+        let s = SharedState::new();
+        let now = now_ms();
+        s.feed_dead_ms.store(60_000, Ordering::Relaxed);
+        // The socket says "all good" — exactly as it did during the outage.
+        s.binance_connected.store(true, Ordering::Relaxed);
+        assert!(!s.health_failed.load(Ordering::Relaxed), "supervisor saw no failure");
+
+        // Fresh kline → healthy.
+        s.last_kline_ms.store(now - 1_000, Ordering::Relaxed);
+        assert!(s.is_healthy(), "a delivering feed is healthy");
+        assert!(!s.feed_is_dead(now));
+        assert_eq!(s.feed_stale_ms(now), 1_000);
+
+        // Just inside the threshold → still healthy (no flapping at the boundary).
+        s.last_kline_ms.store(now - 60_000, Ordering::Relaxed);
+        assert!(s.is_healthy(), "exactly at the threshold is not yet dead");
+
+        // Past it → DEAD, despite binance_connected still being true.
+        s.last_kline_ms.store(now - 60_001, Ordering::Relaxed);
+        assert!(s.feed_is_dead(now), "stale beyond the threshold is dead");
+        assert!(!s.is_healthy(), "THE BUG: healthy must be false on a dead feed");
+        assert!(s.binance_connected.load(Ordering::Relaxed), "…even though the socket reads connected");
+
+        // The 45-hour reading, for the record.
+        s.last_kline_ms.store(now - 162_000_000, Ordering::Relaxed);
+        assert_eq!(s.feed_stale_ms(now) / 1000, 162_000, "45h expressed as bn_kline_age_s");
+        assert!(!s.is_healthy());
+    }
+
+    /// The guard is opt-in (threshold 0 = disabled) so ingestion-only and pure-WS
+    /// tests are unaffected; `main` arms it from config in every trading run.
+    #[test]
+    fn feed_guard_disabled_when_threshold_zero() {
+        let s = SharedState::new();
+        let now = now_ms();
+        s.last_kline_ms.store(now - 999_999_999, Ordering::Relaxed);
+        assert_eq!(s.feed_dead_ms.load(Ordering::Relaxed), 0, "disabled by default");
+        assert!(!s.feed_is_dead(now), "threshold 0 disables the check");
+        assert!(s.is_healthy(), "…so existing WS tests keep their old semantics");
+    }
+
+    /// ORDER #14 C — the entry halt is independent of health and defaults off.
+    #[test]
+    fn entries_halted_flag_defaults_off_and_toggles() {
+        let s = SharedState::new();
+        assert!(!s.entries_halted(), "a fresh process trades normally");
+        s.feed_halt.store(true, Ordering::Relaxed);
+        assert!(s.entries_halted(), "watchdog halt blocks new opens");
+        s.feed_halt.store(false, Ordering::Relaxed);
+        assert!(!s.entries_halted());
+    }
+
+    /// Clock skew (a kline stamped slightly in the future) must read as age 0, never
+    /// as a negative age that could underflow comparisons.
+    #[test]
+    fn future_stamp_clamps_to_zero_age() {
+        let s = SharedState::new();
+        let now = now_ms();
+        s.feed_dead_ms.store(60_000, Ordering::Relaxed);
+        s.last_kline_ms.store(now + 5_000, Ordering::Relaxed);
+        assert_eq!(s.feed_stale_ms(now), 0);
+        assert!(!s.feed_is_dead(now));
+    }
 }

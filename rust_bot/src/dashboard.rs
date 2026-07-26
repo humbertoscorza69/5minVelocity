@@ -41,6 +41,9 @@ pub async fn run_dashboard(
     started_ms: i64,
     // Order #13 A/D: stake_mult_cap for the sizing-clip WARN (max_pos < base×cap).
     stake_mult_cap: f64,
+    // Order #14 D: what the CONFIG asked for, so any live divergence from
+    // controls.json (or a dashboard edit) is shown instead of silently applied.
+    config_controls: crate::v2::ControlsSnapshot,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let listener = match TcpListener::bind((bind.as_str(), port)).await {
@@ -102,7 +105,7 @@ pub async fn run_dashboard(
                         &state, &store_state, &recal, &controls,
                         &mode, &live_armed_path, &kill_switch_path,
                         &oplog_path, started_ms, session_start_bal_milli,
-                        stake_mult_cap, &controls_path,
+                        stake_mult_cap, &controls_path, &config_controls,
                     ).to_string();
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path == "/" || path.starts_with("/?") || path.starts_with("/index") {
@@ -239,6 +242,7 @@ fn compute_stats(
     session_start_bal_milli: i64,
     stake_mult_cap: f64,
     controls_path: &str,
+    config_controls: &crate::v2::ControlsSnapshot,
 ) -> Value {
     let now = crate::state::now_ms();
 
@@ -635,7 +639,17 @@ fn compute_stats(
     }
     if !bn_up { alerts.push("Binance feed DOWN".into()); }
     if !pm_up { alerts.push("Polymarket feed DOWN".into()); }
-    if !state.is_healthy() { alerts.push("feed stale / halted".into()); }
+    // ORDER #14 B/C: name the failure instead of the generic "feed stale / halted" —
+    // a dead Binance feed now says so, with its age, and reports the entry halt.
+    if state.feed_is_dead(now) {
+        alerts.push(format!(
+            "BINANCE FEED DEAD — no kline for {}s (entries halted, exits/settlement continue)",
+            state.feed_stale_ms(now) / 1000
+        ));
+    } else if state.entries_halted() {
+        warns.push("feed recovering — entries halted until the vol ring refills".into());
+    }
+    if !state.is_healthy() && !state.feed_is_dead(now) { alerts.push("feed stale / halted".into()); }
     if det_errors > 0 { alerts.push(format!("{det_errors} order rejections — DETERMINISTIC bug (orders won't fill)")); }
     if win_n >= 20 && fill_rate_win < 0.50 { alerts.push(format!("fill rate {:.0}% (last {win_n}) — most orders rejected", fill_rate_win * 100.0)); }
     if recon_per_hr > 20.0 { warns.push(format!("WS unstable: {:.0} reconnects/hr", recon_per_hr)); }
@@ -655,6 +669,18 @@ fn compute_stats(
     };
     if let Some(w) = clip_warn("5m", controls.base_usd(), controls.max_pos_usd()) { warns.push(w); }
     if let Some(w) = clip_warn("15m", controls.base_usd_15m(), controls.max_pos_15m()) { warns.push(w); }
+    // Order #14 D: persistent, live view of controls.json overriding the config.
+    // `inval_stop_dry:false` hid Order #12 C for an entire audition — the operator
+    // read "stop: DRY" in the config and the bot sold for real. Precedence unchanged.
+    let overrides = crate::v2::control_overrides(config_controls, &controls.snapshot());
+    if !overrides.is_empty() {
+        let list = overrides
+            .iter()
+            .map(|o| format!("{} (config {} → control {})", o.field, o.config, o.control))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        warns.push(format!("controls.json overriding: {list}"));
+    }
     // Order #13 D: re-entry-opposite probation — the registered kill-rule, automated
     // (this project's written rules have gone unexecuted between exports). At n≥100
     // with cumulative net < 0 the validated +EV expectation FAILED → auto-disable the
@@ -709,6 +735,10 @@ fn compute_stats(
             "decisions": state.counters.decisions.load(std::sync::atomic::Ordering::Relaxed),
             "bn_klines": state.counters.binance_klines.load(std::sync::atomic::Ordering::Relaxed),
             "pm_msgs": state.counters.polymarket_msgs.load(std::sync::atomic::Ordering::Relaxed),
+            // ORDER #14 B/C: feed liveness, visible without inference.
+            "bn_kline_age_s": state.feed_stale_ms(now) / 1000,
+            "feed_dead": state.feed_is_dead(now),
+            "entries_halted": state.entries_halted(),
         },
         "pnl": {
             "realized": realized_total,
@@ -756,6 +786,10 @@ fn compute_stats(
             "inval_stop_dry": controls.inval_stop_dry(),
             // Order #13 A: so the frontend can flag max_pos < base × cap inline on Apply.
             "stake_mult_cap": stake_mult_cap,
+            // Order #14 D: live config-vs-controls divergence, per field.
+            "overrides": overrides.iter().map(|o| json!({
+                "field": o.field, "config": o.config, "control": o.control,
+            })).collect::<Vec<_>>(),
         },
         "live": {
             "mode": mode,
@@ -1115,6 +1149,52 @@ mod order13_tests {
         assert_eq!(reentry_opp_probation(true, 120, 0.0), Ok);
         // Already off → always Ok (no re-fire / no re-emit on later polls & restarts).
         assert_eq!(reentry_opp_probation(false, 200, -50.0), Ok);
+    }
+
+    /// ORDER #14 D — the exact 2026-07-25 divergence: config said the stop was DRY
+    /// (Order #12 C), controls.json said it was live, and nothing said a word. The
+    /// override must be reported once per diverging field, with BOTH values, and
+    /// nothing at all when they agree. Precedence is unchanged — this is visibility.
+    #[test]
+    fn control_overrides_report_each_divergence_once() {
+        use crate::v2::{control_overrides, ControlsSnapshot};
+        let cfg = ControlsSnapshot {
+            trading_enabled: true,
+            base_usd: 1.05,
+            max_pos: 3.15,
+            base_usd_15m: 1.05,
+            max_pos_15m: 3.15,
+            inval_stop_on: true,
+            inval_stop_dry: true, // Order #12 C
+            reentry_opp_on: true,
+        };
+        // Identical → silence.
+        assert!(control_overrides(&cfg, &cfg).is_empty(), "agreement must not warn");
+
+        // The real controls.json from the export: dry=false overrides config true.
+        let ctl = ControlsSnapshot { inval_stop_dry: false, ..cfg.clone() };
+        let d = control_overrides(&cfg, &ctl);
+        assert_eq!(d.len(), 1, "exactly one field diverges, got {d:?}");
+        assert_eq!(d[0].field, "inval_stop_dry");
+        assert_eq!(d[0].config, "true", "config said dry");
+        assert_eq!(d[0].control, "false", "controls.json said LIVE — this is what fired 2,175 real sells");
+
+        // Multiple divergences → one entry each, no duplicates.
+        let ctl2 = ControlsSnapshot {
+            inval_stop_dry: false,
+            max_pos: 1.05, // the Order #13 A sizing-clip trap, arriving via controls.json
+            reentry_opp_on: false,
+            ..cfg.clone()
+        };
+        let d2 = control_overrides(&cfg, &ctl2);
+        assert_eq!(d2.len(), 3, "one per field, got {d2:?}");
+        let fields: Vec<&str> = d2.iter().map(|o| o.field).collect();
+        assert!(fields.contains(&"inval_stop_dry"));
+        assert!(fields.contains(&"max_pos"));
+        assert!(fields.contains(&"reentry_opp_on"));
+        // Float compare must not fire on representation noise.
+        let ctl3 = ControlsSnapshot { base_usd: 1.05 + 1e-12, ..cfg.clone() };
+        assert!(control_overrides(&cfg, &ctl3).is_empty(), "epsilon-equal floats must not warn");
     }
 
     /// Order #13 D: the runtime toggle flips off and the disable survives a
