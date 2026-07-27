@@ -232,12 +232,47 @@ pub enum Verdict {
     Fail,
 }
 
-/// Evaluate the pre-registered rule for one challenger against the control.
+/// THE pre-registered rule (Order #17 ruling): a challenger must win under **both**
+/// V0 baselines, or the result is INCONCLUSIVE.
 ///
-/// Encoded as code, committed before the run, precisely so it cannot be softened
-/// afterwards — every leg must pass on its own; there is no averaging across them.
+/// V0's FOK kill is a logged COUNTERFACTUAL — computed exactly as for V1/V2 but never
+/// acted on, because keeping V0 byte-identical protects the 15m audition (mid-verdict
+/// at n=140) and that is the harder constraint. Symmetry is therefore recovered in
+/// SCORING rather than in behaviour:
+///
+/// * `control_actual` — what V0 really booked (what the dashboard and audition see).
+///   Biases **against** the challenger: V1/V2 lose the P&L of killed entries, V0 does
+///   not. V0's population decays ~1.35¢/s and is adverse 31% of the time versus
+///   ~3.33¢/s and 60% for the burst population, so this gap is not small.
+/// * `control_killadj` — V0 with counterfactually-killed entries removed. Biases
+///   slightly **toward** the challenger, because it does not model V0 re-entering
+///   after a kill (the H1 preemption externality).
+///
+/// The truth sits between them. Requiring agreement makes the ambiguity a DEFINED
+/// OUTCOME rather than a judgement call made after seeing the numbers — which is the
+/// entire point of pre-registering.
 #[must_use]
-pub fn evaluate(control: &[DayStat], challenger: &[DayStat], min_days: usize) -> Verdict {
+pub fn evaluate(
+    control_actual: &[DayStat],
+    control_killadj: &[DayStat],
+    challenger: &[DayStat],
+    min_days: usize,
+) -> Verdict {
+    let under_actual = evaluate_against(control_actual, challenger, min_days);
+    let under_killadj = evaluate_against(control_killadj, challenger, min_days);
+    if under_actual == under_killadj {
+        under_actual
+    } else {
+        // Disagreement is not a win. It is not a loss either — it is the honest
+        // statement that the baselines bracket the answer without settling it.
+        Verdict::Inconclusive
+    }
+}
+
+/// One challenger against ONE baseline. Every leg must pass on its own; there is no
+/// averaging across them.
+#[must_use]
+pub fn evaluate_against(control: &[DayStat], challenger: &[DayStat], min_days: usize) -> Verdict {
     if control.len() < min_days || challenger.len() < min_days {
         return Verdict::Inconclusive; // not enough clean days yet
     }
@@ -345,7 +380,7 @@ mod tests {
         let v0 = vec![DayStat { net_usd: 2.0, entries: 50, kills: 5 }; 7];
         // +100% net, 10% kill rate, positive every day.
         let v1 = vec![DayStat { net_usd: 4.0, entries: 90, kills: 10 }; 7];
-        assert_eq!(evaluate(&v0, &v1, 7), Verdict::Win);
+        assert_eq!(evaluate_against(&v0, &v1, 7), Verdict::Win);
     }
 
     /// A high kill rate is a hard FAIL even when the P&L looks spectacular — it means
@@ -356,7 +391,7 @@ mod tests {
         // +400% net but 30% of attempts killed.
         let v1 = vec![DayStat { net_usd: 10.0, entries: 70, kills: 30 }; 7];
         assert_eq!(
-            evaluate(&v0, &v1, 7),
+            evaluate_against(&v0, &v1, 7),
             Verdict::Fail,
             "25%+ kill rate must fail on its own — that IS the finding"
         );
@@ -367,10 +402,10 @@ mod tests {
     fn prereg_missing_the_50pct_bar_is_a_fail() {
         let v0 = vec![DayStat { net_usd: 2.0, entries: 50, kills: 2 }; 7];
         let v1 = vec![DayStat { net_usd: 2.8, entries: 60, kills: 3 }; 7]; // +40%
-        assert_eq!(evaluate(&v0, &v1, 7), Verdict::Fail);
+        assert_eq!(evaluate_against(&v0, &v1, 7), Verdict::Fail);
         // Exactly +50% clears it.
         let v1b = vec![DayStat { net_usd: 3.0, entries: 60, kills: 3 }; 7];
-        assert_eq!(evaluate(&v0, &v1b, 7), Verdict::Win);
+        assert_eq!(evaluate_against(&v0, &v1b, 7), Verdict::Win);
     }
 
     /// Beats the bar and the kill rate, but is positive on too few days → extend once.
@@ -380,7 +415,7 @@ mod tests {
         let mut v1 = vec![DayStat { net_usd: -3.0, entries: 60, kills: 3 }; 3];
         v1.extend(vec![DayStat { net_usd: 9.0, entries: 60, kills: 3 }; 4]);
         // Net = +27 vs +7 (well past +50%), kill rate low, but only 4 positive days.
-        assert_eq!(evaluate(&v0, &v1, 7), Verdict::Inconclusive);
+        assert_eq!(evaluate_against(&v0, &v1, 7), Verdict::Inconclusive);
     }
 
     /// A short run cannot produce a verdict — the rule requires 7 FULL days.
@@ -388,7 +423,53 @@ mod tests {
     fn prereg_needs_seven_full_days() {
         let v0 = vec![DayStat { net_usd: 1.0, entries: 50, kills: 1 }; 6];
         let v1 = vec![DayStat { net_usd: 9.0, entries: 60, kills: 1 }; 6];
-        assert_eq!(evaluate(&v0, &v1, 7), Verdict::Inconclusive, "6 days cannot decide");
+        assert_eq!(evaluate_against(&v0, &v1, 7), Verdict::Inconclusive, "6 days cannot decide");
+    }
+
+    /// ORDER #17 RULING — the dual-baseline rule. V0's kill is a logged
+    /// counterfactual, so the P&L comparison is asymmetric: V1 loses the P&L of
+    /// killed entries and V0 does not. Symmetry is recovered in SCORING, and a
+    /// challenger must win under BOTH baselines.
+    #[test]
+    fn prereg_requires_agreement_across_both_v0_baselines() {
+        // V0 actual = +2/day. Kill-adjusted V0 is LOWER (killed entries removed),
+        // which is the whole reason the asymmetry mattered.
+        let v0_actual = vec![DayStat { net_usd: 2.0, entries: 50, kills: 5 }; 7];
+        let v0_killadj = vec![DayStat { net_usd: 1.5, entries: 45, kills: 5 }; 7];
+
+        // Clears +50% over BOTH (needs >= 3.0 and >= 2.25) → WIN.
+        let strong = vec![DayStat { net_usd: 4.0, entries: 90, kills: 10 }; 7];
+        assert_eq!(evaluate(&v0_actual, &v0_killadj, &strong, 7), Verdict::Win);
+
+        // THE CASE THE RULING EXISTS FOR: beats the kill-adjusted baseline (>= 2.25)
+        // but not the actual one (>= 3.0). Under killadj alone this would read as a
+        // WIN — and shipping on that would be exactly the false positive the dual
+        // baseline is there to prevent.
+        let borderline = vec![DayStat { net_usd: 2.6, entries: 90, kills: 10 }; 7];
+        assert_eq!(
+            evaluate_against(&v0_killadj, &borderline, 7),
+            Verdict::Win,
+            "kill-adjusted alone would call this a win"
+        );
+        assert_eq!(
+            evaluate_against(&v0_actual, &borderline, 7),
+            Verdict::Fail,
+            "…while the actual baseline calls it a fail"
+        );
+        assert_eq!(
+            evaluate(&v0_actual, &v0_killadj, &borderline, 7),
+            Verdict::Inconclusive,
+            "disagreement is a DEFINED outcome, not a judgement call after seeing the numbers"
+        );
+
+        // A kill-rate FAIL is challenger-only, so both baselines agree and it stays a
+        // FAIL — the hard leg cannot be laundered through baseline choice.
+        let killy = vec![DayStat { net_usd: 20.0, entries: 70, kills: 30 }; 7];
+        assert_eq!(evaluate(&v0_actual, &v0_killadj, &killy, 7), Verdict::Fail);
+
+        // Beats neither → FAIL under both → FAIL.
+        let weak = vec![DayStat { net_usd: 1.0, entries: 90, kills: 5 }; 7];
+        assert_eq!(evaluate(&v0_actual, &v0_killadj, &weak, 7), Verdict::Fail);
     }
 
     /// A challenger that never fills (every attempt killed) is a FAIL, not a
@@ -397,6 +478,6 @@ mod tests {
     fn prereg_zero_entries_is_a_fail_not_a_pass() {
         let v0 = vec![DayStat { net_usd: 1.0, entries: 50, kills: 1 }; 7];
         let v1 = vec![DayStat { net_usd: 0.0, entries: 0, kills: 0 }; 7];
-        assert_eq!(evaluate(&v0, &v1, 7), Verdict::Fail);
+        assert_eq!(evaluate_against(&v0, &v1, 7), Verdict::Fail);
     }
 }
