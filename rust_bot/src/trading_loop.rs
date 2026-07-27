@@ -82,6 +82,26 @@ const PAPER_BACKFILL_MIN_AGE_S: i64 = 600;
 /// gates must read the same number — if the A/B re-derived it, a subtle difference in
 /// the window would surface as a gate effect, which is the confound the whole design
 /// is arranged to avoid. Extracted verbatim from the sizing site; behaviour unchanged.
+/// UTC `YYYY-MM-DD` for a ms timestamp — the shadow day-bucket key. Day bucketing is
+/// the bot's only concession to scoring: the auditor computes every rollup offline,
+/// but the bucket has to be stamped at write time to be recoverable.
+#[must_use]
+fn utc_day_of(ts_ms: i64) -> String {
+    let days = ts_ms.div_euclid(86_400_000);
+    // Civil-from-days (Howard Hinnant's algorithm), epoch-shifted to 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 #[must_use]
 fn burst_bps_at(history: &crate::v2::PriceHistory, asset: &str, t_s: i64, up: bool) -> f64 {
     let sign = if up { 1.0 } else { -1.0 };
@@ -803,6 +823,48 @@ pub async fn run_decision_task(
     // updates after the (possibly slow) execution task records the order, so we
     // cannot rely on it to prevent same-market re-entry within the lag window.
     let mut v2_entered: HashSet<String> = HashSet::new();
+    // ORDER #17 A — shadow portfolios. Built only when armed; `None` means the loop
+    // behaves exactly as it does today (gate 2 = deploy disabled, gate 3 = arm).
+    // Each owns its positions, ledger, recal and dedup, and shares nothing mutable
+    // with `bs.positions`, `guards`, the canary, `state.v2_settled` or `state.json`.
+    let vcfg_variants = vcfg.variants.clone();
+    let variant_cfg = vcfg_variants.to_variant_config();
+    let mut shadows: Vec<(crate::variants::Variant, crate::shadow::ShadowBook)> = Vec::new();
+    if vcfg_variants.enabled {
+        for v in [crate::variants::Variant::V1, crate::variants::Variant::V2] {
+            match crate::shadow::ShadowBook::new(
+                v,
+                vcfg_variants.recal_path(v),
+                300,
+                50,
+                20, // shadow-local open cap; never reads the live guard budget
+
+                2,
+            ) {
+                Ok(b) => shadows.push((v, b)),
+                // Refusing to start is correct: a shadow pointed at the audition's
+                // recal would contaminate a mid-verdict n=140 window.
+                Err(e) => tracing::error!(variant = v.as_str(), error = %e, "shadow build REFUSED — arm aborted"),
+            }
+        }
+        info!(
+            arms = shadows.len(), v1_burst = vcfg_variants.v1_burst_bps,
+            v2_burst = vcfg_variants.v2_burst_bps, v2_max_ask = vcfg_variants.v2_max_ask,
+            "ORDER #17: variant A/B ARMED — the pre-registered clock starts now"
+        );
+        oplog.sys("variants_armed", serde_json::json!({
+            "arms": shadows.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+            "v1_burst_bps": vcfg_variants.v1_burst_bps,
+            "v2_burst_bps": vcfg_variants.v2_burst_bps,
+            "v2_max_ask": vcfg_variants.v2_max_ask,
+            "max_slippage": vcfg_variants.max_slippage,
+        }));
+    }
+    // E1: per-tick decision latency, tagged with the enabled flag. ~20 lines, and the
+    // only thing that says whether the 25% kill leg is partly our own overhead.
+    let mut cand_buf: Vec<crate::variants::Candidate> = Vec::with_capacity(64);
+    let mut tick_us: Vec<u64> = Vec::with_capacity(4096);
+    let mut tick_report_at = now_ms() + 3_600_000;
     // AUDIT fix #3: first-touch set for canary shadow intents — process_kline_v2
     // re-emits a qualifying market every kline, so without this a halted market
     // floods thousands of canary_shadow_intent rows/hour and wrecks the auditor's
@@ -1037,6 +1099,47 @@ pub async fn run_decision_task(
                             }
                         }
                     }
+                    // ORDER #17 — SHADOW SETTLEMENT. Same Binance open-vs-close basis
+                    // as V0, but every side effect stays inside the shadow: its own
+                    // ledger, its own recal, its own settled map. It never touches
+                    // `state.v2_settled` (severance 3), the canary (severance 2), the
+                    // guards budget (severance 1) or `bs.positions` (severance 4).
+                    for (v, sb) in shadows.iter_mut() {
+                        let due: Vec<(String, String, i64, bool)> = sb
+                            .positions()
+                            .iter()
+                            .filter(|p| now_s >= p.resolution_s + 2)
+                            .map(|p| (p.token_id.clone(), p.asset.clone(), p.resolution_s, p.up))
+                            .collect();
+                        for (token, asset, res_s, up) in due {
+                            let iv_secs = res_s - (res_s - 300).max(0);
+                            let _ = iv_secs;
+                            let epoch = res_s
+                                - sb.positions()
+                                    .iter()
+                                    .find(|p| p.token_id == token)
+                                    .map(|p| interval_secs(&p.interval).max(1))
+                                    .unwrap_or(300);
+                            let (Some(op), Some(fin)) =
+                                (history.close_at(&asset, epoch - 1), history.close_at(&asset, res_s - 1))
+                            else {
+                                continue; // ring cold → retry next tick
+                            };
+                            let won = up == (fin >= op);
+                            // Photo-finish labels never train ANY recal (Order #11 C).
+                            let feed = !photo_finish_prices(op, fin);
+                            sb.mark_settled(&token, won);
+                            if let Some(row) = sb.settle(&token, won, now, &utc_day_of(now), feed) {
+                                // The P&L row IS the scoring input — variant-tagged.
+                                oplog.sys("variant_pnl", serde_json::json!({
+                                    "variant": v.as_str(), "token_id": row.token_id,
+                                    "interval": row.interval, "entry_price": row.entry_price,
+                                    "shares": row.shares, "resolved_price": row.resolved_price,
+                                    "net_pnl": row.net_pnl, "photo_finish": !feed,
+                                }));
+                            }
+                        }
+                    }
                     // BUG #3: feed recal the counterfactual outcome of STOPPED-and-SOLD
                     // positions — they left bs before resolution, so the loop above
                     // never saw them, and without this recal trains on survivors only.
@@ -1097,6 +1200,11 @@ pub async fn run_decision_task(
                         oplog.sys("v2_recal_update", serde_json::json!({ "fed": cf_fed, "source": "stopped_counterfactual" }));
                     }
                 }
+                // E1: start the per-tick decision clock. Tagged with the enabled flag
+                // below so gate-2 and gate-3 windows of the same deployment are
+                // comparable — the only thing that says whether the 25% kill leg is
+                // partly measuring our own overhead.
+                let tick_t0 = std::time::Instant::now();
                 let catalog = snapshot_catalog_for(&state, &kline.asset, kline.t_s);
                 let positions: Vec<OpenPosition> = {
                     match store_state.lock() {
@@ -1152,9 +1260,9 @@ pub async fn run_decision_task(
                     let cmds = process_kline_v2(
                         &mut history, &kline, &catalog, &book, &strats,
                         &positions, now, &disabled_cells,
-                        // ORDER #16: sink stays None until the variant arms are wired,
-                        // so this deploy is behaviour-neutral by construction.
-                        None,
+                        // ORDER #17 B: the sink is live only when armed; `None`
+                        // otherwise keeps the disabled build behaviour-neutral.
+                        if shadows.is_empty() { None } else { Some(&mut cand_buf) },
                     );
                     for (mut cmd, pred, pred_raw) in cmds {
                         if let ExecCommand::Open { intent, ctx } = &mut cmd {
@@ -1351,6 +1459,9 @@ pub async fn run_decision_task(
                             state.v2_pred.insert(intent.token_id.clone(), (intent.interval.clone(), pred_raw));
                             state.counters.decisions.fetch_add(1, Ordering::Relaxed);
                             oplog.sys("v2_intent_open", serde_json::json!({
+                                // ORDER #17 D: V0 is tagged "v0", never blank — a later
+                                // analyst must not have to infer scope from absence.
+                                "variant": "v0",
                                 "token_id": intent.token_id, "signal_id": ctx.signal_id,
                                 "side": ctx.side, "stake_usd": ctx.stake_usd,
                                 "fill_price": intent.fill_price, "shares": intent.shares,
@@ -1393,6 +1504,117 @@ pub async fn run_decision_task(
                             warn!("execution task gone; v2 decision loop stopping");
                             return;
                         }
+                    }
+                    // ORDER #17 B/C/D — VARIANT ARMS. Runs only when armed; every
+                    // effect lands in a ShadowBook, never in V0's machinery.
+                    for cand in cand_buf.drain(..) {
+                        // B1: the SAME burst definition the sizing tiers use — reused,
+                        // never re-derived, so a window difference cannot masquerade
+                        // as a gate effect.
+                        let burst = burst_bps_at(&history, &cand.asset, kline.t_s, cand.up);
+                        // C: FOK at fill time. Re-reading the book here IS the real
+                        // observed latency — decision-to-fill, measured not assumed.
+                        let ask_now = book.bbo(&cand.token_id).and_then(|b| b.best_ask);
+                        let fok = crate::variants::fok_outcome(
+                            cand.ask,
+                            ask_now.unwrap_or(cand.ask),
+                            vcfg_variants.max_slippage,
+                        );
+                        let latency_ms = now - (kline.received_at_ms.max(1));
+                        let day = utc_day_of(now);
+                        // V0's kill is a COUNTERFACTUAL: computed identically, logged,
+                        // and deliberately NOT acted on. Keeping V0 byte-identical
+                        // protects the 15m audition (mid-verdict at n=140); symmetry is
+                        // recovered in scoring via the dual baseline, not in behaviour.
+                        if cand.v0_admitted {
+                            oplog.sys("variant_fok", serde_json::json!({
+                                "variant": "v0", "token_id": cand.token_id,
+                                "quote_ask": cand.ask, "fill_ask": fok.fill_ask,
+                                "slip": fok.slip, "killed": fok.killed,
+                                "counterfactual": true, "latency_ms": latency_ms,
+                            }));
+                        }
+                        for (v, sb) in shadows.iter_mut() {
+                            if !crate::variants::admits(*v, &variant_cfg, cand.v0_admitted, burst, cand.ask) {
+                                continue;
+                            }
+                            let mkey = crate::shadow::ShadowBook::market_key(
+                                &cand.asset, &cand.interval, cand.epoch,
+                            );
+                            if fok.killed {
+                                sb.record_kill(&day);
+                                oplog.sys("v2_intent_open", serde_json::json!({
+                                    "variant": v.as_str(), "token_id": cand.token_id,
+                                    "side": if cand.up { "Up" } else { "Down" },
+                                    "asset": cand.asset, "interval": cand.interval,
+                                    "quote_ask": cand.ask, "fill_ask": fok.fill_ask,
+                                    "slip": fok.slip, "killed": true,
+                                    "latency_ms": latency_ms, "burst_bps": burst,
+                                    "ttl_s": cand.ttl_s, "v0_admitted": cand.v0_admitted,
+                                    "stake_usd": 0.0,
+                                }));
+                                continue;
+                            }
+                            // Flat $1.05 everywhere — no sizing tiers in this
+                            // experiment; they are a separate axis and would confound.
+                            let stake = controls.base_usd_for(&cand.interval);
+                            let shares = if fok.fill_ask > 0.0 { stake / fok.fill_ask } else { 0.0 };
+                            let pos = crate::shadow::ShadowPosition {
+                                token_id: cand.token_id.clone(),
+                                asset: cand.asset.clone(),
+                                interval: cand.interval.clone(),
+                                up: cand.up,
+                                entry_price: fok.fill_ask,
+                                shares,
+                                stake_usd: stake,
+                                opened_at_ms: now,
+                                resolution_s: cand.epoch + interval_secs(&cand.interval).max(1),
+                                pred_raw: 0.0,
+                            };
+                            // B3: dedup/re-entry against THIS variant's own book.
+                            match sb.open(&mkey, pos, &day) {
+                                Ok(()) => {
+                                    oplog.sys("v2_intent_open", serde_json::json!({
+                                        "variant": v.as_str(), "token_id": cand.token_id,
+                                        "side": if cand.up { "Up" } else { "Down" },
+                                        "asset": cand.asset, "interval": cand.interval,
+                                        "quote_ask": cand.ask, "fill_ask": fok.fill_ask,
+                                        "slip": fok.slip, "killed": false,
+                                        "latency_ms": latency_ms, "burst_bps": burst,
+                                        "ttl_s": cand.ttl_s, "v0_admitted": cand.v0_admitted,
+                                        "stake_usd": stake, "shares": shares,
+                                    }));
+                                }
+                                Err(reason) => {
+                                    oplog.sys("variant_open_rejected", serde_json::json!({
+                                        "variant": v.as_str(), "token_id": cand.token_id,
+                                        "reason": format!("{reason:?}"),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    // E1: record this tick and report percentiles hourly. Absolute
+                    // numbers matter more than the on-vs-off delta, because the two
+                    // windows sit at different times and tape conditions differ.
+                    tick_us.push(tick_t0.elapsed().as_micros() as u64);
+                    if now >= tick_report_at && !tick_us.is_empty() {
+                        let mut v = tick_us.clone();
+                        v.sort_unstable();
+                        let pct = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+                        oplog.sys("tick_latency", serde_json::json!({
+                            "variants_enabled": !shadows.is_empty(),
+                            "n": v.len(),
+                            "p50_us": pct(0.50), "p95_us": pct(0.95), "p99_us": pct(0.99),
+                            "max_us": v[v.len() - 1],
+                        }));
+                        info!(
+                            variants_enabled = !shadows.is_empty(), n = v.len(),
+                            p50_us = pct(0.50), p95_us = pct(0.95), p99_us = pct(0.99),
+                            "E1: per-tick decision latency"
+                        );
+                        tick_us.clear();
+                        tick_report_at = now + 3_600_000;
                     }
                     // Bound the predicted-p map in paper mode (no positions-refresh
                     // drain): clear if it grows unreasonably large.
@@ -3035,6 +3257,20 @@ mod tests {
     /// the truth source). In PAPER a pf token must BOOK from the kline label, not
     /// defer, or it orphans in bs forever. Order #12 B — a stale orphan healed via
     /// the REST fallback books as "paper_backfill"; everything else is "settlement".
+    /// The day bucket must be correct at the UTC boundary, or a variant's daily stats
+    /// straddle two days and the "positive on >= 5 of 7 days" leg reads wrong.
+    #[test]
+    fn order17_utc_day_bucket_is_exact_at_the_boundary() {
+        assert_eq!(utc_day_of(0), "1970-01-01");
+        let midnight = 1_785_110_400_000i64; // 2026-07-27T00:00:00Z
+        assert_eq!(utc_day_of(midnight), "2026-07-27");
+        assert_eq!(utc_day_of(midnight - 1), "2026-07-26", "one ms before rolls back a day");
+        assert_eq!(utc_day_of(midnight + 86_399_999), "2026-07-27", "last ms of the day");
+        assert_eq!(utc_day_of(midnight + 86_400_000), "2026-07-28");
+        // A leap day, since the civil-from-days arithmetic is where that would break.
+        assert_eq!(utc_day_of(1_709_164_800_000), "2024-02-29");
+    }
+
     /// ORDER #16, DECISION 5 — THE ISOLATION PROOF.
     ///
     /// Drive `process_kline_v2` over one identical event sequence twice: once with the

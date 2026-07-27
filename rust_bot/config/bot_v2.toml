@@ -277,3 +277,18 @@ vol60_floor = 0.07
 enabled = true
 bind = "127.0.0.1"
 port = 8787
+
+# ORDER #17 — three-variant paper A/B (V0 control + V1 UNION-2 + V2 UNION-3-CAPPED).
+# enabled=false is a NO-BEHAVIOUR-CHANGE deploy (run-procedure gate 2); flipping it to
+# true arms the arms and STARTS THE PRE-REGISTERED 7-DAY CLOCK (gate 3) — note the UTC
+# timestamp of the restart. Thresholds are frozen by pre-registration: no mid-run
+# tuning. If an arm is broken, fix the bug and restart the clock rather than adjusting
+# the gate. Shadow state lives under state_dir, never in state.json, and shadow recal
+# never touches recal.json / recal_15m.json (ShadowBook::new refuses those names).
+[v2.variants]
+enabled = false
+v1_burst_bps = 2.0
+v2_burst_bps = 3.0
+v2_max_ask = 0.75
+state_dir = "data/v2/shadow"
+max_slippage = 0.04
