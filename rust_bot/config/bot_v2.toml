@@ -286,7 +286,20 @@ port = 8787
 # the gate. Shadow state lives under state_dir, never in state.json, and shadow recal
 # never touches recal.json / recal_15m.json (ShadowBook::new refuses those names).
 [v2.variants]
-enabled = false
+# ARMED (Order #17). Operator decision: no separate arm step — a single
+# `git pull && cargo build --release && systemctl restart` brings V0/V1/V2 up
+# together, which is also what makes the comparison fair (one process, one feed,
+# one decision loop, three portfolios).
+#
+# The CODE default stays `false` (see config.rs) — this is the running config only.
+# ROLLBACK is this one line back to `false` + restart; nothing else to undo.
+#
+# WATCH THE FIRST 15 MINUTES after the first armed restart. Abort conditions:
+#   * data/v2/recal*.json mtimes MOVE (severance 6 — protects the 15m audition at n=140)
+#   * new `invariant` or `guard_halt` lines vs the preceding window
+#   * tick_latency p99 materially up (E1 — else the 25% kill leg measures our overhead)
+#   * V1 producing FEWER intents than V0 (violates the V1 superset property)
+enabled = true
 v1_burst_bps = 2.0
 v2_burst_bps = 3.0
 v2_max_ask = 0.75
