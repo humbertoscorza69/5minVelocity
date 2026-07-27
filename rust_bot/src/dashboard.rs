@@ -318,6 +318,27 @@ fn compute_stats(
     // token to its later pnl_recorder_recorded net.
     let mut re_opp_life_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (mut re_opp_life_n, mut re_opp_life_net) = (0u64, 0.0f64);
+    // ORDER #17 item 3 — per-variant aggregation. V1/V2 are shadow portfolios whose
+    // settlements arrive as `variant_pnl`; V0's come through `rev` like always. Kills
+    // are read from the `killed` field on every variant-tagged intent, and V0's
+    // counterfactual kills from `variant_fok`, which is what makes net_v0_killadj —
+    // one of the two PRE-REGISTERED scoring baselines — visible while the run is live
+    // rather than only at scoring.
+    #[derive(Default, Clone)]
+    struct VarAcc {
+        entries: u64,
+        kills: u64,
+        ask_sum: f64,
+        ask_n: u64,
+        pf_flagged: u64,
+        pnl_n: u64,
+        rows: Vec<(i64, f64, String)>, // (ts, net, interval)
+    }
+    let mut varacc: std::collections::HashMap<String, VarAcc> = std::collections::HashMap::new();
+    // V0 tokens whose FOK counterfactual came back killed — removed from the
+    // kill-adjusted baseline. V0 still TOOK these (byte-identical behaviour); the
+    // adjustment exists only so the +50% leg can be read like-for-like.
+    let mut v0_killed_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(text) = std::fs::read_to_string(oplog_path) {
         for line in text.lines() {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
@@ -351,6 +372,21 @@ fn compute_stats(
             let sid = || v.get("data").and_then(|d| d.get("signal_id")).and_then(Value::as_str);
             match kind {
                 "v2_intent_open" => {
+                    // Variant-tagged intents feed the per-arm entry/kill/ask stats.
+                    // V0 rows are tagged "v0" explicitly, never blank.
+                    if let Some(d) = v.get("data") {
+                        let var = d.get("variant").and_then(Value::as_str).unwrap_or("v0").to_string();
+                        let a = varacc.entry(var).or_default();
+                        if d.get("killed").and_then(Value::as_bool).unwrap_or(false) {
+                            a.kills += 1;
+                        } else {
+                            a.entries += 1;
+                        }
+                        if let Some(ask) = d.get("ask").or_else(|| d.get("quote_ask")).and_then(num) {
+                            a.ask_sum += ask;
+                            a.ask_n += 1;
+                        }
+                    }
                     entries += 1;
                     if let Some(s) = sid() { intent_sids.push(s.to_string()); }
                     if v.get("data").and_then(|d| d.get("reentry")).and_then(Value::as_bool).unwrap_or(false) {
@@ -364,6 +400,32 @@ fn compute_stats(
                     // Telemetry self-check: asleep should populate on ~all intents.
                     if v.get("data").and_then(|d| d.get("asleep")).map(Value::is_null).unwrap_or(true) {
                         asleep_null += 1;
+                    }
+                }
+                "variant_pnl" => {
+                    if let Some(d) = v.get("data") {
+                        let var = d.get("variant").and_then(Value::as_str).unwrap_or("").to_string();
+                        if !var.is_empty() {
+                            let a = varacc.entry(var).or_default();
+                            if let Some(net) = d.get("net_pnl").and_then(num) {
+                                let iv = d.get("interval").and_then(Value::as_str).unwrap_or("5m");
+                                a.rows.push((ts, net, iv.to_string()));
+                                a.pnl_n += 1;
+                            }
+                            if d.get("photo_finish").and_then(Value::as_bool).unwrap_or(false) {
+                                a.pf_flagged += 1;
+                            }
+                        }
+                    }
+                }
+                "variant_fok" => {
+                    // V0's kill is a counterfactual: logged for every V0 intent with
+                    // killed true/false, never acted on.
+                    if let Some(d) = v.get("data")
+                        && d.get("killed").and_then(Value::as_bool).unwrap_or(false)
+                        && let Some(t) = d.get("token_id").and_then(Value::as_str)
+                    {
+                        v0_killed_tokens.insert(short_tok(t));
                     }
                 }
                 "v2_guard_blocked_open" => blocked += 1,
@@ -505,12 +567,29 @@ fn compute_stats(
         } else {
             g.gross_loss += -*r; a.gross_loss += -*r;
         }
-        curve.push(json!({ "t": *ts, "d": *r, "iv": iv.as_str() }));
+        curve.push(json!({ "t": *ts, "d": *r, "iv": iv.as_str(), "v": "v0" }));
         recent_trades.push(json!({
             "ts": *ts, "token": token.as_str(), "side": side.as_str(),
-            "entry": *entry, "exit": *exit, "pnl": *r, "iv": iv.as_str(),
+            "entry": *entry, "exit": *exit, "pnl": *r, "iv": iv.as_str(), "v": "v0",
         }));
     }
+    // Shadow settlements join the curve + trade table, tagged by arm, so the
+    // cumulative view and recent-trades list follow the variant selector too.
+    for arm in ["v1", "v2"] {
+        if let Some(a) = varacc.get(arm) {
+            for (ts, net, iv) in &a.rows {
+                curve.push(json!({ "t": *ts, "d": *net, "iv": iv.as_str(), "v": arm }));
+                recent_trades.push(json!({
+                    "ts": *ts, "token": "(shadow)", "side": "",
+                    "entry": Value::Null, "exit": Value::Null,
+                    "pnl": *net, "iv": iv.as_str(), "v": arm,
+                }));
+            }
+        }
+    }
+    curve.sort_by_key(|p| p.get("t").and_then(Value::as_i64).unwrap_or(0));
+    recent_trades.sort_by_key(|p| p.get("ts").and_then(Value::as_i64).unwrap_or(0));
+
     let curve = tail(curve, 600);
     let mut recent_trades = tail(recent_trades, 60);
     recent_trades.reverse(); // newest first for the table
@@ -535,6 +614,99 @@ fn compute_stats(
     let m5 = per.get("5m").copied().unwrap_or_default();
     let m15 = per.get("15m").copied().unwrap_or_default();
     let by_interval = json!({ "5m": stat_obj(&m5), "15m": stat_obj(&m15) });
+
+    // ---- ORDER #17 item 3: per-variant stats, the comparison strip, and the two
+    //      pre-registered V0 baselines rendered side by side. READ-ONLY: nothing here
+    //      can arm, disarm or otherwise touch an arm.
+    // V0's realized rows come from `rev` (the audited path); V1/V2 from `variant_pnl`.
+    for (ts, r, token, _side, _e, _x, iv) in &rev {
+        let a = varacc.entry("v0".to_string()).or_default();
+        a.rows.push((*ts, *r, iv.clone()));
+        a.pnl_n += 1;
+        let _ = token;
+    }
+    /// Downside deviation of DAILY net — Sortino's denominator. Upside volatility is
+    /// not risk, which is why this is the metric the order asks for rather than Sharpe.
+    fn sortino_of(rows: &[(i64, f64, String)]) -> Value {
+        let mut by_day: std::collections::BTreeMap<i64, f64> = std::collections::BTreeMap::new();
+        for (ts, net, _) in rows {
+            *by_day.entry(ts / 86_400_000).or_insert(0.0) += *net;
+        }
+        let d: Vec<f64> = by_day.values().copied().collect();
+        if d.len() < 2 {
+            return Value::Null; // one day cannot express a deviation
+        }
+        let mean = d.iter().sum::<f64>() / d.len() as f64;
+        let dn: Vec<f64> = d.iter().filter(|x| **x < 0.0).map(|x| x * x).collect();
+        if dn.is_empty() {
+            return json!("∞"); // no losing day yet
+        }
+        let dd = (dn.iter().sum::<f64>() / d.len() as f64).sqrt();
+        if dd > 0.0 { json!(mean / dd) } else { Value::Null }
+    }
+    let span_days = {
+        let ms = (now - started_ms).max(1) as f64;
+        (ms / 86_400_000.0).max(1.0 / 24.0) // floor at 1h so early rates are not absurd
+    };
+    let var_obj = |a: &VarAcc| -> Value {
+        let net: f64 = a.rows.iter().map(|(_, n, _)| *n).sum();
+        let wins = a.rows.iter().filter(|(_, n, _)| *n >= 0.0).count() as u64;
+        let gw: f64 = a.rows.iter().map(|(_, n, _)| *n).filter(|n| *n >= 0.0).sum();
+        let gl: f64 = a.rows.iter().map(|(_, n, _)| -*n).filter(|n| *n > 0.0).sum();
+        let closed = a.rows.len() as u64;
+        let attempts = a.entries + a.kills;
+        // Staked notional is what EV/$1 divides by; flat $1.05 in this experiment.
+        let staked = closed as f64 * controls.base_usd();
+        json!({
+            "entries": a.entries, "kills": a.kills,
+            "kill_rate": if attempts > 0 { a.kills as f64 / attempts as f64 } else { 0.0 },
+            "closed": closed, "wins": wins, "losses": closed.saturating_sub(wins),
+            "win_rate": if closed > 0 { wins as f64 / closed as f64 } else { 0.0 },
+            "net": net,
+            "ev_per_dollar": if staked > 0.0 { net / staked } else { 0.0 },
+            "net_per_day": net / span_days,
+            "entries_per_day": a.entries as f64 / span_days,
+            "profit_factor": pf_value(gw, gl),
+            "sortino": sortino_of(&a.rows),
+            "mean_ask": if a.ask_n > 0 { json!(a.ask_sum / a.ask_n as f64) } else { Value::Null },
+            "photo_finish_share": if closed > 0 { a.pf_flagged as f64 / closed as f64 } else { 0.0 },
+        })
+    };
+    let empty = VarAcc::default();
+    let v0a = varacc.get("v0").unwrap_or(&empty).clone();
+    let v1a = varacc.get("v1").unwrap_or(&empty).clone();
+    let v2a = varacc.get("v2").unwrap_or(&empty).clone();
+    // THE DUAL BASELINE, visible live. `actual` biases against the challenger (V1/V2
+    // lose the P&L of killed entries and V0 does not); `killadj` biases slightly
+    // toward it (it does not model V0 re-entering after a kill). A WIN must hold
+    // under BOTH — disagreement is INCONCLUSIVE, decided before the run, not after.
+    let net_v0_actual: f64 = v0a.rows.iter().map(|(_, n, _)| *n).sum();
+    let net_v0_killadj: f64 = rev
+        .iter()
+        .filter(|(_, _, tok, _, _, _, _)| !v0_killed_tokens.contains(tok))
+        .map(|(_, r, _, _, _, _, _)| *r)
+        .sum();
+    let kr = |a: &VarAcc| {
+        let att = a.entries + a.kills;
+        if att > 0 { a.kills as f64 / att as f64 } else { 0.0 }
+    };
+    let variants_json = json!({
+        "armed": !v1a.rows.is_empty() || v1a.entries > 0 || v2a.entries > 0,
+        "span_days": span_days,
+        "v0": var_obj(&v0a), "v1": var_obj(&v1a), "v2": var_obj(&v2a),
+        "baselines": {
+            "net_v0_actual": net_v0_actual,
+            "net_v0_killadj": net_v0_killadj,
+            "v0_counterfactual_kills": v0_killed_tokens.len(),
+        },
+        // The comparison strip: deltas vs V0 on the two legs that decide the run.
+        "compare": {
+            "v1_net_per_day_delta": (v1a.rows.iter().map(|(_, n, _)| *n).sum::<f64>() - net_v0_actual) / span_days,
+            "v2_net_per_day_delta": (v2a.rows.iter().map(|(_, n, _)| *n).sum::<f64>() - net_v0_actual) / span_days,
+            "v1_kill_rate_delta": kr(&v1a) - kr(&v0a),
+            "v2_kill_rate_delta": kr(&v2a) - kr(&v0a),
+        },
+    });
 
     let (b5, n5) = recal.m5.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
     let (b15, n15) = recal.m15.lock().map(|r| (r.bias(), r.samples())).unwrap_or((0.0, 0));
@@ -771,6 +943,8 @@ fn compute_stats(
             "opp_auto_disabled": re_opp_auto_disabled,
         },
         "by_interval": by_interval,
+        // ORDER #17 item 3 — per-variant view. READ-ONLY.
+        "variants": variants_json,
         "recal": {
             "bias": b5, "samples": n5,
             "m5": { "bias": b5, "samples": n5 },
@@ -910,6 +1084,12 @@ tbody tr:hover{background:var(--panel2)}
     <button class="btn seg sel" data-f="all">All</button>
     <button class="btn seg" data-f="5m">5m</button>
     <button class="btn seg" data-f="15m">15m</button>
+    <span style="margin-left:18px" class="muted">VARIANT</span>
+    <button class="btn vseg sel" data-v="all">All</button>
+    <button class="btn vseg" data-v="v0">V0</button>
+    <button class="btn vseg" data-v="v1">V1</button>
+    <button class="btn vseg" data-v="v2">V2</button>
+    <span id="vnote" class="muted"></span>
     <span id="filt_note" class="muted" style="font-size:11px"></span>
   </div>
   <div class="grid">
@@ -921,6 +1101,11 @@ tbody tr:hover{background:var(--panel2)}
     <div class="card"><div class="lbl">Settled WR</div><div class="val mono" id="wr">—</div><div class="sub" id="wr_sub"></div></div>
     <div class="card"><div class="lbl">Trades</div><div class="val mono" id="trades">—</div><div class="sub" id="trades_sub"></div></div>
     <div class="card"><div class="lbl">Recal bias</div><div class="val mono" id="recal">—</div><div class="sub" id="recal_sub"></div></div>
+    <div class="card" id="vcmp_card" style="display:none;grid-column:1/-1">
+      <div class="lbl">Variant A/B — comparison vs V0 (read-only)</div>
+      <div id="vcmp" class="mono" style="font-size:13px;line-height:1.9"></div>
+      <div class="sub" id="vbase"></div>
+    </div>
     <div class="card"><div class="lbl">Re-entry (opp / same)</div><div class="val mono" id="reentry">—</div><div class="sub" id="reentry_sub">n · net P&L per side</div></div>
   </div>
   <div class="panel"><h2>Cumulative realized P&L</h2><canvas id="chart"></canvas></div>
@@ -1020,9 +1205,14 @@ function render(){
   const s=LAST;if(!s)return;
   const st=(FILT==="all")?s.stats:(s.by_interval[FILT]||{closed:0,wins:0,losses:0,win_rate:0,profit_factor:0,gross_win:0,gross_loss:0,realized:0});
   const realized=(FILT==="all")?s.pnl.realized:st.realized;
-  const opens=(FILT==="all")?s.open_positions:s.open_positions.filter(p=>p.interval===FILT);
+  // open_positions is V0's book only (shadows are virtual and not in bs.positions),
+  // so selecting V1/V2 correctly shows none rather than implying V0's are theirs.
+  const opens=(VFILT==="v1"||VFILT==="v2")?[]:((FILT==="all")?s.open_positions:s.open_positions.filter(p=>p.interval===FILT));
   const unreal=opens.reduce((a,p)=>a+(+p.unreal),0);
   const total=realized+unreal;
+  // ORDER #17 item 3: the variant selector filters the same way the interval one
+  // does — client-side over per-point tags, so both dimensions compose.
+  const vok=p=>VFILT==="all"||(p.v||"v0")===VFILT;
   const rc=(FILT==="15m")?s.recal.m15:s.recal.m5;
   $("filt_note").textContent=(FILT==="all")?"combined 5m + 15m":(FILT+" only");
   const t=$("pnl_total");t.textContent=money(total);t.className="val mono "+cls(total);
@@ -1048,6 +1238,39 @@ function render(){
   $("trades_sub").textContent=(FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.entries+" intents · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed");
   $("recal").textContent=(rc.bias>=0?"+":"")+rc.bias.toFixed(3);
   $("recal_sub").textContent=rc.samples+" samples ("+(FILT==="15m"?"15m":"5m")+")";
+  // ORDER #17 item 3 — variant view. Read-only: no control here can arm or disarm.
+  (function(){
+    const V=(LAST&&LAST.variants)||null; const card=$("vcmp_card");
+    if(!V){ if(card)card.style.display="none"; return; }
+    const pct=x=>(100*(+x||0)).toFixed(1)+"%";
+    const sgn=x=>((+x||0)>=0?"+":"")+(+x||0).toFixed(2);
+    if(!V.armed){
+      $("vnote").textContent=" — arms not producing intents";
+      if(card)card.style.display="none";
+    } else {
+      $("vnote").textContent="";
+      if(card)card.style.display="";
+      const c=V.compare||{};
+      const row=(n,d)=>{
+        const v=V[n]||{};
+        return `<div>${n.toUpperCase()}: net ${money(v.net)} · ${sgn(v.net_per_day)}/day · EV/$1 ${(+v.ev_per_dollar||0).toFixed(4)} · WR ${pct(v.win_rate)} · PF ${typeof v.profit_factor==="number"?(+v.profit_factor).toFixed(2):v.profit_factor} · kill ${pct(v.kill_rate)} · entries/day ${(+v.entries_per_day||0).toFixed(0)} · ask ${v.mean_ask!=null?(+v.mean_ask).toFixed(3):"—"} · pf ${pct(v.photo_finish_share)} · Sortino ${typeof v.sortino==="number"?(+v.sortino).toFixed(2):(v.sortino||"—")}${d||""}</div>`;
+      };
+      const dv=(nd,kd)=>` <span class="${(+nd>=0)?"pos":"neg"}">[Δ$/day ${sgn(nd)}]</span> <span class="${(+kd<=0)?"pos":"neg"}">[Δkill ${((+kd>=0)?"+":"")+pct(kd)}]</span>`;
+      $("vcmp").innerHTML =
+        row("v0") +
+        row("v1",dv(c.v1_net_per_day_delta,c.v1_kill_rate_delta)) +
+        row("v2",dv(c.v2_net_per_day_delta,c.v2_kill_rate_delta));
+      const b=V.baselines||{};
+      // Both PRE-REGISTERED baselines, side by side: a WIN must hold under BOTH, and
+      // disagreement is INCONCLUSIVE. Showing them live stops the verdict being a
+      // surprise at scoring time.
+      $("vbase").textContent =
+        "dual baseline — net_v0_actual "+money(b.net_v0_actual)+
+        " vs net_v0_killadj "+money(b.net_v0_killadj)+
+        " ("+(b.v0_counterfactual_kills||0)+" V0 counterfactual kills removed)"+
+        " · a WIN must hold under BOTH; disagreement = INCONCLUSIVE";
+    }
+  })();
   // Re-entry per-side cohort (A5): opposite is the validated leg, same is on
   // probation (kill-rule: same_net < -$15 at same_n=100 → reentry_same_enabled=false).
   const re=s.reentry||{same_n:0,same_net:0,opposite_n:0,opposite_net:0};
@@ -1062,12 +1285,18 @@ function render(){
   }
   $("open_n").textContent=opens.length;
   $("open_body").innerHTML=opens.map(p=>`<tr><td class="mono">${p.token}</td><td>${p.side}</td><td class="muted">${p.asset}/${p.interval}</td><td class="mono">${p.entry.toFixed(3)}</td><td class="mono">$${(+p.usd).toFixed(2)}</td><td class="mono">${p.bid.toFixed(3)}</td><td class="mono">${p.shares.toFixed(1)}</td><td class="mono ${cls(p.unreal)}">${money(p.unreal)}</td><td class="muted mono">${fmtAge(p.age_s)}</td></tr>`).join("")||`<tr><td colspan=9 class=muted>none</td></tr>`;
-  const trs=(FILT==="all")?s.recent_trades:s.recent_trades.filter(x=>x.iv===FILT);
+  const trs=s.recent_trades.filter(x=>(FILT==="all"||x.iv===FILT)&&vok(x));
   $("trades_body").innerHTML=trs.map(t=>`<tr><td class="muted mono">${fmtTime(t.ts)}</td><td class="mono">${t.token}</td><td>${t.side||""}</td><td class="muted">${t.iv||"5m"}</td><td class="mono">${t.entry!=null?(+t.entry).toFixed(3):"—"}</td><td class="mono">${t.exit!=null?(+t.exit).toFixed(3):"—"}</td><td class="mono ${cls(t.pnl)}">${money(t.pnl)}</td></tr>`).join("")||`<tr><td colspan=7 class=muted>no closed trades yet</td></tr>`;
   // Cumulative curve from per-trade deltas, filtered by strategy.
-  const pts=(FILT==="all")?s.curve:s.curve.filter(p=>p.iv===FILT);
+  const pts=s.curve.filter(p=>(FILT==="all"||p.iv===FILT)&&vok(p));
   let run=0;drawChart(pts.map(p=>({t:p.t,pnl:(run+=p.d)})));
 }
+let VFILT="all";
+document.querySelectorAll(".btn.vseg").forEach(b=>b.onclick=()=>{
+  VFILT=b.dataset.v;
+  document.querySelectorAll(".btn.vseg").forEach(x=>x.classList.toggle("sel",x===b));
+  if(LAST)render();
+});
 document.querySelectorAll(".btn.seg").forEach(b=>b.onclick=()=>{
   FILT=b.getAttribute("data-f");
   document.querySelectorAll(".btn.seg").forEach(x=>x.classList.toggle("sel",x===b));
