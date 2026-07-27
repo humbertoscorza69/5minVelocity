@@ -1,0 +1,39 @@
+[package]
+name = "maker_bot"
+version = "0.1.0"
+edition = "2024"
+description = "Order #15 — maker-book paper bot (Part A) + up/down universe recorder (Part B)"
+
+# DELIBERATELY NOT A WORKSPACE MEMBER of ../rust_bot (which declares no workspace
+# either). This crate builds to ITS OWN maker_bot/target/, so the taker bot's
+# deployed binary path (rust_bot/target/release/rust_bot) is untouched by anything
+# here — Order #15 A6 isolation. Separate process, separate config, separate logs,
+# no shared mutable state.
+
+[[bin]]
+name = "maker_paper"
+path = "src/bin/maker_paper.rs"
+
+[[bin]]
+name = "universe_recorder"
+path = "src/bin/universe_recorder.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["std", "sink", "async-await"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Part B storage: price_change is the firehose (~58 GB/day uncompressed for btc+eth
+# alone, and we are adding sol+xrp).
+zstd = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
