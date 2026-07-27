@@ -171,6 +171,12 @@ pub struct Heartbeat {
     /// measured in the first hour and reported before a retention policy is chosen.
     #[serde(default)]
     pub bytes: BTreeMap<String, u64>,
+    /// Channels received but deliberately NOT written this run. Persisted beside the
+    /// data so a later analyst can never mistake "we chose not to record it" for
+    /// "the feed was silent" — the two have opposite meanings and only this field
+    /// distinguishes them.
+    #[serde(default)]
+    pub skipped_channels: Vec<String>,
 }
 
 #[cfg(test)]

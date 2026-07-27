@@ -46,6 +46,17 @@ struct Cli {
     /// Seconds a channel may be silent before the watchdog calls it stale.
     #[arg(long, default_value_t = 120)]
     stale_after_s: i64,
+    /// Channels to receive but NOT write (comma-separated). Default: keep everything.
+    ///
+    /// `price_change` is ~90% of the write volume and is the obvious candidate — but
+    /// DO NOT drop it casually. Combined with the REST print feed it decomposes a
+    /// level's size decrease into trade volume (known from REST) and cancels (the
+    /// residual). That turns the maker fill model's pessimistic "assume cancels sat
+    /// behind us" into a MEASURED cancel fraction, and that assumption is the single
+    /// biggest unknown in the queue model. Drop it only if this machine's I/O actually
+    /// strains; the non-evictable core is ~0.74 GB/day either way.
+    #[arg(long, default_value = "")]
+    skip_channels: String,
     /// Stop after N hours (0 = run until Ctrl-C).
     #[arg(long, default_value_t = 0)]
     hours: u64,
@@ -360,6 +371,18 @@ async fn writer_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut writers: BTreeMap<String, DayWriter> = BTreeMap::new();
+    let skip: std::collections::HashSet<String> = split_csv(&cli.skip_channels).into_iter().collect();
+    if skip.is_empty() {
+        info!("recording ALL channels (default)");
+    } else {
+        // Loud, per the Order #14 D lesson: a silent config override is how a run gets
+        // interpreted against data it never actually captured.
+        warn!(
+            skipped = ?skip,
+            "SKIPPING channels — they will be received and counted but NOT written; \
+             analysis of this run must not assume they are present"
+        );
+    }
     let mut gaps = GapTracker::new(cli.stale_after_s * 1000);
     let mut gap_writer = DayWriter::new(&cli.root, META_SUBDIR, "gaps", false);
     let hb_path = cli.root.join("heartbeat.json");
@@ -405,6 +428,12 @@ async fn writer_loop(
                     let _ = gap_writer.write_line(&day, &line);
                     let _ = gap_writer.flush();
                 }
+                // Skipped channels are still COUNTED above (heartbeat and gap tracking
+                // stay honest about what the feed is doing) — we only decline to
+                // WRITE them, which is where the I/O cost actually is.
+                if skip.contains(&ev.channel) {
+                    continue;
+                }
                 let w = writers.entry(ev.channel.clone()).or_insert_with(|| {
                     DayWriter::new(
                         &cli.root,
@@ -430,6 +459,11 @@ async fn writer_loop(
                     pid: std::process::id(),
                     channels: gaps.stats().clone(),
                     bytes: bytes.clone(),
+                    skipped_channels: {
+                        let mut s: Vec<String> = skip.iter().cloned().collect();
+                        s.sort();
+                        s
+                    },
                 };
                 if let Ok(text) = serde_json::to_string_pretty(&hb) {
                     let _ = std::fs::create_dir_all(&cli.root);

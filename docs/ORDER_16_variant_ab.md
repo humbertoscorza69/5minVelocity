@@ -97,26 +97,37 @@ taker bot's live-arming path. V0 must be byte-identical to what runs today.
 
 ## Appendix — answers to the dev's two blockers
 
-**Q2, trade prints: RESOLVED FROM THE RECORDER, and the answer changes Part A.**
+**Q2, trade prints — SUPERSEDED BY LIVE MEASUREMENT. Read this version.**
 
-There is **no trade-print channel in the Polymarket WS feed.** The recorded channels
-are exactly: `best_bid_ask`, `book`, `market_resolved`, `markets`, `new_market`,
-`price_change`, `rest_book`, `tick_size_change`. No `last_trade_price`, no trades.
+My original claim ("no trade-print channel exists") was **wrong**, and the reasoning
+was bad: I inferred absence from the operator's recorder DIRECTORY LIST, which only
+shows what that recorder subscribed to, not what the API emits. `last_trade_price`
+does exist on the live feed and carries `price`, `size`, `side`, `timestamp` and
+`transaction_hash` — confirmed by the dev (941 events / 90s) and reproduced
+independently (478 / 180s).
 
-`price_change` looks like a print feed — it carries `price`, `size`, `side`, `hash` —
-but it is **a level-update feed, not prints**. Proof from 297,884 consecutive updates
-at the same (token, price, side): the size **increased 51.4%** of the time, decreased
-48.3%, and was exactly `0` in 0.9% of events. A traded quantity can never make a level
-grow, and "traded zero" is meaningless. `size` is the new resting size at that level.
+What survives, and is load-bearing: `price_change` **is** a level-update feed, not
+prints. Over 297,884 consecutive updates at the same (token, price, side) the size
+**increased 51.4%** of the time, decreased 48.3%, and was exactly `0` in 0.9%. A traded
+quantity can never make a level grow and "traded zero" is meaningless, so `size` is the
+new resting depth. Draining queue off it would manufacture fills from quote churn.
 
-So the fill model cannot be driven by the WS alone. Trade prints must come from the
-REST endpoint `https://data-api.polymarket.com/trades?market=<condition_id>` — which is
-exactly what the validated queue-aware backtest used (it re-fetched 4.38M prints that
-way to produce the +0.455c/share OOS figure). Consequence for Part A: prints arrive by
-poll, not by push. That is acceptable because a **paper** fill does not need to be
-determined in real time — quotes rest on the WS book, and fills can be reconciled
-against the REST print feed on a short lag. Spec it as a reconciliation loop, not a
-hot path.
+**But `last_trade_price` is NOT a complete print feed either.** Matched by
+`transaction_hash` against `data-api /trades` over the same window, after waiting 300s
+for the indexer: REST 898 unique hashes / 18,912 size vs WS 273 / 5,258 —
+**WS covers 30.2% of prints and ~28% of volume**, with 627 REST hashes the WS never
+sent. It has last-price semantics: consecutive fills at one price collapse.
+
+METHOD WARNING: an immediate REST pull (no indexer wait) showed 16 rows and an apparent
+93.8% WS coverage — the exact opposite conclusion. The data-api indexer lags minutes.
+
+**Therefore REST `/trades` remains the fill-scoring path for Part A**, as originally
+specified. Draining queue off WS prints alone would consume ~30% of real volume, so the
+simulated queue would advance too slowly and the bot would UNDERSTATE fill rate — the
+core metric of the whole business case. WS `last_trade_price` stays useful as a
+low-latency hint, and its `transaction_hash` gives A8 counterparty logging for free,
+but it is not the fill driver. Prints arrive by poll; a **paper** fill need not be
+determined in real time, so spec it as a reconciliation loop, not a hot path.
 
 **Q3, the A3.2 fill direction: the dev is right and the order was wrong.** A resting
 ask at 0.60 is lifted by a buy printing at 0.60 *or above*; a 0.55 print cannot touch

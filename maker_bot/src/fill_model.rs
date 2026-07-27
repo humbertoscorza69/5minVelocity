@@ -18,6 +18,13 @@
 //!      whether it sat ahead of or behind us, so we assume BEHIND — `queue_ahead` is
 //!      NOT improved. The amount is recorded so the optimistic variant (cancels
 //!      ahead → queue_ahead reduced) can be scored offline from the log alone.
+//!
+//!      This assumption is the single biggest unknown in the queue model, and it is
+//!      MEASURABLE rather than permanent: `price_change` (level updates) combined with
+//!      the REST print feed decomposes each size decrease into trade volume (known
+//!      from REST) and cancels (the residual). The Part B recorder captures both, so a
+//!      week of data replaces this pessimistic guess with a measured cancel fraction.
+//!      That is why `price_change` earns its ~90% share of the recorder's disk.
 //!   4. BBO moving away does not cancel anything: the naive config leaves the order
 //!      resting and marks it stale-priced. (Lag defense *inverted* the study result,
 //!      +0.35 → +0.25, so there is deliberately none.)

@@ -12,6 +12,31 @@
 //! Everything here is PURE so the gates, the kill model and the decision rule are
 //! testable without a feed — and so the decision rule is committed as code BEFORE the
 //! run, which is what stops it being tuned afterwards.
+//!
+//! # Guardrails for the decision-loop wiring (the remaining step)
+//!
+//! These are not style preferences; each one protects a result we would otherwise
+//! lose, and they are recorded here so they survive between sessions.
+//!
+//! 1. **V0 is NOT a third symmetric portfolio — it is the actual bot, end to end.**
+//!    Its positions, settlement path, band-stop, invariants and recal stay the
+//!    existing audited machinery, untouched. V1/V2 are ADDITIVE shadow portfolios
+//!    with their own state. A hand-rebuilt control is the single most likely way
+//!    this A/B returns a confident wrong answer — every disaster in this project's
+//!    ledger has been a population-mismatch error.
+//! 2. **V1/V2 recal instances must NEVER write `recal.json` or `recal_15m.json`.**
+//!    They trade larger populations with different biases by construction, so a
+//!    shared file would contaminate the 15m audition, which is mid-verdict at n=140
+//!    and must keep maturing on exactly the samples it would have seen anyway.
+//!    Shadow recal state goes to its own paths.
+//! 3. **One entry per market is PER VARIANT, not global** — variants disagreeing
+//!    about which second to take is the measurement, not a bug to be deduplicated.
+//! 4. **Re-entry-after-stop applies per variant**, for the same reason.
+//! 5. Stakes flat $1.05 everywhere; **no sizing tiers in this experiment** — they are
+//!    a separate axis and would confound the comparison.
+//! 6. The 7-day clock only starts with Order #14 deployed and the feed healthy. A
+//!    repeat of the 45-hour blind window voids this A/B exactly as it voided the
+//!    weekend exam.
 
 // The gates, the kill model and the decision rule are complete and tested; the
 // decision-loop wiring that calls them is the remaining step of Order #16. Allowed at
