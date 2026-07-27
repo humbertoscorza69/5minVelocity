@@ -148,6 +148,32 @@ pub fn admits(variant: Variant, cfg: &VariantConfig, v0_admits: bool, burst_bps:
     }
 }
 
+/// One market/side the decision loop resolved far enough to price, emitted for the
+/// variant arms REGARDLESS of whether V0's gate stack went on to reject it.
+///
+/// This exists because V1 is "V0 **OR** burst ≥ 2bps with no other gate", so by
+/// construction most V1 entries are signals V0 threw away — they never appear in the
+/// returned commands and cannot be derived from them.
+///
+/// Crucially the `ask` and `ttl_s` here are resolved at the SAME instant, from the
+/// same computation, that V0 used. A parallel re-scan would resolve them a few
+/// microseconds later in the loop, and that difference lands directly in `fill_ask`
+/// and therefore in the kill rate — letting enumeration timing masquerade as a gate
+/// effect, which is the one confound this A/B cannot survive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    pub asset: String,
+    pub interval: String,
+    pub epoch: i64,
+    pub token_id: String,
+    pub up: bool,
+    pub ask: f64,
+    pub ttl_s: i64,
+    /// True when V0's full gate stack went on to admit this candidate. The union
+    /// arms read it rather than re-deriving V0's verdict.
+    pub v0_admitted: bool,
+}
+
 /// Outcome of modelling a fill-or-kill at the real observed latency.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FokOutcome {

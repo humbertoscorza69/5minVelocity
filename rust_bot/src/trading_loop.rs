@@ -473,6 +473,12 @@ pub fn process_kline_v2(
     positions: &[OpenPosition],
     now_ms: i64,
     disabled: &[String],
+    // ORDER #16: variant candidate SINK. `None` (the default at every pre-existing
+    // call site) means this function behaves exactly as before — which is why this is
+    // a sink parameter rather than a return-type change: "V0's path is untouched"
+    // becomes verifiable BY DIFF, and the zero-cost-when-off property is structural
+    // rather than an argument about code paths.
+    mut candidates: Option<&mut Vec<crate::variants::Candidate>>,
 ) -> Vec<(ExecCommand, f64, f64)> {
     // Returns (cmd, p_gate, p_raw): p_gate (debiased) for log/attribution; p_raw
     // (pre-debias) is stored in v2_pred and fed to the recalibrator (Order #7 A).
@@ -528,6 +534,29 @@ pub fn process_kline_v2(
             Some(a) if a > 0.0 => a,
             _ => continue,
         };
+        // ORDER #16: emit the variant candidate HERE — after the ask is resolved (the
+        // union arms need it, and V2 caps on it) but BEFORE the ask-band, floor and
+        // v2 gates, all of which V1 bypasses by definition. `v0_admitted` is patched
+        // to true further down if the full stack goes on to accept it, so the arms
+        // read V0's verdict rather than re-deriving it.
+        //
+        // NOTE ON SCOPE: this sits after the one-entry-per-market check above, so no
+        // candidate is emitted for a market V0 already holds. Since V1 ⊇ V0 the arm
+        // will normally hold that market too; the uncovered case is a variant wanting
+        // a re-entry V0 did not take. Flagged rather than silently accepted.
+        let cand_idx = candidates.as_mut().map(|v| {
+            v.push(crate::variants::Candidate {
+                asset: kline.asset.clone(),
+                interval: (*interval).to_string(),
+                epoch,
+                token_id: bet_token.clone(),
+                up,
+                ask,
+                ttl_s: ttl,
+                v0_admitted: false,
+            });
+            v.len() - 1
+        });
         // Ask-BAND gate: max-ask quality cap (15m: 0.70; 5m: none) + Order #9 B
         // min-ask floor (0.30 both) — keep entries inside the validated [0.30,0.97]
         // envelope; extreme-ask books are where the curve is maximally wrong.
@@ -614,6 +643,11 @@ pub fn process_kline_v2(
             exit_ts_s,
             now_ms,
         };
+        // ORDER #16: the full stack admitted this one — record V0's verdict on the
+        // candidate so the union arms consume it instead of re-deriving it.
+        if let (Some(v), Some(i)) = (candidates.as_mut(), cand_idx) {
+            v[i].v0_admitted = true;
+        }
         out.push((ExecCommand::Open { intent, ctx }, f.p, f.p_raw));
     }
     out
@@ -1092,6 +1126,9 @@ pub async fn run_decision_task(
                     let cmds = process_kline_v2(
                         &mut history, &kline, &catalog, &book, &strats,
                         &positions, now, &disabled_cells,
+                        // ORDER #16: sink stays None until the variant arms are wired,
+                        // so this deploy is behaviour-neutral by construction.
+                        None,
                     );
                     for (mut cmd, pred, pred_raw) in cmds {
                         if let ExecCommand::Open { intent, ctx } = &mut cmd {
@@ -2986,6 +3023,104 @@ mod tests {
     /// the truth source). In PAPER a pf token must BOOK from the kline label, not
     /// defer, or it orphans in bs forever. Order #12 B — a stale orphan healed via
     /// the REST fallback books as "paper_backfill"; everything else is "settlement".
+    /// ORDER #16, DECISION 5 — THE ISOLATION PROOF.
+    ///
+    /// Drive `process_kline_v2` over one identical event sequence twice: once with the
+    /// candidate sink ABSENT, once with it PRESENT. V0's emitted commands must be
+    /// byte-identical.
+    ///
+    /// The refined form is the point: the interesting failure is not "does dead code
+    /// change behaviour" — it is **"does collecting candidates perturb the thing being
+    /// collected from"**. So the second run passes a live `Some(&mut Vec)` that really
+    /// is written to; only the variant ARMS are absent. This is what makes V0 provably
+    /// untouched rather than carefully untouched, and it gates the 7-day clock while
+    /// the audition sits mid-verdict at n=140.
+    #[test]
+    fn order16_candidate_sink_does_not_perturb_v0() {
+        let secs = 300i64;
+        let base = 1_784_000_000i64 / secs * secs;
+        let mut cat = HashMap::new();
+        cat.insert(("BTC".to_string(), "5m".to_string(), base), mref("up_tok", "down_tok"));
+        let catalog = TestCat(cat);
+        let mut bk = HashMap::new();
+        for t in ["up_tok", "down_tok"] {
+            bk.insert(
+                t.to_string(),
+                EventBbo { best_ask: Some(0.60), best_bid: Some(0.58), ts_ms: (base + 400) * 1000 },
+            );
+        }
+        let book = TestBook(bk);
+        let mut vcfg = crate::config::V2Config::default();
+        vcfg.enabled = true;
+        let mut s5 = vcfg.strat_5m(0.0);
+        s5.base_usd = 1.05;
+        s5.max_pos_usd = 3.15;
+        // The synthetic tape is more volatile than production's vol_cap allows; lift
+        // only that knob so the fixture fires. Every other gate stays at its deployed
+        // value, so early low-displacement seconds are still REJECTED — which is what
+        // makes the superset assertion below meaningful.
+        s5.vol_cap = 1_000.0;
+        let mut strats = std::collections::HashMap::new();
+        strats.insert("5m", s5);
+
+        // One fixed event sequence, replayed identically into both runs. Drift plus a
+        // wiggle so vol is real and the gate stack actually admits some seconds.
+        let events: Vec<(i64, f64)> = (0..120)
+            .map(|i| {
+                let t = base + 60 + i;
+                (t, 100.0 + 0.03 * i as f64 + 0.05 * ((i as f64) * 1.7).sin())
+            })
+            .collect();
+
+        let run = |mut sink: Option<&mut Vec<crate::variants::Candidate>>| {
+            let mut history = crate::v2::PriceHistory::new(4096);
+            history.push("BTC", base - 1, 100.0);
+            let mut fired: Vec<(String, String, f64, i64)> = Vec::new();
+            for (t, px) in &events {
+                let k = kl("BTC", *t, *px, *t * 1000);
+                let cmds = process_kline_v2(
+                    &mut history, &k, &catalog, &book, &strats,
+                    &[], (*t + 1) * 1000, &[],
+                    sink.as_deref_mut(),
+                );
+                for (cmd, p, p_raw) in cmds {
+                    if let ExecCommand::Open { intent, ctx } = cmd {
+                        // Token, signal id, stake and the two probabilities — if the
+                        // sink perturbed anything upstream, one of these moves.
+                        fired.push((intent.token_id, ctx.signal_id, ctx.stake_usd + p + p_raw, ctx.ttl_s));
+                    }
+                }
+            }
+            fired
+        };
+
+        let without_sink = run(None);
+        let mut collected: Vec<crate::variants::Candidate> = Vec::new();
+        let with_sink = run(Some(&mut collected));
+
+        assert_eq!(
+            without_sink, with_sink,
+            "collecting candidates must not perturb V0's emitted commands"
+        );
+        assert!(
+            !without_sink.is_empty(),
+            "the fixture must actually fire, or this test proves nothing"
+        );
+        assert!(!collected.is_empty(), "the sink must actually have been written to");
+        // The candidates carry V0's verdict rather than re-deriving it.
+        let admitted = collected.iter().filter(|c| c.v0_admitted).count();
+        assert_eq!(
+            admitted,
+            without_sink.len(),
+            "v0_admitted must mark exactly the candidates V0 actually took"
+        );
+        // And they are a SUPERSET — carrying the rejects is the entire reason V1 exists.
+        assert!(
+            collected.len() > admitted,
+            "the sink must also carry seconds V0 rejected; that is what the union arms read"
+        );
+    }
+
     #[test]
     fn order12_book_decision_table() {
         // PAPER + pf → book at the kline label (source "settlement"), NOT defer.
