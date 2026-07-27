@@ -837,7 +837,7 @@ pub async fn run_decision_task(
                 vcfg_variants.recal_path(v),
                 300,
                 50,
-                20, // shadow-local open cap; never reads the live guard budget
+                vcfg_variants.max_open_positions,
 
                 2,
             ) {
@@ -1012,6 +1012,7 @@ pub async fn run_decision_task(
                                             && bid.is_some()
                                             && !controls.inval_stop_dry();
                                         oplog.sys("inval_stop", serde_json::json!({
+                                            "variant": "v0",
                                             "token_id": p.token_id, "asset": p.asset,
                                             "interval": p.interval, "side": if up {"up"} else {"down"},
                                             "disp_bps": disp, "model_bid": bid,
@@ -1177,6 +1178,7 @@ pub async fn run_decision_task(
                         let resolved = if won { 1.0 } else { 0.0 };
                         let dev = shares * (stop_bid - resolved);
                         oplog.sys("stop_dev", serde_json::json!({
+                            "variant": "v0",
                             "token_id": token, "interval": iv, "won": won,
                             "stop_bid": stop_bid, "shares": shares, "dev": dev,
                             "outcome": if won { "whipsawed" } else { "saved" },
@@ -1588,7 +1590,7 @@ pub async fn run_decision_task(
                                 Err(reason) => {
                                     oplog.sys("variant_open_rejected", serde_json::json!({
                                         "variant": v.as_str(), "token_id": cand.token_id,
-                                        "reason": format!("{reason:?}"),
+                                        "reason": reason.as_str(),
                                     }));
                                 }
                             }

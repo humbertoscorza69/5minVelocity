@@ -432,7 +432,17 @@ pub struct VariantsCfg {
     /// FOK tolerance. Same value the deployed executor uses.
     #[serde(default = "d_max_slippage")]
     pub max_slippage: f64,
+    /// Shadow-local concurrent-position cap. Deliberately far above V0's 20: V1's
+    /// whole thesis is ~3x V0's volume, so a cap sized for V0 would throttle exactly
+    /// the arm under test and the rejection would look like a gate effect. Shadows
+    /// hold no capital, so this bounds memory rather than risk. Watch the
+    /// `shadow_cap` reason in `variant_open_rejected` — if it is a material share of
+    /// rejections, this is still too low.
+    #[serde(default = "d_shadow_max_open")]
+    pub max_open_positions: usize,
 }
+
+fn d_shadow_max_open() -> usize { 200 }
 
 fn d_v1_burst() -> f64 { 2.0 }
 fn d_v2_burst() -> f64 { 3.0 }
@@ -449,6 +459,7 @@ impl Default for VariantsCfg {
             v2_max_ask: d_v2_max_ask(),
             state_dir: d_shadow_dir(),
             max_slippage: d_max_slippage(),
+            max_open_positions: d_shadow_max_open(),
         }
     }
 }

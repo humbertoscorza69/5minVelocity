@@ -70,6 +70,20 @@ pub enum ShadowReject {
     MaxOpenPositions,
 }
 
+impl ShadowReject {
+    /// STABLE lowercase vocabulary for the log. Debug formatting would couple the
+    /// analysis to Rust identifier names; these strings are the contract, and a
+    /// rejection rate over 50% is undiagnosable without them.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShadowReject::AlreadyInMarket => "dedup",
+            ShadowReject::MaxEntriesPerMarket => "reentry_blocked",
+            ShadowReject::MaxOpenPositions => "shadow_cap",
+        }
+    }
+}
+
 /// Constructing a shadow against a protected path is refused, not warned about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectedPathError(pub String);
@@ -326,6 +340,25 @@ mod tests {
         assert_eq!(b.recal_path(), "data/v2/shadow_v1.json");
         // A lookalike that is NOT the protected name is allowed.
         assert!(ShadowBook::new(Variant::V2, "data/v2/recal_shadow.json", 300, 50, 20, 2).is_ok());
+    }
+
+    /// ORDER #17 addendum 2 — the reject vocabulary is a LOG CONTRACT, not Debug
+    /// output. >50% of shadow opens were rejected and undiagnosable; these strings are
+    /// what makes the cause countable, so they must not drift with Rust identifiers.
+    #[test]
+    fn reject_reasons_are_a_stable_lowercase_vocabulary() {
+        assert_eq!(ShadowReject::MaxOpenPositions.as_str(), "shadow_cap");
+        assert_eq!(ShadowReject::AlreadyInMarket.as_str(), "dedup");
+        assert_eq!(ShadowReject::MaxEntriesPerMarket.as_str(), "reentry_blocked");
+        // Every reason a real rejection can carry is covered and lowercase.
+        for r in [
+            ShadowReject::MaxOpenPositions,
+            ShadowReject::AlreadyInMarket,
+            ShadowReject::MaxEntriesPerMarket,
+        ] {
+            let s = r.as_str();
+            assert!(!s.is_empty() && s == s.to_lowercase(), "{s} must be lowercase");
+        }
     }
 
     /// LEAK SURFACE 1 (the one that matters most): shadow caps bind against SHADOW

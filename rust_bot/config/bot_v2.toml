@@ -305,3 +305,9 @@ v2_burst_bps = 3.0
 v2_max_ask = 0.75
 state_dir = "data/v2/shadow"
 max_slippage = 0.04
+# Shadow-local concurrent-position cap. NOT V0's 20: V1 is expected to trade ~3x V0's
+# volume, so a V0-sized cap would throttle precisely the arm under test and the
+# throttling would masquerade as a gate effect. Shadows hold no capital, so this
+# bounds memory rather than risk. If the `shadow_cap` reason is a material share of
+# variant_open_rejected, raise it further.
+max_open_positions = 200

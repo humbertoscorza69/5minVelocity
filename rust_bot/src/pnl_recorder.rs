@@ -622,6 +622,10 @@ pub fn record_settled(
     oplog.sys(
         "pnl_recorder_recorded",
         serde_json::json!({
+            // ORDER #17 D: V0's P&L rows carry the tag explicitly. net_v0_killadj is a
+            // pre-registered scoring baseline and must not depend on inferring V0 from
+            // a MISSING field — absence is exactly the ambiguity this prevents.
+            "variant": "v0",
             "token_id": token_id,
             "shares": total_shares,
             "entry_price": avg_entry,
