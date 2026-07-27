@@ -38,6 +38,7 @@ mod tasks;
 mod trade_log;
 mod trading_loop;
 mod v2;
+mod variants;
 mod window_logger;
 mod ws;
 

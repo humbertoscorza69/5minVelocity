@@ -75,9 +75,23 @@ pub enum MarketEvent {
     /// A trade print — from the REST print feed, NOT the websocket.
     ///
     /// `https://data-api.polymarket.com/trades?market=<condition_id>` is the only
-    /// source of executed volume, and it is the same source the validated queue
-    /// backtest used (4.38M re-fetched prints → the +0.455¢/share OOS figure), so
-    /// scoring against that model stays apples-to-apples.
+    /// COMPLETE source of executed volume, and it is the same source the validated
+    /// queue backtest used (4.38M re-fetched prints → the +0.455¢/share OOS figure),
+    /// so scoring against that model stays apples-to-apples.
+    ///
+    /// The WS *does* emit `last_trade_price` — but measured against REST by
+    /// `transaction_hash` over one window it carried only **30.2% of prints and ~28%
+    /// of volume** (273 of 898 hashes; 627 REST-only, 2 WS-only). It has last-price
+    /// semantics: consecutive fills at one price collapse into a single event. Driving
+    /// the queue off it would consume ~30% of real volume, so our simulated queue
+    /// would advance too slowly and the run would UNDERSTATE fill rate — the core
+    /// metric of the whole business case. Use it as a low-latency hint and for the
+    /// `transaction_hash` (which gives A8 counterparty logging for free); never as the
+    /// fill driver.
+    ///
+    /// METHODOLOGY WARNING for anyone re-measuring this: the data-api indexer lags by
+    /// MINUTES. Querying it immediately returned 16 rows and implied 93.8% WS coverage
+    /// — the exact opposite conclusion. Wait ~300s and pass `takerOnly=false`.
     ///
     /// Consequence for the caller: prints arrive on a LAG. A paper fill needs no
     /// real-time determination, so the driver must merge WS book events and REST
