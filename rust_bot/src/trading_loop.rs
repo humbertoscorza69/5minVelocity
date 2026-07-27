@@ -76,6 +76,32 @@ fn photo_finish_prices(op: f64, fin: f64) -> bool {
 /// so the auditor separates the one-time heal from steady-state booking.
 const PAPER_BACKFILL_MIN_AGE_S: i64 = 600;
 
+/// Max side-aligned 1s/3s Binance return over `t_s-5 ..= t_s`, in bps.
+///
+/// THE single definition of "burst". Order #5's sizing tiers and Order #16's V1/V2
+/// gates must read the same number — if the A/B re-derived it, a subtle difference in
+/// the window would surface as a gate effect, which is the confound the whole design
+/// is arranged to avoid. Extracted verbatim from the sizing site; behaviour unchanged.
+#[must_use]
+fn burst_bps_at(history: &crate::v2::PriceHistory, asset: &str, t_s: i64, up: bool) -> f64 {
+    let sign = if up { 1.0 } else { -1.0 };
+    let mut b = 0.0_f64;
+    for k in 0..5i64 {
+        let t = t_s - k;
+        if let (Some(c), Some(c1)) = (history.close_at(asset, t), history.close_at(asset, t - 1))
+            && c1 > 0.0
+        {
+            b = b.max(sign * (c / c1 - 1.0) * 1e4);
+        }
+        if let (Some(c), Some(c3)) = (history.close_at(asset, t), history.close_at(asset, t - 3))
+            && c3 > 0.0
+        {
+            b = b.max(sign * (c / c3 - 1.0) * 1e4);
+        }
+    }
+    b
+}
+
 #[inline]
 #[must_use]
 fn is_paper_backfill(resolution_s: i64, now_s: i64) -> bool {
@@ -1265,26 +1291,12 @@ pub async fn run_decision_task(
                             // BEFORE the guard so it caps the REAL (multiplied) stake and
                             // the daily-loss stop accrues on effective P&L. burst_bps =
                             // max side-aligned 1s/3s Binance return over entry-5s..entry.
-                            let burst_bps = {
-                                let sign = if ctx.side.eq_ignore_ascii_case("up") { 1.0 } else { -1.0 };
-                                let mut b = 0.0_f64;
-                                for k in 0..5i64 {
-                                    let t = kline.t_s - k;
-                                    if let (Some(c), Some(c1)) =
-                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 1))
-                                        && c1 > 0.0
-                                    {
-                                        b = b.max(sign * (c / c1 - 1.0) * 1e4);
-                                    }
-                                    if let (Some(c), Some(c3)) =
-                                        (history.close_at(&kline.asset, t), history.close_at(&kline.asset, t - 3))
-                                        && c3 > 0.0
-                                    {
-                                        b = b.max(sign * (c / c3 - 1.0) * 1e4);
-                                    }
-                                }
-                                b
-                            };
+                            let burst_bps = burst_bps_at(
+                                &history,
+                                &kline.asset,
+                                kline.t_s,
+                                ctx.side.eq_ignore_ascii_case("up"),
+                            );
                             let burst_mult = if burst_bps >= vcfg.burst_hi_bps {
                                 vcfg.burst_mult_hi
                             } else if burst_bps >= vcfg.burst_lo_bps {

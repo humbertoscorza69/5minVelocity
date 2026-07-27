@@ -251,6 +251,11 @@ pub struct V2Config {
     /// its own recalibrator). Absent/disabled = 5m-only (no behavior change).
     #[serde(default)]
     pub i15m: Interval15mCfg,
+    /// ORDER #17 A — the variant A/B. Default OFF: with `enabled = false` this is
+    /// today's behaviour exactly, which is what makes the deploy separable from the
+    /// arming (gate 2 vs gate 3 of the run procedure).
+    #[serde(default)]
+    pub variants: VariantsCfg,
 }
 
 fn d_stop_bid_hi() -> f64 { 0.50 }
@@ -404,6 +409,68 @@ impl V2Config {
     }
 }
 
+/// ORDER #17 A — variant A/B settings. Frozen by pre-registration; the thresholds are
+/// here so the run is reproducible from config, NOT so they can be tuned mid-run
+/// ("no mid-run gate tuning — if an arm is broken, fix the bug and restart the clock").
+#[derive(Debug, Clone, Deserialize)]
+pub struct VariantsCfg {
+    /// Master switch. `false` = today's behaviour exactly, byte-identical.
+    #[serde(default)]
+    pub enabled: bool,
+    /// V1: V0 OR burst >= this, with no other gate and no ask cap.
+    #[serde(default = "d_v1_burst")]
+    pub v1_burst_bps: f64,
+    /// V2: V0 OR (burst >= this AND ask <= `v2_max_ask`).
+    #[serde(default = "d_v2_burst")]
+    pub v2_burst_bps: f64,
+    #[serde(default = "d_v2_max_ask")]
+    pub v2_max_ask: f64,
+    /// Per-variant state lives here — never in `state.json`, whose schema V0's load
+    /// path depends on mid-audition.
+    #[serde(default = "d_shadow_dir")]
+    pub state_dir: String,
+    /// FOK tolerance. Same value the deployed executor uses.
+    #[serde(default = "d_max_slippage")]
+    pub max_slippage: f64,
+}
+
+fn d_v1_burst() -> f64 { 2.0 }
+fn d_v2_burst() -> f64 { 3.0 }
+fn d_v2_max_ask() -> f64 { 0.75 }
+fn d_shadow_dir() -> String { "data/v2/shadow".to_string() }
+fn d_max_slippage() -> f64 { 0.04 }
+
+impl Default for VariantsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            v1_burst_bps: d_v1_burst(),
+            v2_burst_bps: d_v2_burst(),
+            v2_max_ask: d_v2_max_ask(),
+            state_dir: d_shadow_dir(),
+            max_slippage: d_max_slippage(),
+        }
+    }
+}
+
+impl VariantsCfg {
+    /// The frozen thresholds, in the shape the pure gate takes.
+    #[must_use]
+    pub fn to_variant_config(&self) -> crate::variants::VariantConfig {
+        crate::variants::VariantConfig {
+            v1_burst_bps: self.v1_burst_bps,
+            v2_burst_bps: self.v2_burst_bps,
+            v2_max_ask: self.v2_max_ask,
+        }
+    }
+    /// Shadow recal path for a variant. Kept away from the audition's files by
+    /// construction; `ShadowBook::new` refuses the protected names as a second line.
+    #[must_use]
+    pub fn recal_path(&self, v: crate::variants::Variant) -> String {
+        format!("{}/shadow_{}.json", self.state_dir.trim_end_matches('/'), v.as_str())
+    }
+}
+
 impl Interval15mCfg {
     /// Build the 15-minute strategy with the given current recal de-bias. Gated by
     /// BOTH the master `v2.enabled` and this section's `enabled`.
@@ -473,6 +540,7 @@ impl Default for V2Config {
             vol60_floor: 0.0,
             min_ask: d_min_ask(),
             i15m: Interval15mCfg::default(),
+            variants: VariantsCfg::default(),
         }
     }
 }
