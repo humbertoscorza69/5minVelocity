@@ -31,6 +31,7 @@ mod pnl_recorder;
 mod redemption;
 mod relayer;
 mod rest;
+mod shadow;
 mod sign_parity;
 mod signal;
 mod state;

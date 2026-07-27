@@ -37,6 +37,41 @@
 //! 6. The 7-day clock only starts with Order #14 deployed and the feed healthy. A
 //!    repeat of the 45-hour blind window voids this A/B exactly as it voided the
 //!    weekend exam.
+//!
+//! # The six leak surfaces
+//!
+//! Isolation fails at BOUNDARIES, not inside the data structure — and this codebase
+//! has precedent: Order #12 B's 79 phantom positions counting toward exposure caps
+//! was exactly this bug in an earlier costume. Each surface must be severed AND
+//! tested:
+//!
+//! 1. **Guard / exposure budget.** Shadow opens must not consume
+//!    `max_open_positions`, the stake cap, total exposure, the per-token cap or
+//!    `daily_loss_cap`. If they do, V1/V2 throttle V0 and the treatment corrupts the
+//!    control — the worst failure available here, because it is invisible in the P&L
+//!    and looks like a real result.
+//! 2. **Canary.** V0's per-asset AMBER/RED arms off hold-WR. Shadow settles must
+//!    never feed it, or V1/V2's larger population changes V0's stake multipliers and
+//!    re-entry suspension.
+//! 3. **Settlement sweep.** Paper settlement drains `state.v2_settled`; shadows need
+//!    their OWN map or they are drained into V0's recal feed — the survivorship bug
+//!    from Order #11 C.
+//! 4. **Accounting invariant.** The "every posted token in exactly one of
+//!    {close_posted, pnl_recorded}" banner fires on shadow positions unless it is
+//!    variant-scoped. A noisy invariant is a dead invariant, and it is the only thing
+//!    catching booking bugs.
+//! 5. **State persistence.** Shadow state lives in its own file, never inside
+//!    `state.json` — a schema change to the shared file is a way to break V0's state
+//!    load mid-audition.
+//! 6. **Recal files.** Own paths, enforced in code (see `ShadowBook::new`).
+//!
+//! # What makes it "provably"
+//!
+//! An integration test drives the loop over an identical synthetic event sequence
+//! TWICE — variants disabled, then enabled — and asserts V0's intents, positions,
+//! P&L rows and recal samples are byte-identical across the two runs. That converts
+//! isolation from a design intention into a regression-tested invariant, and it is
+//! cheap because the loop is already deterministic given a fixed event sequence.
 
 // The gates, the kill model and the decision rule are complete and tested; the
 // decision-loop wiring that calls them is the remaining step of Order #16. Allowed at
