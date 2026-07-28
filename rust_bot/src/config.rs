@@ -440,7 +440,17 @@ pub struct VariantsCfg {
     /// rejections, this is still too low.
     #[serde(default = "d_shadow_max_open")]
     pub max_open_positions: usize,
+    /// Minimum ms between a candidate's quote and its FOK evaluation. The kill model
+    /// is meaningless without a gap: checking the book in the same tick compares a
+    /// quote against itself and yields 0% kills. The decision loop ticks ~1/s, so the
+    /// effective gap is ~1s — pessimistic versus a real ~200ms round trip, which is
+    /// why `quote_ask`, `fill_ask` and the ACTUAL `latency_ms` are all logged: the
+    /// kill rate stays re-scorable offline at any assumed latency.
+    #[serde(default = "d_fok_latency_ms")]
+    pub fok_min_latency_ms: i64,
 }
+
+fn d_fok_latency_ms() -> i64 { 200 }
 
 fn d_shadow_max_open() -> usize { 200 }
 
@@ -460,6 +470,7 @@ impl Default for VariantsCfg {
             state_dir: d_shadow_dir(),
             max_slippage: d_max_slippage(),
             max_open_positions: d_shadow_max_open(),
+            fok_min_latency_ms: d_fok_latency_ms(),
         }
     }
 }

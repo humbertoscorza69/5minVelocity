@@ -311,3 +311,10 @@ max_slippage = 0.04
 # bounds memory rather than risk. If the `shadow_cap` reason is a material share of
 # variant_open_rejected, raise it further.
 max_open_positions = 200
+# Minimum ms between a candidate's quote and its FOK evaluation. Without a gap the
+# kill model compares a quote against itself: the first armed run reported 0.0% kill
+# on all three arms, i.e. a dead instrument on the metric the experiment exists for.
+# The loop ticks ~1/s so the effective gap is ~1s — pessimistic vs a real ~200ms
+# round trip, which is why quote_ask / fill_ask / actual latency_ms are all logged
+# and the kill rate stays re-scorable offline at any assumed latency.
+fok_min_latency_ms = 200

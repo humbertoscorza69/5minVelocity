@@ -829,6 +829,7 @@ pub async fn run_decision_task(
     // with `bs.positions`, `guards`, the canary, `state.v2_settled` or `state.json`.
     let vcfg_variants = vcfg.variants.clone();
     let variant_cfg = vcfg_variants.to_variant_config();
+    let fok_min_latency_ms = vcfg_variants.fok_min_latency_ms;
     let mut shadows: Vec<(crate::variants::Variant, crate::shadow::ShadowBook)> = Vec::new();
     if vcfg_variants.enabled {
         for v in [crate::variants::Variant::V1, crate::variants::Variant::V2] {
@@ -863,6 +864,16 @@ pub async fn run_decision_task(
     // E1: per-tick decision latency, tagged with the enabled flag. ~20 lines, and the
     // only thing that says whether the 25% kill leg is partly our own overhead.
     let mut cand_buf: Vec<crate::variants::Candidate> = Vec::with_capacity(64);
+    // ORDER #17 C — DEFERRED FOK. The kill model must see a REAL latency gap. Checking
+    // the book in the same tick that produced the candidate compares a quote against
+    // itself: slip is ~0, nothing ever kills, and the first live run duly reported
+    // 0.0% kill on all three arms — a dead instrument on the metric the experiment
+    // exists for, and a WIN leg every arm passes trivially.
+    // So candidates are held and evaluated on a LATER tick against the book as it
+    // then stands, with the ACTUAL elapsed ms logged. That keeps the decision
+    // re-scorable offline at any assumed latency (quote_ask, fill_ask and latency_ms
+    // are all recorded) instead of baking one in.
+    let mut pending_fok: Vec<(crate::variants::Candidate, i64)> = Vec::new();
     let mut tick_us: Vec<u64> = Vec::with_capacity(4096);
     let mut tick_report_at = now_ms() + 3_600_000;
     // AUDIT fix #3: first-touch set for canary shadow intents — process_kline_v2
@@ -1509,7 +1520,15 @@ pub async fn run_decision_task(
                     }
                     // ORDER #17 B/C/D — VARIANT ARMS. Runs only when armed; every
                     // effect lands in a ShadowBook, never in V0's machinery.
-                    for cand in cand_buf.drain(..) {
+                    // Evaluate candidates held from an earlier tick, then stash this
+                    // tick's for the next one — this is where the latency gap comes from.
+                    let due: Vec<(crate::variants::Candidate, i64)> =
+                        pending_fok.drain(..).filter(|(_, t)| now - *t >= fok_min_latency_ms).collect();
+                    for c in cand_buf.drain(..) {
+                        pending_fok.push((c, now));
+                    }
+                    if pending_fok.len() > 10_000 { pending_fok.clear(); }
+                    for (cand, decided_ms) in due {
                         // B1: the SAME burst definition the sizing tiers use — reused,
                         // never re-derived, so a window difference cannot masquerade
                         // as a gate effect.
@@ -1522,7 +1541,7 @@ pub async fn run_decision_task(
                             ask_now.unwrap_or(cand.ask),
                             vcfg_variants.max_slippage,
                         );
-                        let latency_ms = now - (kline.received_at_ms.max(1));
+                        let latency_ms = now - decided_ms;
                         let day = utc_day_of(now);
                         // V0's kill is a COUNTERFACTUAL: computed identically, logged,
                         // and deliberately NOT acted on. Keeping V0 byte-identical

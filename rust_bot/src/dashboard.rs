@@ -619,11 +619,15 @@ fn compute_stats(
     //      pre-registered V0 baselines rendered side by side. READ-ONLY: nothing here
     //      can arm, disarm or otherwise touch an arm.
     // V0's realized rows come from `rev` (the audited path); V1/V2 from `variant_pnl`.
-    for (ts, r, token, _side, _e, _x, iv) in &rev {
+    // SESSION-SCOPED, and that scoping is load-bearing. `rev` merges the oplog
+    // (session-filtered) with the P&L recorder FILE, which spans restarts — so an
+    // unfiltered V0 would carry P&L from before the arms existed while V1/V2 only
+    // ever have this session. That makes V0 look better purely by covering a longer
+    // window, and the +50% leg is measured against exactly that number.
+    for (ts, r, _token, _side, _e, _x, iv) in rev.iter().filter(|(t, ..)| *t >= started_ms) {
         let a = varacc.entry("v0".to_string()).or_default();
         a.rows.push((*ts, *r, iv.clone()));
         a.pnl_n += 1;
-        let _ = token;
     }
     /// Downside deviation of DAILY net — Sortino's denominator. Upside volatility is
     /// not risk, which is why this is the metric the order asks for rather than Sharpe.
@@ -683,6 +687,7 @@ fn compute_stats(
     let net_v0_actual: f64 = v0a.rows.iter().map(|(_, n, _)| *n).sum();
     let net_v0_killadj: f64 = rev
         .iter()
+        .filter(|(t, ..)| *t >= started_ms)
         .filter(|(_, _, tok, _, _, _, _)| !v0_killed_tokens.contains(tok))
         .map(|(_, r, _, _, _, _, _)| *r)
         .sum();
