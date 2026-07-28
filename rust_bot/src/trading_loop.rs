@@ -1543,6 +1543,17 @@ pub async fn run_decision_task(
                             let mkey = crate::shadow::ShadowBook::market_key(
                                 &cand.asset, &cand.interval, cand.epoch,
                             );
+                            // ADMISSIBILITY FIRST, then the kill model. A variant
+                            // re-qualifies on a market it already holds on nearly
+                            // every tick; counting those as killed ATTEMPTS would
+                            // inflate the kill rate, which is the hard-FAIL leg.
+                            if let Err(reason) = sb.can_open(&mkey, &cand.token_id) {
+                                oplog.sys("variant_open_rejected", serde_json::json!({
+                                    "variant": v.as_str(), "token_id": cand.token_id,
+                                    "reason": reason.as_str(),
+                                }));
+                                continue;
+                            }
                             if fok.killed {
                                 sb.record_kill(&day);
                                 oplog.sys("v2_intent_open", serde_json::json!({

@@ -206,22 +206,33 @@ impl ShadowBook {
     /// live `guards`, so a shadow can neither be throttled by V0's budget nor consume
     /// it (leak surface 1). `killed` FOK attempts must NOT call this; record them via
     /// [`Self::record_kill`] so kill rate and entries stay distinguishable.
+    /// Would an open be admitted? Pure — no mutation.
+    ///
+    /// This exists so the caller can test admissibility BEFORE modelling the FOK
+    /// kill. Ordering matters more than it looks: a variant re-qualifies on a market
+    /// it already holds on almost every tick, and if the kill were evaluated first
+    /// those non-attempts would land in the kill-rate denominator (and numerator).
+    /// Kill rate is the hard-FAIL leg at 25%, so that would fail an arm on bookkeeping.
+    pub fn can_open(&self, mkey: &str, token_id: &str) -> Result<(), ShadowReject> {
+        if self.entered.contains(token_id) {
+            return Err(ShadowReject::AlreadyInMarket);
+        }
+        if self.market_entries.get(mkey).copied().unwrap_or(0) >= self.max_entries_per_market {
+            return Err(ShadowReject::MaxEntriesPerMarket);
+        }
+        if self.positions.len() >= self.max_open_positions {
+            return Err(ShadowReject::MaxOpenPositions);
+        }
+        Ok(())
+    }
+
     pub fn open(
         &mut self,
         mkey: &str,
         pos: ShadowPosition,
         day: &str,
     ) -> Result<(), ShadowReject> {
-        if self.entered.contains(&pos.token_id) {
-            return Err(ShadowReject::AlreadyInMarket);
-        }
-        let entries = self.market_entries.get(mkey).copied().unwrap_or(0);
-        if entries >= self.max_entries_per_market {
-            return Err(ShadowReject::MaxEntriesPerMarket);
-        }
-        if self.positions.len() >= self.max_open_positions {
-            return Err(ShadowReject::MaxOpenPositions);
-        }
+        self.can_open(mkey, &pos.token_id)?;
         self.entered.insert(pos.token_id.clone());
         *self.market_entries.entry(mkey.to_string()).or_insert(0) += 1;
         self.positions.push(pos);
@@ -440,6 +451,37 @@ mod tests {
         let row = b.settle("t1", false, 5_000, "d1", true).unwrap();
         assert!((row.net_pnl + 1.05).abs() < 1e-12, "lost the full stake: 1.75 * -0.60");
         assert!(b.day_stats()["d1"].net_usd < 0.0);
+    }
+
+    /// LIVE-CAUGHT REGRESSION: admissibility must be testable BEFORE the FOK kill.
+    /// A variant re-qualifies on a market it already holds on nearly every tick
+    /// (7,387 dedup rejections in the first minutes of the live run). If the kill were
+    /// evaluated first, those non-attempts would land in the kill rate — the hard-FAIL
+    /// leg at 25% — and could fail an arm on bookkeeping rather than on execution.
+    #[test]
+    fn can_open_gates_before_the_kill_model_and_does_not_mutate() {
+        let mut b = book(Variant::V1);
+        assert!(b.can_open("m1", "t1").is_ok(), "a fresh market is admissible");
+        b.open("m1", pos("t1", 0.6, 1.75), "d1").unwrap();
+
+        // Same token again → NOT admissible, so no kill may be recorded for it.
+        assert_eq!(b.can_open("m1", "t1"), Err(ShadowReject::AlreadyInMarket));
+        // The check is PURE: asking repeatedly changes nothing.
+        for _ in 0..5 {
+            let _ = b.can_open("m1", "t1");
+        }
+        assert_eq!(b.open_count(), 1);
+        assert_eq!(b.day_stats()["d1"].kills, 0, "an inadmissible attempt is not a kill");
+        assert_eq!(b.day_stats()["d1"].entries, 1);
+
+        // And it agrees with what open() would decide.
+        assert_eq!(
+            b.can_open("m1", "t2"),
+            Ok(()),
+            "the one permitted re-entry is admissible"
+        );
+        b.open("m1", pos("t2", 0.6, 1.75), "d1").unwrap();
+        assert_eq!(b.can_open("m1", "t3"), Err(ShadowReject::MaxEntriesPerMarket));
     }
 
     /// Kills are counted but create NO position — they must stay distinguishable from
