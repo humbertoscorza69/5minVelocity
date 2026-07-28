@@ -1203,16 +1203,28 @@ async function tick(){
 // open positions, trades table, chart) for the selected strategy (all/5m/15m).
 function render(){
   const s=LAST;if(!s)return;
-  const st=(FILT==="all")?s.stats:(s.by_interval[FILT]||{closed:0,wins:0,losses:0,win_rate:0,profit_factor:0,gross_win:0,gross_loss:0,realized:0});
-  const realized=(FILT==="all")?s.pnl.realized:st.realized;
+  let st=(FILT==="all")?s.stats:(s.by_interval[FILT]||{closed:0,wins:0,losses:0,win_rate:0,profit_factor:0,gross_win:0,gross_loss:0,realized:0});
+  let realized=(FILT==="all")?s.pnl.realized:st.realized;
   // open_positions is V0's book only (shadows are virtual and not in bs.positions),
   // so selecting V1/V2 correctly shows none rather than implying V0's are theirs.
   const opens=(VFILT==="v1"||VFILT==="v2")?[]:((FILT==="all")?s.open_positions:s.open_positions.filter(p=>p.interval===FILT));
   const unreal=opens.reduce((a,p)=>a+(+p.unreal),0);
-  const total=realized+unreal;
+  let total=realized+unreal;
   // ORDER #17 item 3: the variant selector filters the same way the interval one
   // does — client-side over per-point tags, so both dimensions compose.
   const vok=p=>VFILT==="all"||(p.v||"v0")===VFILT;
+  // ORDER #17 item 3: when a single ARM is selected, the headline cards must show
+  // THAT arm — otherwise the selector silently reports V0's numbers under a V1 label,
+  // which is worse than showing nothing. V1/V2 stats come from the backend's
+  // per-variant block (their P&L lives in shadow ledgers, not in by_interval).
+  if(VFILT!=="all"&&s.variants&&s.variants[VFILT]){
+    const V=s.variants[VFILT];
+    st={closed:V.closed,wins:V.wins,losses:V.losses,win_rate:V.win_rate,
+        profit_factor:V.profit_factor,
+        // Backend reports net only; split gross for the W/L sub-line.
+        gross_win:(V.net>0?V.net:0),gross_loss:(V.net<0?-V.net:0),realized:V.net};
+    realized=V.net; total=V.net; // shadows carry no unrealized: they settle or nothing
+  }
   const rc=(FILT==="15m")?s.recal.m15:s.recal.m5;
   $("filt_note").textContent=(FILT==="all")?"combined 5m + 15m":(FILT+" only");
   const t=$("pnl_total");t.textContent=money(total);t.className="val mono "+cls(total);
