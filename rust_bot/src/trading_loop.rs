@@ -842,7 +842,19 @@ pub async fn run_decision_task(
 
                 2,
             ) {
-                Ok(b) => shadows.push((v, b)),
+                Ok(mut b) => {
+                    // ORDER #18: restore accumulated state. Without this the recal
+                    // window and ledger reset on every restart — and there were 5
+                    // `variants_armed` events in a 3-day window.
+                    let sp = vcfg_variants.state_path(v);
+                    if let Some(snap) = crate::shadow::ShadowBook::load(&sp) {
+                        let (pos, led) = (snap.positions.len(), snap.ledger.len());
+                        b.restore(snap);
+                        info!(variant = v.as_str(), positions = pos, ledger = led,
+                            path = %sp, "shadow state restored");
+                    }
+                    shadows.push((v, b));
+                }
                 // Refusing to start is correct: a shadow pointed at the audition's
                 // recal would contaminate a mid-verdict n=140 window.
                 Err(e) => tracing::error!(variant = v.as_str(), error = %e, "shadow build REFUSED — arm aborted"),
@@ -1111,6 +1123,63 @@ pub async fn run_decision_task(
                             }
                         }
                     }
+                    // ORDER #18 — SHADOW BAND-STOP. Order #16 required "exits
+                    // identical across all three", but shadows ran hold-only while V0
+                    // ran hold + band-stop (100% of variant_pnl resolved at 0.0/1.0).
+                    // That asymmetry FAVOURED V0 — its stop added +$17.44 over the
+                    // measured window — so closing it makes the arms look better, not
+                    // worse. Same rule, same thresholds, same per-second evaluation.
+                    if controls.inval_stop_on() {
+                        for (v, sb) in shadows.iter_mut() {
+                            for (token, asset, up, iv) in sb.open_for_stop() {
+                                let secs = interval_secs(&iv).max(1);
+                                let epoch_s = (now_s / secs) * secs;
+                                let (Some(open), Some(cur)) =
+                                    (history.close_at(&asset, epoch_s - 1), history.close_at(&asset, now_s))
+                                else { continue };
+                                let raw = (cur / open - 1.0) * 1e4;
+                                let disp = if up { raw } else { -raw }; // side-signed
+                                let bid = state.bbo.get(&token).and_then(|b| b.best_bid);
+                                if !crate::shadow::ShadowBook::stop_should_fire(
+                                    disp, bid, vcfg.stop_bid_hi, vcfg.stop_bid_lo,
+                                ) {
+                                    continue;
+                                }
+                                let Some(b) = bid else { continue };
+                                if let Some(row) = sb.apply_stop(&token, b, now, &utc_day_of(now)) {
+                                    oplog.sys("variant_pnl", serde_json::json!({
+                                        "variant": v.as_str(), "token_id": row.token_id,
+                                        "interval": row.interval, "entry_price": row.entry_price,
+                                        "shares": row.shares, "resolved_price": row.resolved_price,
+                                        "net_pnl": row.net_pnl, "exit": "band_stop",
+                                    }));
+                                }
+                            }
+                            // Stop-vs-hold counterfactual, once the window resolves —
+                            // the same `dev` gauge V0 has, per arm.
+                            for sp in sb.take_resolved_stops(now_s) {
+                                let win_secs = interval_secs(&sp.interval).max(1);
+                                let ep = sp.resolution_s - win_secs;
+                                let (Some(op), Some(fin)) = (
+                                    history.close_at(&sp.asset, ep - 1),
+                                    history.close_at(&sp.asset, sp.resolution_s - 1),
+                                ) else { continue };
+                                let won = sp.up == (fin >= op);
+                                let resolved = if won { 1.0 } else { 0.0 };
+                                let dev = sp.shares * (sp.stop_bid - resolved);
+                                // A photo-finish label trains no recal (Order #11 C).
+                                sb.record_stop_counterfactual(
+                                    sp.pred_raw, won, !photo_finish_prices(op, fin),
+                                );
+                                oplog.sys("stop_dev", serde_json::json!({
+                                    "variant": v.as_str(), "token_id": sp.token_id,
+                                    "interval": sp.interval, "won": won,
+                                    "stop_bid": sp.stop_bid, "shares": sp.shares, "dev": dev,
+                                    "outcome": if won { "whipsawed" } else { "saved" },
+                                }));
+                            }
+                        }
+                    }
                     // ORDER #17 — SHADOW SETTLEMENT. Same Binance open-vs-close basis
                     // as V0, but every side effect stays inside the shadow: its own
                     // ledger, its own recal, its own settled map. It never touches
@@ -1151,6 +1220,12 @@ pub async fn run_decision_task(
                                 }));
                             }
                         }
+                    }
+                    // ORDER #18: persist shadow state on the settle cadence, so a
+                    // restart resumes rather than resetting. Own files under
+                    // state_dir — never state.json, whose schema V0's load depends on.
+                    for (v, sb) in shadows.iter() {
+                        sb.save(&vcfg_variants.state_path(*v));
                     }
                     // BUG #3: feed recal the counterfactual outcome of STOPPED-and-SOLD
                     // positions — they left bs before resolution, so the loop above

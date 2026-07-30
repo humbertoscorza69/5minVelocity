@@ -318,6 +318,7 @@ fn compute_stats(
     // token to its later pnl_recorder_recorded net.
     let mut re_opp_life_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (mut re_opp_life_n, mut re_opp_life_net) = (0u64, 0.0f64);
+    let mut v0_stop_dev_total = 0.0f64;
     // ORDER #17 item 3 — per-variant aggregation. V1/V2 are shadow portfolios whose
     // settlements arrive as `variant_pnl`; V0's come through `rev` like always. Kills
     // are read from the `killed` field on every variant-tagged intent, and V0's
@@ -344,6 +345,18 @@ fn compute_stats(
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let ts = v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+            // ORDER #18: V0 hold-only = realised net MINUS the stop's contribution.
+            // `dev` is stop-vs-hold, so subtracting it strips V0 back to hold-only —
+            // the like-for-like figure against hold-only shadows until the shadow
+            // band-stop has accumulated its own history.
+            if kind == "stop_dev"
+                && v.get("data").and_then(|d| d.get("variant")).and_then(Value::as_str)
+                    .unwrap_or("v0") == "v0"
+                && ts >= started_ms
+                && let Some(d) = v.get("data").and_then(|d| d.get("dev")).and_then(num)
+            {
+                v0_stop_dev_total += d;
+            }
             if kind == "stop_dev" {
                 if let Some(d) = v.get("data").and_then(|d| d.get("dev")).and_then(num) {
                     let won = v.get("data").and_then(|d| d.get("won")).and_then(Value::as_bool).unwrap_or(false);
@@ -703,6 +716,9 @@ fn compute_stats(
             "net_v0_actual": net_v0_actual,
             "net_v0_killadj": net_v0_killadj,
             "v0_counterfactual_kills": v0_killed_tokens.len(),
+            // V0 stripped of its band-stop: net − Σdev. Comparable to hold-only arms.
+            "net_v0_hold_only": net_v0_actual - v0_stop_dev_total,
+            "v0_stop_dev_total": v0_stop_dev_total,
         },
         // The comparison strip: deltas vs V0 on the two legs that decide the run.
         "compare": {
@@ -1285,6 +1301,7 @@ function render(){
         "dual baseline — net_v0_actual "+money(b.net_v0_actual)+
         " vs net_v0_killadj "+money(b.net_v0_killadj)+
         " ("+(b.v0_counterfactual_kills||0)+" V0 counterfactual kills removed)"+
+        " · V0 hold-only "+money(b.net_v0_hold_only)+" (stop dev "+sgn(b.v0_stop_dev_total)+")"+
         " · a WIN must hold under BOTH; disagreement = INCONCLUSIVE";
     }
   })();

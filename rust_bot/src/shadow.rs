@@ -98,6 +98,40 @@ impl std::fmt::Display for ProtectedPathError {
     }
 }
 
+/// ORDER #18 — a shadow position closed by the band-stop, awaiting its resolution so
+/// the stop-vs-hold counterfactual (`dev`) can be computed. V0 stashes the same thing
+/// in `state.v2_stop_recal`; shadows keep their own, sharing nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoppedPending {
+    pub token_id: String,
+    pub asset: String,
+    pub interval: String,
+    pub up: bool,
+    pub resolution_s: i64,
+    pub stop_bid: f64,
+    pub shares: f64,
+    pub pred_raw: f64,
+}
+
+/// ORDER #18 — the on-disk form. Shadow state must survive a restart: there were 5
+/// `variants_armed` events in a 3-day window, and without this the recal window and
+/// ledger reset each time, which also left severance 5 ("shadow state in its own
+/// files") unverifiable because nothing was ever written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowSnapshot {
+    pub variant: Variant,
+    pub positions: Vec<ShadowPosition>,
+    pub ledger: Vec<ShadowPnl>,
+    pub day_stats: BTreeMap<String, DayStat>,
+    pub recal: Recalibrator,
+    #[serde(default)]
+    pub entered: Vec<String>,
+    #[serde(default)]
+    pub market_entries: HashMap<String, u8>,
+    #[serde(default)]
+    pub stopped_pending: Vec<StoppedPending>,
+}
+
 /// A complete virtual portfolio: own positions, own settled map, own recal, own
 /// ledger, own dedup. Shares nothing mutable with V0.
 #[derive(Debug)]
@@ -117,6 +151,8 @@ pub struct ShadowBook {
     reentry: HashMap<String, (i64, bool)>,
     ledger: Vec<ShadowPnl>,
     day_stats: BTreeMap<String, DayStat>,
+    /// Stopped-out positions awaiting resolution for their `dev` counterfactual.
+    stopped_pending: Vec<StoppedPending>,
     max_open_positions: usize,
     max_entries_per_market: u8,
 }
@@ -156,6 +192,7 @@ impl ShadowBook {
             reentry: HashMap::new(),
             ledger: Vec::new(),
             day_stats: BTreeMap::new(),
+            stopped_pending: Vec::new(),
             max_open_positions,
             max_entries_per_market,
         })
@@ -289,6 +326,133 @@ impl ShadowBook {
         self.day_stats.entry(day.to_string()).or_default().net_usd += net;
         self.ledger.push(row.clone());
         Some(row)
+    }
+
+    /// ORDER #18 — the deployed BAND-STOP, applied to shadow positions.
+    ///
+    /// Order #16 specified "exits identical across all three", but shadows ran
+    /// hold-only while V0 ran hold + band-stop: 100% of `variant_pnl` rows resolved at
+    /// exactly 0.0/1.0. That asymmetry FAVOURED V0 (its stop added +$17.44 over the
+    /// measured window), so correcting it makes the variants look better, not worse.
+    ///
+    /// Same rule and thresholds as V0: exit at the bid when side-signed displacement
+    /// has reverted to <= 0 AND the bid sits in an overpay band (>= hi or <= lo). The
+    /// fair mid-band has no stale-bid premium to harvest and whipsaws, so it holds.
+    #[must_use]
+    pub fn stop_should_fire(disp: f64, bid: Option<f64>, hi: f64, lo: f64) -> bool {
+        disp <= 0.0 && matches!(bid, Some(b) if b >= hi || b <= lo)
+    }
+
+    /// Positions eligible for a stop check this tick: (token, asset, up, interval).
+    #[must_use]
+    pub fn open_for_stop(&self) -> Vec<(String, String, bool, String)> {
+        self.positions
+            .iter()
+            .map(|p| (p.token_id.clone(), p.asset.clone(), p.up, p.interval.clone()))
+            .collect()
+    }
+
+    /// Close a position at `bid` (a fired stop). Books the REALISED exit price rather
+    /// than a 0/1 settlement, and stashes the stop-vs-hold counterfactual so `dev` can
+    /// be computed once the window resolves — the same gauge V0 has.
+    pub fn apply_stop(&mut self, token_id: &str, bid: f64, ts_ms: i64, day: &str) -> Option<ShadowPnl> {
+        let idx = self.positions.iter().position(|p| p.token_id == token_id)?;
+        let p = self.positions.remove(idx);
+        let net = p.shares * (bid - p.entry_price);
+        self.stopped_pending.push(StoppedPending {
+            token_id: p.token_id.clone(),
+            asset: p.asset.clone(),
+            interval: p.interval.clone(),
+            up: p.up,
+            resolution_s: p.resolution_s,
+            stop_bid: bid,
+            shares: p.shares,
+            pred_raw: p.pred_raw,
+        });
+        let row = ShadowPnl {
+            token_id: p.token_id,
+            variant: self.variant,
+            ts_ms,
+            interval: p.interval,
+            entry_price: p.entry_price,
+            shares: p.shares,
+            resolved_price: bid, // realised exit, NOT a 0/1 settlement
+            net_pnl: net,
+        };
+        self.day_stats.entry(day.to_string()).or_default().net_usd += net;
+        self.ledger.push(row.clone());
+        Some(row)
+    }
+
+    /// Stopped positions whose window has now resolved — drained for the `dev` gauge.
+    pub fn take_resolved_stops(&mut self, now_s: i64) -> Vec<StoppedPending> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.stopped_pending.len() {
+            if now_s >= self.stopped_pending[i].resolution_s + 2 {
+                out.push(self.stopped_pending.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Feed this shadow's recal a stopped position's HOLD counterfactual — the same
+    /// survivorship fix Order #11 C made for V0. `feed` is the caller's photo-finish
+    /// decision; an unreliable label must never train a recal.
+    pub fn record_stop_counterfactual(&mut self, pred_raw: f64, won: bool, feed: bool) {
+        if feed {
+            self.recal.record(pred_raw, won);
+        }
+    }
+
+    // ---- ORDER #18: persistence (severance 5, now verifiable) ----
+
+    #[must_use]
+    pub fn snapshot(&self) -> ShadowSnapshot {
+        ShadowSnapshot {
+            variant: self.variant,
+            positions: self.positions.clone(),
+            ledger: self.ledger.clone(),
+            day_stats: self.day_stats.clone(),
+            recal: self.recal.clone(),
+            entered: self.entered.iter().cloned().collect(),
+            market_entries: self.market_entries.clone(),
+            stopped_pending: self.stopped_pending.clone(),
+        }
+    }
+
+    /// Restore from disk. The variant and the caps stay as constructed — only the
+    /// accumulated STATE is restored, so a config change is never silently overridden
+    /// by a stale file.
+    pub fn restore(&mut self, snap: ShadowSnapshot) {
+        self.positions = snap.positions;
+        self.ledger = snap.ledger;
+        self.day_stats = snap.day_stats;
+        self.recal = snap.recal;
+        self.entered = snap.entered.into_iter().collect();
+        self.market_entries = snap.market_entries;
+        self.stopped_pending = snap.stopped_pending;
+    }
+
+    /// Write state beside the recal path. Best-effort: a failed save must never take
+    /// the trading loop down.
+    pub fn save(&self, path: &str) {
+        if let Some(dir) = std::path::Path::new(path).parent()
+            && !dir.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(js) = serde_json::to_string(&self.snapshot()) {
+            let _ = std::fs::write(path, js);
+        }
+    }
+
+    /// Load a snapshot from disk, if present and parseable.
+    #[must_use]
+    pub fn load(path: &str) -> Option<ShadowSnapshot> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
     }
 
     /// Mark a market re-entry-eligible after a stop. Per variant (leak surface: V0's
@@ -482,6 +646,75 @@ mod tests {
         );
         b.open("m1", pos("t2", 0.6, 1.75), "d1").unwrap();
         assert_eq!(b.can_open("m1", "t3"), Err(ShadowReject::MaxEntriesPerMarket));
+    }
+
+    /// ORDER #18 — the band-stop rule, identical to V0's. Fires only when the thesis
+    /// is dead AND the bid sits in an overpay band; the fair mid-band whipsaws and is
+    /// deliberately held through.
+    #[test]
+    fn band_stop_matches_v0s_rule() {
+        let (hi, lo) = (0.50, 0.30);
+        // Thesis dead + bid high (stale premium to sell into) → fire.
+        assert!(ShadowBook::stop_should_fire(-1.0, Some(0.60), hi, lo));
+        // Thesis dead + bid low → fire.
+        assert!(ShadowBook::stop_should_fire(-1.0, Some(0.25), hi, lo));
+        // Thesis dead but bid in the FAIR mid-band → hold (nothing to harvest).
+        assert!(!ShadowBook::stop_should_fire(-1.0, Some(0.40), hi, lo));
+        // Thesis alive → never fire, whatever the bid.
+        assert!(!ShadowBook::stop_should_fire(3.0, Some(0.90), hi, lo));
+        // No bid = nothing to sell to → hold.
+        assert!(!ShadowBook::stop_should_fire(-1.0, None, hi, lo));
+        // Boundaries are inclusive, matching V0.
+        assert!(ShadowBook::stop_should_fire(0.0, Some(0.50), hi, lo));
+        assert!(ShadowBook::stop_should_fire(0.0, Some(0.30), hi, lo));
+    }
+
+    /// A stop books the REALISED exit price, not a 0/1 settlement — which is exactly
+    /// what was missing: 100% of variant_pnl rows resolved at 0.0/1.0 because shadows
+    /// had no exit policy at all.
+    #[test]
+    fn stop_books_the_realised_exit_and_stashes_the_dev_counterfactual() {
+        let mut b = book(Variant::V1);
+        b.open("m1", pos("t1", 0.60, 1.75), "d1").unwrap();
+        let row = b.apply_stop("t1", 0.52, 9_000, "d1").expect("stops");
+        assert_eq!(row.resolved_price, 0.52, "realised exit, NOT a 0/1 settlement");
+        assert!((row.net_pnl - 1.75 * (0.52 - 0.60)).abs() < 1e-12);
+        assert_eq!(b.open_count(), 0, "the position is closed");
+        // Nothing resolves yet — the dev counterfactual waits for the window.
+        assert!(b.take_resolved_stops(0).is_empty());
+        let due = b.take_resolved_stops(1_000_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].stop_bid, 0.52);
+        assert!(b.take_resolved_stops(1_000_000).is_empty(), "drained exactly once");
+    }
+
+    /// ORDER #18 — state must survive a restart. Severance 5 was unverifiable because
+    /// nothing was ever written; 5 restarts in 3 days silently reset every shadow.
+    #[test]
+    fn state_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("mb_shadow_{}", std::process::id()));
+        let path = dir.join("shadow_v1.json");
+        let path_s = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let mut a = book(Variant::V1);
+        a.open("m1", pos("t1", 0.60, 1.75), "d1").unwrap();
+        a.open("m2", pos("t2", 0.55, 1.90), "d1").unwrap();
+        a.settle("t2", true, 5_000, "d1", true);
+        a.apply_stop("t1", 0.52, 6_000, "d1");
+        a.save(&path_s);
+
+        let snap = ShadowBook::load(&path_s).expect("loads");
+        let mut b = book(Variant::V1);
+        b.restore(snap);
+        assert_eq!(b.ledger().len(), a.ledger().len(), "ledger survives");
+        assert_eq!(b.recal_samples(), a.recal_samples(), "recal window survives");
+        assert_eq!(b.day_stats()["d1"].net_usd, a.day_stats()["d1"].net_usd);
+        // Dedup survives too — otherwise a restart would re-enter markets it holds.
+        assert_eq!(b.can_open("m1", "t1"), Err(ShadowReject::AlreadyInMarket));
+        // And the pending stop counterfactual is not lost.
+        assert_eq!(b.take_resolved_stops(1_000_000).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Kills are counted but create NO position — they must stay distinguishable from

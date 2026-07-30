@@ -485,6 +485,12 @@ impl VariantsCfg {
             v2_max_ask: self.v2_max_ask,
         }
     }
+    /// Shadow STATE path (positions, ledger, day stats, recal window). Distinct from
+    /// the recal path so the two concerns stay separable on disk.
+    #[must_use]
+    pub fn state_path(&self, v: crate::variants::Variant) -> String {
+        format!("{}/shadow_{}.json", self.state_dir.trim_end_matches('/'), v.as_str())
+    }
     /// Shadow recal path for a variant. Kept away from the audition's files by
     /// construction; `ShadowBook::new` refuses the protected names as a second line.
     #[must_use]
