@@ -153,6 +153,14 @@ inval_stop_enabled = true
 # gauge continues); positions HOLD to settle. Requires Order #12 A in the same
 # deploy (more positions reach settlement → pf ones must not orphan). Flip false to
 # re-arm live only if a future regime shifts the gauge back positive.
+# ORDER #19 B — the re-registered gauge FAILED. Over 4,523 post-arming stops the
+# trailing-500 dEV is -0.0204/stop (saved 181 / whipsawed 319 = 0.57) against +0.0169
+# over the FIRST 500 — it decayed across the window rather than holding. Total
+# contribution +$9.35 (~+$1/day) for 13% of exits and their churn. Stays ENABLED so it
+# keeps evaluating and logging, but DRY: no sells, gauge continues.
+# NOTE: this value has been silently overridden by controls.json before — it ran LIVE
+# through an entire audition against a registered decision to dry it. Check the
+# `controls_override` banner after every deploy; the config is not authoritative here.
 inval_stop_dry_run = true
 # BID-BAND conditional stop (dynstop_study, 26 recorder days post-frozen-gate):
 # the stop only fires when the live bid is in an OVERPAY band (>= hi OR <= lo) —
@@ -286,35 +294,25 @@ port = 8787
 # the gate. Shadow state lives under state_dir, never in state.json, and shadow recal
 # never touches recal.json / recal_15m.json (ShadowBook::new refuses those names).
 [v2.variants]
-# ARMED (Order #17). Operator decision: no separate arm step — a single
-# `git pull && cargo build --release && systemctl restart` brings V0/V1/V2 up
-# together, which is also what makes the comparison fair (one process, one feed,
-# one decision loop, three portfolios).
+# ORDER #19 A — RETIRED. The A/B is decided; V0 won on 9.35 days / 2,234 trades:
+#   V0 +$19.38/day  EV/$1 +0.0773  PF 1.28  10/10 positive days
+#   V1 +$14.65/day  EV/$1 +0.0276  PF 1.12   8/10
+#   V2 +$14.13/day  EV/$1 +0.0492  PF 1.17   9/10
+# V0 hold-only (stripped of its stop, like-for-like) is +$18.38/day — still ahead of
+# both. Kill rates (V1 12.1%, V2 15.1%) sat UNDER the 25% hard-FAIL leg, so kills were
+# not the mechanism: the burst population simply has a far worse per-trade edge and
+# ~2x volume does not compensate. The tournament's sealed-holdout result did not
+# survive contact with a live feed.
 #
-# The CODE default stays `false` (see config.rs) — this is the running config only.
-# ROLLBACK is this one line back to `false` + restart; nothing else to undo.
-#
-# WATCH THE FIRST 15 MINUTES after the first armed restart. Abort conditions:
-#   * data/v2/recal*.json mtimes MOVE (severance 6 — protects the 15m audition at n=140)
-#   * new `invariant` or `guard_halt` lines vs the preceding window
-#   * tick_latency p99 materially up (E1 — else the 25% kill leg measures our overhead)
-#   * V1 producing FEWER intents than V0 (violates the V1 superset property)
-enabled = true
+# The ShadowBook machinery, the byte-identical isolation proof (ee879c3) and the log
+# contract all STAY IN THE CODE — they are the harness for the sizing A/B
+# (VOLCONDEDGE vs FLAT), which needs 25-30 live days and a re-registration first.
+# Re-arming is this one line back to `true` plus a restart.
+enabled = false
 v1_burst_bps = 2.0
 v2_burst_bps = 3.0
 v2_max_ask = 0.75
 state_dir = "data/v2/shadow"
 max_slippage = 0.04
-# Shadow-local concurrent-position cap. NOT V0's 20: V1 is expected to trade ~3x V0's
-# volume, so a V0-sized cap would throttle precisely the arm under test and the
-# throttling would masquerade as a gate effect. Shadows hold no capital, so this
-# bounds memory rather than risk. If the `shadow_cap` reason is a material share of
-# variant_open_rejected, raise it further.
 max_open_positions = 200
-# Minimum ms between a candidate's quote and its FOK evaluation. Without a gap the
-# kill model compares a quote against itself: the first armed run reported 0.0% kill
-# on all three arms, i.e. a dead instrument on the metric the experiment exists for.
-# The loop ticks ~1/s so the effective gap is ~1s — pessimistic vs a real ~200ms
-# round trip, which is why quote_ask / fill_ask / actual latency_ms are all logged
-# and the kill rate stays re-scorable offline at any assumed latency.
 fok_min_latency_ms = 200
