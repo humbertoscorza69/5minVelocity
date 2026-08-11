@@ -355,6 +355,75 @@ impl ShadowBook {
     /// Close a position at `bid` (a fired stop). Books the REALISED exit price rather
     /// than a 0/1 settlement, and stashes the stop-vs-hold counterfactual so `dev` can
     /// be computed once the window resolves — the same gauge V0 has.
+    /// ORDER #21 — close a position mid-window at the live bid and book it.
+    ///
+    /// The shared exit-at-bid primitive: the band-stop (Order #18) and the FLIP
+    /// (Order #21 V1) are the same mechanical action with different triggers, so they
+    /// share one implementation and one P&L convention. `reason` is carried onto the
+    /// row so the exit leg is attributable — without that, a flip's exit and its new
+    /// entry cannot be told apart and the result is uninterpretable.
+    pub fn close_at_bid(
+        &mut self,
+        token_id: &str,
+        bid: f64,
+        ts_ms: i64,
+        day: &str,
+    ) -> Option<(ShadowPnl, ShadowPosition)> {
+        let idx = self.positions.iter().position(|p| p.token_id == token_id)?;
+        let p = self.positions.remove(idx);
+        let net = p.shares * (bid - p.entry_price);
+        let row = ShadowPnl {
+            token_id: p.token_id.clone(),
+            variant: self.variant,
+            ts_ms,
+            interval: p.interval.clone(),
+            entry_price: p.entry_price,
+            shares: p.shares,
+            resolved_price: bid, // realised exit, NOT a 0/1 settlement
+            net_pnl: net,
+        };
+        self.day_stats.entry(day.to_string()).or_default().net_usd += net;
+        self.ledger.push(row.clone());
+        Some((row, p))
+    }
+
+    /// An open position on the OPPOSITE side of the same market, if any. This is what
+    /// makes a flip detectable: a fully-gated signal arriving for the other side of a
+    /// market this arm already holds.
+    #[must_use]
+    pub fn opposite_open(
+        &self,
+        asset: &str,
+        interval: &str,
+        resolution_s: i64,
+        up: bool,
+    ) -> Option<&ShadowPosition> {
+        self.positions.iter().find(|p| {
+            p.asset == asset && p.interval == interval && p.resolution_s == resolution_s && p.up != up
+        })
+    }
+
+    /// FLIP: close the held original at the bid, then open the opposite leg.
+    ///
+    /// Deliberately bypasses the per-market entry cap: a flip REPLACES a position
+    /// rather than adding one, so the arm never holds both sides. "Keep A, add B"
+    /// is not on the menu — it lost in two independent tests (EV −0.266 / −0.329),
+    /// and a hedge pair is not what this measures.
+    pub fn flip(
+        &mut self,
+        old_token: &str,
+        bid: f64,
+        new_pos: ShadowPosition,
+        ts_ms: i64,
+        day: &str,
+    ) -> Option<(ShadowPnl, ShadowPosition)> {
+        let (exit_row, old) = self.close_at_bid(old_token, bid, ts_ms, day)?;
+        self.entered.insert(new_pos.token_id.clone());
+        self.positions.push(new_pos);
+        self.day_stats.entry(day.to_string()).or_default().entries += 1;
+        Some((exit_row, old))
+    }
+
     pub fn apply_stop(&mut self, token_id: &str, bid: f64, ts_ms: i64, day: &str) -> Option<ShadowPnl> {
         let idx = self.positions.iter().position(|p| p.token_id == token_id)?;
         let p = self.positions.remove(idx);
@@ -715,6 +784,46 @@ mod tests {
         // And the pending stop counterfactual is not lost.
         assert_eq!(b.take_resolved_stops(1_000_000).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ORDER #21 — the FLIP: close the original at the bid, open the opposite. The
+    /// arm must never hold both sides, because "keep A, add B" LOST in two independent
+    /// tests (EV −0.266 / −0.329) and a hedge pair is not what this measures.
+    #[test]
+    fn flip_replaces_the_position_and_never_holds_both_sides() {
+        let mut b = book(Variant::V1);
+        let mut up = pos("t_up", 0.60, 1.75);
+        up.up = true;
+        up.resolution_s = 2_000;
+        b.open("BTC:5m:1700", up, "d1").unwrap();
+
+        // The opposite side of the SAME market is findable; the same side is not.
+        assert!(b.opposite_open("BTC", "5m", 2_000, false).is_some(), "Down signal sees the Up hold");
+        assert!(b.opposite_open("BTC", "5m", 2_000, true).is_none(), "same side is not a flip");
+        // A different market must not be mistaken for one.
+        assert!(b.opposite_open("BTC", "5m", 9_999, false).is_none());
+        assert!(b.opposite_open("ETH", "5m", 2_000, false).is_none());
+
+        let mut down = pos("t_down", 0.45, 2.33);
+        down.up = false;
+        down.resolution_s = 2_000;
+        let (exit, old) = b.flip("t_up", 0.52, down, 7_000, "d1").expect("flips");
+
+        // Exit leg is booked at the REALISED bid, attributable on its own.
+        assert_eq!(exit.resolved_price, 0.52);
+        assert!((exit.net_pnl - 1.75 * (0.52 - 0.60)).abs() < 1e-12);
+        assert_eq!(old.token_id, "t_up");
+        // Exactly ONE position remains, and it is the new side.
+        assert_eq!(b.open_count(), 1, "a flip replaces, never adds");
+        assert!(!b.positions()[0].up, "the surviving leg is the opposite side");
+        assert_eq!(b.positions()[0].token_id, "t_down");
+        // Both legs are countable: one entry recorded for the new leg.
+        assert_eq!(b.day_stats()["d1"].entries, 2, "original + flipped-in leg");
+        // Flipping a token we do not hold is a no-op, not a phantom entry.
+        let mut ghost = pos("t_ghost", 0.50, 2.0);
+        ghost.resolution_s = 2_000;
+        assert!(b.flip("t_nonexistent", 0.5, ghost, 8_000, "d1").is_none());
+        assert_eq!(b.open_count(), 1);
     }
 
     /// Kills are counted but create NO position — they must stay distinguishable from

@@ -139,12 +139,38 @@ impl Default for VariantConfig {
 /// burst arms are a UNION on top of it: they can only ever ADD entries, never remove
 /// one V0 would have taken.
 #[must_use]
-pub fn admits(variant: Variant, cfg: &VariantConfig, v0_admits: bool, burst_bps: f64, ask: f64) -> bool {
+pub fn admits(variant: Variant, _cfg: &VariantConfig, v0_admits: bool, _burst_bps: f64, _ask: f64) -> bool {
+    // ORDER #21: all three arms now share V0's ENTRY path exactly. The burst-union
+    // gates were retired in Order #19 (V0 beat both: +$19.38/day vs +$14.65/+$14.13),
+    // and this A/B varies the EXIT policy instead — see `arm_policy`. Keeping the
+    // signature means the isolation proof and the log contract are unchanged.
+    let _ = variant;
+    v0_admits
+}
+
+/// ORDER #21 — what distinguishes the arms is now the EXIT, not the entry.
+///
+/// Returns `(flip, stop_armed)`:
+/// * **V0** — control, byte-identical to today: stop DRY, no flip.
+/// * **V1** — FLIP. When a FULLY-GATED opposite signal fires on a market this arm
+///   holds, close the original at the bid and open the opposite. Stop stays DRY, so
+///   the flip is isolated from the stop. This is the untested middle: the instant
+///   flip at the invalidation crossing is dead three times over (priced within 2s),
+///   and the post-stop opposite re-entry is already validated (+0.144/$1) — this is a
+///   fully-gated opposite signal arriving on its own schedule with no stop required.
+/// * **V2** — STOP armed, no flip. A clean re-read of the stop's own value on the
+///   same tape; its gauge failed on one trailing-500 stretch and `stop_dev` gives the
+///   counterfactual either way.
+///
+/// Note "keep A, add B" is deliberately NOT an arm: holding both LOSES
+/// (EV −0.266/−0.329) and hedge pairs have now lost money in two independent tests.
+/// The original must be CLOSED.
+#[must_use]
+pub fn arm_policy(variant: Variant) -> (bool, bool) {
     match variant {
-        Variant::V0 => v0_admits,
-        // Deliberately no other gate: this is the tournament winner as selected.
-        Variant::V1 => v0_admits || burst_bps >= cfg.v1_burst_bps,
-        Variant::V2 => v0_admits || (burst_bps >= cfg.v2_burst_bps && ask <= cfg.v2_max_ask),
+        Variant::V0 => (false, false),
+        Variant::V1 => (true, false),
+        Variant::V2 => (false, true),
     }
 }
 
@@ -324,26 +350,43 @@ mod tests {
         }
     }
 
-    /// V1 UNION-2: burst ≥ 2bps alone is sufficient — no z, edge, disp, vol,
-    /// book-unmoved or frozen gate, and NO ask cap. Tested as selected.
+
+
+    /// ORDER #21 — all three arms now share V0's ENTRY path exactly. The burst-union
+    /// gates were retired in Order #19 after V0 beat both arms live. An arm that
+    /// entered on anything V0 rejected would confound the exit comparison this run is
+    /// actually for.
     #[test]
-    fn v1_admits_on_burst_alone_with_no_ask_cap() {
-        assert!(!admits(Variant::V1, &CFG, false, 1.99, 0.60), "below 2bps and V0 says no");
-        assert!(admits(Variant::V1, &CFG, false, 2.0, 0.60), "exactly 2bps admits");
-        assert!(admits(Variant::V1, &CFG, false, 9.0, 0.60));
-        // No ask cap: even a near-certainty ask is admitted on burst.
-        assert!(admits(Variant::V1, &CFG, false, 5.0, 0.97), "V1 has NO ask cap by design");
+    fn all_arms_share_v0s_entry_path() {
+        for v in Variant::all() {
+            for burst in [-5.0, 0.0, 1.9, 3.5, 20.0] {
+                for ask in [0.05, 0.60, 0.97] {
+                    assert!(
+                        admits(v, &CFG, true, burst, ask),
+                        "{v:?} must take everything V0 takes"
+                    );
+                    assert!(
+                        !admits(v, &CFG, false, burst, ask),
+                        "{v:?} must take NOTHING V0 rejects (burst {burst}, ask {ask})"
+                    );
+                }
+            }
+        }
     }
 
-    /// V2 UNION-3-CAPPED needs BOTH legs: a higher burst floor and the ask cap.
+    /// The arms differ on the EXIT, and each policy is exclusive: V1 flips with the
+    /// stop dry, V2 arms the stop without flipping, V0 does neither. No arm does both
+    /// — if both win they get tested together in a later run rather than merged on the
+    /// assumption that the effects add.
     #[test]
-    fn v2_requires_both_burst_and_ask_cap() {
-        assert!(!admits(Variant::V2, &CFG, false, 2.5, 0.60), "2.5bps is below V2's 3bps floor");
-        assert!(admits(Variant::V2, &CFG, false, 3.0, 0.75), "3bps at the cap boundary admits");
-        assert!(!admits(Variant::V2, &CFG, false, 9.0, 0.76), "past the ask cap is rejected");
-        // The tier V1 takes and V2 deliberately trims.
-        assert!(admits(Variant::V1, &CFG, false, 2.5, 0.60));
-        assert!(!admits(Variant::V2, &CFG, false, 2.5, 0.60), "V2 trims the loosest burst tier");
+    fn arm_policies_are_exclusive() {
+        assert_eq!(arm_policy(Variant::V0), (false, false), "control: no flip, stop dry");
+        assert_eq!(arm_policy(Variant::V1), (true, false), "FLIP arm keeps the stop dry");
+        assert_eq!(arm_policy(Variant::V2), (false, true), "STOP arm does not flip");
+        for v in Variant::all() {
+            let (flip, stop) = arm_policy(v);
+            assert!(!(flip && stop), "{v:?} must not confound flip with stop");
+        }
     }
 
     /// THE measurement the experiment exists for. Fill when the ask has not run past

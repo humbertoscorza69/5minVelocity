@@ -1143,8 +1143,14 @@ pub async fn run_decision_task(
                     // That asymmetry FAVOURED V0 — its stop added +$17.44 over the
                     // measured window — so closing it makes the arms look better, not
                     // worse. Same rule, same thresholds, same per-second evaluation.
-                    if controls.inval_stop_on() {
+                    {
                         for (v, sb) in shadows.iter_mut() {
+                            // ORDER #21: the stop is now an ARM POLICY, not a global.
+                            // V2 runs it armed; V1 keeps it DRY so the flip is measured
+                            // in isolation rather than confounded with the stop.
+                            if !crate::variants::arm_policy(*v).1 {
+                                continue;
+                            }
                             for (token, asset, up, iv) in sb.open_for_stop() {
                                 let secs = interval_secs(&iv).max(1);
                                 let epoch_s = (now_s / secs) * secs;
@@ -1652,6 +1658,68 @@ pub async fn run_decision_task(
                             let mkey = crate::shadow::ShadowBook::market_key(
                                 &cand.asset, &cand.interval, cand.epoch,
                             );
+                            // ORDER #21 — FLIP. A fully-gated signal for the OPPOSITE
+                            // side of a market this arm already holds: close the
+                            // original at the bid, open the opposite. The gate fires on
+                            // both sides of 9.0% of markets (~20/day, median 89s apart)
+                            // and HOLDING those is EV −0.5372/$1 versus +0.1734 flipped.
+                            // "Keep A, add B" is deliberately not an option — it lost in
+                            // two independent tests; the original must be CLOSED.
+                            let resolution_s = cand.epoch + interval_secs(&cand.interval).max(1);
+                            if crate::variants::arm_policy(*v).0
+                                && let Some(old) = sb
+                                    .opposite_open(&cand.asset, &cand.interval, resolution_s, cand.up)
+                                    .cloned()
+                                && let Some(exit_bid) =
+                                    state.bbo.get(&old.token_id).and_then(|b| b.best_bid)
+                                && exit_bid > 0.0
+                            {
+                                let stake = controls.base_usd_for(&cand.interval);
+                                let new_pos = crate::shadow::ShadowPosition {
+                                    token_id: cand.token_id.clone(),
+                                    asset: cand.asset.clone(),
+                                    interval: cand.interval.clone(),
+                                    up: cand.up,
+                                    entry_price: fok.fill_ask,
+                                    shares: if fok.fill_ask > 0.0 { stake / fok.fill_ask } else { 0.0 },
+                                    stake_usd: stake,
+                                    opened_at_ms: now,
+                                    resolution_s,
+                                    pred_raw: 0.0,
+                                };
+                                let new_ask = new_pos.entry_price;
+                                let new_shares = new_pos.shares;
+                                if !fok.killed
+                                    && let Some((exit_row, old_pos)) =
+                                        sb.flip(&old.token_id, exit_bid, new_pos, now, &day)
+                                {
+                                    // BOTH LEGS LOGGED SEPARATELY — the exit and the new
+                                    // entry must be attributable independently or the
+                                    // result cannot be interpreted.
+                                    oplog.sys("flip_fired", serde_json::json!({
+                                        "variant": v.as_str(),
+                                        "asset": cand.asset, "interval": cand.interval,
+                                        "epoch": cand.epoch,
+                                        "old_token": old_pos.token_id,
+                                        "old_entry_ask": old_pos.entry_price,
+                                        "exit_bid": exit_bid,
+                                        "held_secs": (now - old_pos.opened_at_ms) / 1000,
+                                        "exit_leg_pnl": exit_row.net_pnl,
+                                        "new_token": cand.token_id,
+                                        "new_ask": new_ask, "new_shares": new_shares,
+                                        "new_side": if cand.up { "Up" } else { "Down" },
+                                    }));
+                                    oplog.sys("variant_pnl", serde_json::json!({
+                                        "variant": v.as_str(), "token_id": exit_row.token_id,
+                                        "interval": exit_row.interval,
+                                        "entry_price": exit_row.entry_price,
+                                        "shares": exit_row.shares,
+                                        "resolved_price": exit_row.resolved_price,
+                                        "net_pnl": exit_row.net_pnl, "exit": "flip",
+                                    }));
+                                    continue; // the flip IS this candidate's action
+                                }
+                            }
                             // ADMISSIBILITY FIRST, then the kill model. A variant
                             // re-qualifies on a market it already holds on nearly
                             // every tick; counting those as killed ATTEMPTS would
