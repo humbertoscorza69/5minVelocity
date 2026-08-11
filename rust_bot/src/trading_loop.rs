@@ -579,13 +579,20 @@ pub fn process_kline_v2(
         let Some(open) = history.close_at(&kline.asset, epoch - 1) else { continue };
         let up = kline.close >= open;
         let bet_token = if up { m.up_token_id.clone() } else { m.down_token_id.clone() };
-        // One entry per market: skip if any lot exists on either side of THIS market.
-        if positions
-            .iter()
-            .any(|p| p.token_id == m.up_token_id || p.token_id == m.down_token_id)
-        {
-            continue;
-        }
+        // ORDER #21: price the candidate BEFORE V0's one-entry-per-market check.
+        //
+        // These two were the other way round, and it made the FLIP structurally
+        // impossible: emission sat after the dedup, so a market V0 already held
+        // produced NO candidate — which is precisely the flip's trigger condition (a
+        // fully-gated opposite signal on a market the arm holds). flip_fired was
+        // guaranteed 0, not merely rare. The boundary was flagged and accepted at
+        // ee879c3 because the burst-union arms fired EARLIER and barely touched the
+        // suppressed window; Order #21's flip lives entirely inside it.
+        //
+        // Reordering is behaviour-preserving for V0: both are `continue` guards with
+        // no side effects, so the set of commands V0 emits is unchanged — only the
+        // order in which two read-only lookups happen. The ee879c3 isolation proof is
+        // what holds that claim honest.
         let Some(bbo) = book.bbo(&bet_token) else { continue };
         if bbo.ts_ms <= 0 || now_ms - bbo.ts_ms > STALE_BBO_MS {
             continue;
@@ -594,6 +601,9 @@ pub fn process_kline_v2(
             Some(a) if a > 0.0 => a,
             _ => continue,
         };
+        let v0_holds_market = positions
+            .iter()
+            .any(|p| p.token_id == m.up_token_id || p.token_id == m.down_token_id);
         // ORDER #16: emit the variant candidate HERE — after the ask is resolved (the
         // union arms need it, and V2 caps on it) but BEFORE the ask-band, floor and
         // v2 gates, all of which V1 bypasses by definition. `v0_admitted` is patched
@@ -617,6 +627,11 @@ pub fn process_kline_v2(
             });
             v.len() - 1
         });
+        // V0's one-entry-per-market rule, applied AFTER the candidate is recorded so
+        // the arms can still see a signal V0 declines to act on.
+        if v0_holds_market {
+            continue;
+        }
         // Ask-BAND gate: max-ask quality cap (15m: 0.70; 5m: none) + Order #9 B
         // min-ask floor (0.30 both) — keep entries inside the validated [0.30,0.97]
         // envelope; extreme-ask books are where the curve is maximally wrong.

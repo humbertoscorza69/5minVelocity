@@ -1267,8 +1267,15 @@ function render(){
   // Headline = REAL filled trades (positions that actually opened = open+closed),
   // NOT s.stats.entries (which counts every v2_intent_open, incl. FOK kills /
   // rolled-back orders that never became a position). Intents shown in the sub.
-  $("trades").textContent=(FILT==="all")?(s.stats.open+s.stats.closed):st.closed;
-  $("trades_sub").textContent=(FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.entries+" intents · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed");
+  // ORDER #21 fix: this card read s.stats (GLOBAL) whenever FILT==="all", so it
+  // showed V0's trade count under a V1/V2 selection — the one card that ignored the
+  // variant selector. A count that does not move while P&L does is worse than no
+  // card, because it reads as "the arms took identical trades".
+  const vsel=(VFILT!=="all"&&s.variants&&s.variants[VFILT])?s.variants[VFILT]:null;
+  $("trades").textContent=vsel?(vsel.closed):((FILT==="all")?(s.stats.open+s.stats.closed):st.closed);
+  $("trades_sub").textContent=vsel
+    ?(vsel.closed+" closed · "+vsel.entries+" entries · "+vsel.kills+" killed")
+    :((FILT==="all")?(s.stats.open+" open · "+s.stats.closed+" closed · "+s.stats.entries+" intents · "+s.stats.blocked+" blocked"):(opens.length+" open · "+st.closed+" closed"));
   $("recal").textContent=(rc.bias>=0?"+":"")+rc.bias.toFixed(3);
   $("recal_sub").textContent=rc.samples+" samples ("+(FILT==="15m"?"15m":"5m")+")";
   // ORDER #17 item 3 — variant view. Read-only: no control here can arm or disarm.
