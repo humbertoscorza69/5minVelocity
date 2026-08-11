@@ -436,6 +436,27 @@ impl PriceHistory {
         }
     }
 
+    /// ORDER #20 — mean close over `[from_sec, to_sec]` inclusive: the SETTLEMENT
+    /// statistic.
+    ///
+    /// Polymarket resolves these markets on the Chainlink 30-second TWAP at window
+    /// end, not on the last print. Booking against `close[res-1]` disagrees with the
+    /// venue on ~3.75% of windows, concentrated in the near-zero cohort — exactly the
+    /// population the photo-finish logic exists for, so the error lands where it does
+    /// the most damage to the recal's diet.
+    ///
+    /// `min_samples` guards against a one-tick "average" that is just the close again:
+    /// a sparse ring returns `None` so the caller retries on a later tick rather than
+    /// booking a label computed from thinner data than the venue used.
+    #[must_use]
+    pub fn twap(&self, asset: &str, from_sec: i64, to_sec: i64, min_samples: usize) -> Option<f64> {
+        let closes = self.closes_in(asset, from_sec, to_sec);
+        if closes.len() < min_samples.max(1) {
+            return None;
+        }
+        Some(closes.iter().sum::<f64>() / closes.len() as f64)
+    }
+
     /// Rolling vol (bps/s) over the last `lookback_s` seconds ending at `now_sec`.
     #[must_use]
     pub fn vol_bps(&self, asset: &str, now_sec: i64, lookback_s: i64) -> Option<f64> {
@@ -1116,6 +1137,51 @@ mod tests {
         // Cold start: window-open is BEFORE any history (earliest bar = 999) →
         // can't price the open → None (the correct skip).
         assert!(h.features("BTC", 800, now, ttl, true, 0.60, 0.0, &CAL_Z, &CAL_W, 60).is_none());
+    }
+
+    /// ORDER #20 — the settlement statistic is the 30s MEAN, not the last print, and
+    /// a thin ring must refuse rather than pass off a near-point estimate as a TWAP.
+    #[test]
+    fn twap_averages_the_window_and_refuses_a_thin_ring() {
+        let mut h = PriceHistory::new(1024);
+        // 30 seconds ramping 100.00 -> 100.29; mean is 100.145, last print 100.29.
+        for i in 0..30i64 {
+            h.push("BTC", 1_000 + i, 100.0 + 0.01 * i as f64);
+        }
+        let t = h.twap("BTC", 1_000, 1_029, 15).expect("full window");
+        assert!((t - 100.145).abs() < 1e-9, "mean of the window, got {t}");
+        assert!(
+            (t - h.close_at("BTC", 1_029).unwrap()).abs() > 0.1,
+            "the TWAP must differ from the last print, or this change is a no-op"
+        );
+        // Only 5 samples present → refuse, so the caller retries instead of booking a
+        // label computed from thinner data than the venue used.
+        let mut sparse = PriceHistory::new(1024);
+        for i in 0..5i64 {
+            sparse.push("BTC", 2_000 + i, 100.0);
+        }
+        assert!(sparse.twap("BTC", 2_000, 2_029, 15).is_none(), "thin ring must refuse");
+        assert!(sparse.twap("BTC", 2_000, 2_029, 5).is_some(), "…but is usable at a lower bar");
+    }
+
+    /// THE CASE THE ORDER EXISTS FOR: close and TWAP disagree on the LABEL. This is
+    /// the ~3.75% cohort — a window that ticks up at the very last second reads as a
+    /// win on the close but a loss on the 30s mean, which is what the venue settles on.
+    #[test]
+    fn twap_and_close_can_disagree_on_the_settlement_label() {
+        let mut h = PriceHistory::new(1024);
+        let open = 100.0;
+        // 29 seconds slightly BELOW the open, then one spike above it at the end.
+        for i in 0..29i64 {
+            h.push("BTC", 1_000 + i, 99.99);
+        }
+        h.push("BTC", 1_029, 100.05);
+        let last = h.close_at("BTC", 1_029).unwrap();
+        let twap = h.twap("BTC", 1_000, 1_029, 15).unwrap();
+        // Up wins on the close…
+        assert!(last >= open, "last print is above the open");
+        // …and LOSES on the TWAP, which is what Polymarket actually resolves against.
+        assert!(twap < open, "the 30s mean is below the open: {twap}");
     }
 
     /// ORDER #14 B/C — VERIFICATION of the post-reconnect COLD RING, which the order

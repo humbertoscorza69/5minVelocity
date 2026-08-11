@@ -58,6 +58,20 @@ const EXEC_LOG: &str = "data/live/execution_log.jsonl";
 /// Order #8 payout-truth deferral). Do not fork this constant.
 const PHOTO_FINISH_BPS: f64 = 2.0;
 
+/// ORDER #20 — the settlement statistic. Polymarket resolves these markets on the
+/// Chainlink 30-second TWAP at window end
+/// (`data.chain.link/streams/btc-usd-twap-30s-streams`) versus the price at window
+/// start — NOT on the last 1s print. Booking against `close[res-1]` disagreed with
+/// the venue on ~3.75% of windows, concentrated in the near-zero cohort, which is
+/// precisely the population the photo-finish rule exists to protect the recal from.
+/// The 1s closes are already in the ring, so this is an averaging change at the point
+/// of comparison, not a new feed.
+const SETTLE_TWAP_SECS: i64 = 30;
+/// Minimum 1s samples required before a TWAP is trusted. A sparse ring returns None
+/// and the caller retries on a later tick rather than booking a label computed from
+/// thinner data than the venue used.
+const SETTLE_TWAP_MIN_SAMPLES: usize = 15;
+
 /// Photo-finish test from raw window open/close prices: is `|fin−op|` (in bps) below
 /// PHOTO_FINISH_BPS? A photo-finish Binance label flips ~20% vs Chainlink, so it must
 /// train NEITHER a recalibrator NOR the canary hold-WR. Shared by the stop-path recal
@@ -1097,7 +1111,7 @@ pub async fn run_decision_task(
                         }
                         let (Some(op), Some(fin)) = (
                             history.close_at(&p.asset, epoch - 1),
-                            history.close_at(&p.asset, resolution - 1),
+                            history.twap(&p.asset, resolution - SETTLE_TWAP_SECS, resolution - 1, SETTLE_TWAP_MIN_SAMPLES),
                         ) else {
                             continue; // ring doesn't have both ends (e.g. post-restart)
                         };
@@ -1162,7 +1176,7 @@ pub async fn run_decision_task(
                                 let ep = sp.resolution_s - win_secs;
                                 let (Some(op), Some(fin)) = (
                                     history.close_at(&sp.asset, ep - 1),
-                                    history.close_at(&sp.asset, sp.resolution_s - 1),
+                                    history.twap(&sp.asset, sp.resolution_s - SETTLE_TWAP_SECS, sp.resolution_s - 1, SETTLE_TWAP_MIN_SAMPLES),
                                 ) else { continue };
                                 let won = sp.up == (fin >= op);
                                 let resolved = if won { 1.0 } else { 0.0 };
@@ -1202,7 +1216,8 @@ pub async fn run_decision_task(
                                     .map(|p| interval_secs(&p.interval).max(1))
                                     .unwrap_or(300);
                             let (Some(op), Some(fin)) =
-                                (history.close_at(&asset, epoch - 1), history.close_at(&asset, res_s - 1))
+                                (history.close_at(&asset, epoch - 1),
+                                 history.twap(&asset, res_s - SETTLE_TWAP_SECS, res_s - 1, SETTLE_TWAP_MIN_SAMPLES))
                             else {
                                 continue; // ring cold → retry next tick
                             };
@@ -1244,7 +1259,7 @@ pub async fn run_decision_task(
                         let epoch = resolution - interval_secs(&iv).max(1);
                         let (Some(op), Some(fin)) = (
                             history.close_at(&asset, epoch - 1),
-                            history.close_at(&asset, resolution - 1),
+                            history.twap(&asset, resolution - SETTLE_TWAP_SECS, resolution - 1, SETTLE_TWAP_MIN_SAMPLES),
                         ) else { continue }; // ring cold → retry next tick
                         let won = up == (fin >= op);
                         // Order #11 C: PF-guard the stop-counterfactual recal feed. A
@@ -1950,6 +1965,41 @@ async fn binance_close_at_rest(http: &reqwest::Client, asset: &str, sec: i64) ->
     arr.first()?.get(4)?.as_str()?.parse::<f64>().ok()
 }
 
+/// ORDER #20 — the REST twin of `PriceHistory::twap`: mean 1s close over the
+/// `SETTLE_TWAP_SECS` ending at `end_sec` inclusive.
+///
+/// The ring-gap fallback must settle on the SAME statistic as the live path, or a
+/// position recovered after a WS drop would be labelled by a different rule than one
+/// settled normally — a silent two-regime dataset, which is the class of bug that
+/// makes an archive unanalysable months later.
+async fn binance_twap_at_rest(http: &reqwest::Client, asset: &str, end_sec: i64) -> Option<f64> {
+    let symbol = match asset {
+        "BTC" => "BTCUSDT",
+        "ETH" => "ETHUSDT",
+        _ => return None,
+    };
+    let start_sec = end_sec - SETTLE_TWAP_SECS + 1;
+    let url = format!(
+        "https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1s&startTime={}&endTime={}&limit={}",
+        start_sec * 1000,
+        end_sec * 1000 + 999,
+        SETTLE_TWAP_SECS
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let arr: Vec<Vec<serde_json::Value>> = resp.json().await.ok()?;
+    let closes: Vec<f64> = arr
+        .iter()
+        .filter_map(|row| row.get(4)?.as_str()?.parse::<f64>().ok())
+        .collect();
+    if closes.len() < SETTLE_TWAP_MIN_SAMPLES {
+        return None;
+    }
+    Some(closes.iter().sum::<f64>() / closes.len() as f64)
+}
+
 /// Settlement BOOKING — mode-independent (needs only `bs` + Binance, NOT the
 /// Polymarket REST client). Runs the ring-gap REST fallback (Bug A i) then books
 /// every v2_settled outcome via record_settled + feeds the recalibrator. Shared
@@ -2003,7 +2053,7 @@ async fn settle_and_book(
             let epoch = resolution - win_secs;
             let (Some(op), Some(fin)) = (
                 binance_close_at_rest(bn_http, &p.asset, epoch - 1).await,
-                binance_close_at_rest(bn_http, &p.asset, resolution - 1).await,
+                binance_twap_at_rest(bn_http, &p.asset, resolution - 1).await,
             ) else {
                 oplog.sys("settlement_rest_fallback_miss", serde_json::json!({
                     "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
