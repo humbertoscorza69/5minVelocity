@@ -251,7 +251,13 @@ impl ShadowBook {
     /// those non-attempts would land in the kill-rate denominator (and numerator).
     /// Kill rate is the hard-FAIL leg at 25%, so that would fail an arm on bookkeeping.
     pub fn can_open(&self, mkey: &str, token_id: &str) -> Result<(), ShadowReject> {
-        if self.entered.contains(token_id) {
+        // CURRENTLY HOLDING, not "ever entered". `entered` only ever grew — the
+        // prune in mark_reentry_eligible matched `token.starts_with(mkey)`, but mkey
+        // is "BTC:5m:<epoch>" and the entries are bare numeric token ids, so it never
+        // matched anything. That locked an arm out of a market permanently after one
+        // touch, while V0 re-enters freely: 136 of 253 attempts per arm were rejected
+        // as `dedup`, against V0's 185 fills on the same candidates.
+        if self.positions.iter().any(|p| p.token_id == token_id) {
             return Err(ShadowReject::AlreadyInMarket);
         }
         if self.market_entries.get(mkey).copied().unwrap_or(0) >= self.max_entries_per_market {
@@ -779,8 +785,19 @@ mod tests {
         assert_eq!(b.ledger().len(), a.ledger().len(), "ledger survives");
         assert_eq!(b.recal_samples(), a.recal_samples(), "recal window survives");
         assert_eq!(b.day_stats()["d1"].net_usd, a.day_stats()["d1"].net_usd);
-        // Dedup survives too — otherwise a restart would re-enter markets it holds.
-        assert_eq!(b.can_open("m1", "t1"), Err(ShadowReject::AlreadyInMarket));
+        // Dedup survives a restart for a position that is still OPEN — otherwise a
+        // restart would double-enter a market the arm is already holding.
+        let mut still_open = pos("t3", 0.50, 2.0);
+        still_open.resolution_s = 9_999;
+        a.open("m3", still_open, "d1").unwrap();
+        a.save(&path_s);
+        let mut c = book(Variant::V1);
+        c.restore(ShadowBook::load(&path_s).expect("loads"));
+        assert_eq!(c.can_open("m3", "t3"), Err(ShadowReject::AlreadyInMarket), "open position still blocks");
+        // …but a CLOSED one does not. `entered` used to record "ever entered" and was
+        // never pruned, which locked an arm out of a market permanently after one
+        // touch while V0 re-entered freely (136 of 253 attempts rejected as dedup).
+        assert_eq!(c.can_open("m1", "t1"), Ok(()), "a settled/stopped market is re-enterable");
         // And the pending stop counterfactual is not lost.
         assert_eq!(b.take_resolved_stops(1_000_000).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
