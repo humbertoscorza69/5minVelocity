@@ -1059,8 +1059,11 @@ tbody tr:hover{background:var(--panel2)}
 #armpanel{border-color:#3a2c10}
 .ctlrow label{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:6px}
 .ctlrow input{width:92px;background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:7px 9px;font-size:13px;font-variant-numeric:tabular-nums}
-.btn.seg{padding:6px 15px;font-size:12px;font-weight:600}
-.btn.seg.sel{color:var(--acc);border-color:var(--acc);background:#0d1b2e}
+.btn.seg,.btn.vseg{padding:6px 15px;font-size:12px;font-weight:600}
+/* The variant buttons carry class `vseg`, so they need the selected style too —
+   without it a selection was invisible and the operator had to track by hand which
+   arm was on screen. */
+.btn.seg.sel,.btn.vseg.sel{color:var(--acc);border-color:var(--acc);background:#0d1b2e}
 .healthbar{border-radius:10px;padding:11px 15px;margin-bottom:14px;font-weight:650;font-size:13px;letter-spacing:.2px}
 .healthbar.ok{background:#0f2417;border:1px solid #1c3a25;color:var(--grn)}
 .healthbar.warn{background:#241f0a;border:1px solid #3a2c10;color:var(--amb)}
