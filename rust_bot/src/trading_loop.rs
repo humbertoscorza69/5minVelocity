@@ -116,6 +116,33 @@ fn utc_day_of(ts_ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Split the deferred-FOK queue into candidates old enough to evaluate, RETAINING
+/// the rest in `pending`.
+///
+/// This exists as a named function because the inline version was
+/// `pending.drain(..).filter(...)`, which emptied the queue and kept only the due
+/// entries — silently DESTROYING everything not yet old enough. BTC and ETH each tick
+/// ~1/s but unsynchronised, so a candidate queued on one asset's tick is drained by
+/// the other's a few tens of ms later, fails the age test, and is gone. Measured
+/// cost before the fix: V0 opened 26 markets and V1 never saw 16 of them.
+///
+/// The invariant is conservation: every candidate is either returned as due or still
+/// in `pending`. Nothing is dropped.
+#[must_use]
+fn partition_due(
+    pending: &mut Vec<(crate::variants::Candidate, i64)>,
+    now: i64,
+    min_latency_ms: i64,
+) -> Vec<(crate::variants::Candidate, i64)> {
+    let mut due = Vec::new();
+    let mut hold = Vec::with_capacity(pending.len());
+    for (c, t) in pending.drain(..) {
+        if now - t >= min_latency_ms { due.push((c, t)) } else { hold.push((c, t)) }
+    }
+    *pending = hold;
+    due
+}
+
 #[must_use]
 fn burst_bps_at(history: &crate::v2::PriceHistory, asset: &str, t_s: i64, up: bool) -> f64 {
     let sign = if up { 1.0 } else { -1.0 };
@@ -1633,8 +1660,14 @@ pub async fn run_decision_task(
                     // effect lands in a ShadowBook, never in V0's machinery.
                     // Evaluate candidates held from an earlier tick, then stash this
                     // tick's for the next one — this is where the latency gap comes from.
-                    let due: Vec<(crate::variants::Candidate, i64)> =
-                        pending_fok.drain(..).filter(|(_, t)| now - *t >= fok_min_latency_ms).collect();
+                    // PARTITION, do not filter. `drain(..).filter(...)` emptied the
+                    // queue and kept only the DUE entries — everything not yet old
+                    // enough was silently destroyed. BTC and ETH each tick ~1/s but
+                    // unsynchronised, so a candidate queued on one asset's tick is
+                    // drained by the other's a few tens of ms later, fails the 200ms
+                    // age test, and is thrown away. Measured cost: V0 opened 26
+                    // markets and V1 never saw 16 of them.
+                    let due = partition_due(&mut pending_fok, now, fok_min_latency_ms);
                     for c in cand_buf.drain(..) {
                         pending_fok.push((c, now));
                     }
@@ -3509,6 +3542,48 @@ mod tests {
         assert_eq!(utc_day_of(midnight + 86_400_000), "2026-07-28");
         // A leap day, since the civil-from-days arithmetic is where that would break.
         assert_eq!(utc_day_of(1_709_164_800_000), "2024-02-29");
+    }
+
+    /// THE BUG THAT COST THREE ARMED RUNS: the deferred-FOK queue must RETAIN
+    /// candidates that are not yet old enough, not discard them.
+    ///
+    /// The original `drain(..).filter(...)` emptied the queue and kept only the due
+    /// entries, so anything younger than the latency threshold vanished. Because BTC
+    /// and ETH tick ~1/s unsynchronised, the next tick often lands tens of ms later —
+    /// well inside the 200ms threshold — so a large, roughly constant fraction was
+    /// destroyed every tick. Measured: V0 opened 26 markets, V1 never saw 16 of them.
+    /// The invariant is CONSERVATION — due + retained == everything in, always.
+    #[test]
+    fn order21_fok_queue_retains_young_candidates_and_never_drops_any() {
+        let mk = |tok: &str| crate::variants::Candidate {
+            asset: "BTC".into(), interval: "5m".into(), epoch: 100,
+            token_id: tok.into(), up: true, ask: 0.60, ttl_s: 200, v0_admitted: true,
+        };
+        let now = 10_000i64;
+        let mut q = vec![
+            (mk("old_a"), now - 500),  // due
+            (mk("young"), now - 50),   // NOT due — must survive
+            (mk("old_b"), now - 201),  // due (just past)
+            (mk("edge"),  now - 200),  // exactly at threshold — due
+        ];
+        let due = partition_due(&mut q, now, 200);
+        let d: Vec<&str> = due.iter().map(|(c, _)| c.token_id.as_str()).collect();
+        let held: Vec<&str> = q.iter().map(|(c, _)| c.token_id.as_str()).collect();
+        assert_eq!(d, vec!["old_a", "old_b", "edge"], "due set, boundary inclusive");
+        assert_eq!(held, vec!["young"], "the young candidate MUST be retained, not dropped");
+        assert_eq!(due.len() + q.len(), 4, "conservation: nothing may vanish");
+
+        // The young one becomes due on a later tick rather than being lost forever.
+        let due2 = partition_due(&mut q, now + 200, 200);
+        assert_eq!(due2.len(), 1, "retained candidate is evaluated once it ages in");
+        assert!(q.is_empty());
+
+        // A tick that is too soon for EVERYTHING must drop nothing at all — the exact
+        // shape of the bug (two klines arriving milliseconds apart).
+        let mut q2 = vec![(mk("a"), now), (mk("b"), now), (mk("c"), now)];
+        let none_due = partition_due(&mut q2, now + 20, 200);
+        assert!(none_due.is_empty());
+        assert_eq!(q2.len(), 3, "a fast second tick must not destroy the queue");
     }
 
     /// ORDER #16, DECISION 5 — THE ISOLATION PROOF.
