@@ -319,6 +319,7 @@ fn compute_stats(
     let mut re_opp_life_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (mut re_opp_life_n, mut re_opp_life_net) = (0u64, 0.0f64);
     let mut v0_stop_dev_total = 0.0f64;
+    let mut v0_session_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ORDER #17 item 3 — per-variant aggregation. V1/V2 are shadow portfolios whose
     // settlements arrive as `variant_pnl`; V0's come through `rev` like always. Kills
     // are read from the `killed` field on every variant-tagged intent, and V0's
@@ -389,6 +390,11 @@ fn compute_stats(
                     // V0 rows are tagged "v0" explicitly, never blank.
                     if let Some(d) = v.get("data") {
                         let var = d.get("variant").and_then(Value::as_str).unwrap_or("v0").to_string();
+                        if var == "v0"
+                            && let Some(t) = d.get("token_id").and_then(Value::as_str)
+                        {
+                            v0_session_tokens.insert(short_tok(t));
+                        }
                         let a = varacc.entry(var).or_default();
                         if d.get("killed").and_then(Value::as_bool).unwrap_or(false) {
                             a.kills += 1;
@@ -637,7 +643,16 @@ fn compute_stats(
     // unfiltered V0 would carry P&L from before the arms existed while V1/V2 only
     // ever have this session. That makes V0 look better purely by covering a longer
     // window, and the +50% leg is measured against exactly that number.
-    for (ts, r, _token, _side, _e, _x, iv) in rev.iter().filter(|(t, ..)| *t >= started_ms) {
+    // V0 carries positions across restarts while the shadows are wiped, so a
+    // close-time filter alone counts pre-restart entries settling in-session — that is
+    // how the card read "324 closed / 108 entries", which cannot happen in one window.
+    // Scope to positions whose ENTRY was in this session, so V0 is comparable to arms
+    // that started from zero.
+    for (ts, r, _token, _side, _e, _x, iv) in rev
+        .iter()
+        .filter(|(t, ..)| *t >= started_ms)
+        .filter(|(_, _, tok, ..)| v0_session_tokens.contains(tok))
+    {
         let a = varacc.entry("v0".to_string()).or_default();
         a.rows.push((*ts, *r, iv.clone()));
         a.pnl_n += 1;
@@ -701,6 +716,7 @@ fn compute_stats(
     let net_v0_killadj: f64 = rev
         .iter()
         .filter(|(t, ..)| *t >= started_ms)
+        .filter(|(_, _, tok, ..)| v0_session_tokens.contains(tok))
         .filter(|(_, _, tok, _, _, _, _)| !v0_killed_tokens.contains(tok))
         .map(|(_, r, _, _, _, _, _)| *r)
         .sum();
