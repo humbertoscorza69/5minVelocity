@@ -198,6 +198,29 @@ fn correction_is_session(orig_ts: i64, started_ms: i64) -> bool {
 /// Order #13 A: the burst/tick-age tiers can't express when `max_pos < base × cap`
 /// (the stake gets pinned flat). Pure so the guard is unit-tested.
 #[must_use]
+/// Does this oplog kind carry a V0 realized-P&L row for `rev`?
+///
+/// The walk matches on the PRESENCE of a pnl field, so any new event carrying one is
+/// swept into V0's dataset by default. That is how the arms' P&L ended up in V0's:
+/// Order #17 added `variant_pnl` with a `net_pnl` field, and because all three arms
+/// trade the SAME token by design, each settlement appeared up to three times —
+/// paper_close + V1's variant_pnl + V2's variant_pnl — inflating both V0's closed
+/// count and its net.
+///
+/// `pnl_recorder_recorded` / `pnl_recorded_at_redeem` are the recorder's audit mirror
+/// of rows it also writes to pnl_recorded.jsonl (read separately), so they are
+/// excluded for the same double-count reason.
+///
+/// This is a DENY list because the walk is permissive; anything added here must be
+/// re-checked whenever a new pnl-bearing event is introduced.
+#[must_use]
+fn is_v0_realized_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "pnl_recorded_at_redeem" | "pnl_recorder_recorded" | "variant_pnl"
+    )
+}
+
 fn sizing_clipped(base_usd: f64, max_pos: f64, stake_mult_cap: f64) -> bool {
     max_pos + 1e-6 < base_usd * stake_mult_cap
 }
@@ -490,7 +513,7 @@ fn compute_stats(
             // canonical realized P&L for resolutions comes from the file. The oplog
             // still supplies paper_close / exit closes (paper mode, not in the file).
             let data = v.get("data").cloned().unwrap_or(Value::Null);
-            if !matches!(kind, "pnl_recorded_at_redeem" | "pnl_recorder_recorded") {
+            if is_v0_realized_kind(kind) {
                 if let Some(r) = data.get("realized_pnl").or_else(|| data.get("net_pnl")).or_else(|| data.get("pnl")).and_then(num) {
                     rev.push((ts, r,
                         short_tok(data.get("token_id").and_then(Value::as_str).unwrap_or("")),
@@ -1409,6 +1432,26 @@ mod order13_tests {
     use super::{reentry_opp_probation, sizing_clipped, ReentryProbation};
 
     /// Order #13 A: the sizing-clip guard — max_pos must be >= base × stake_mult_cap
+    /// THE BUG THAT CORRUPTED THE A/B: shadow settlements were counted as V0's.
+    ///
+    /// The oplog walk selects rows by the PRESENCE of a pnl field, so `variant_pnl`
+    /// (added in Order #17 with `net_pnl`) was swept into V0's dataset. Because all
+    /// three arms trade the SAME token by design, each settlement appeared up to
+    /// three times — paper_close + V1 + V2 — inflating V0's closed count AND
+    /// crediting it with the arms' P&L. Observed live: 11 rows, 4 distinct tokens.
+    #[test]
+    fn v0_realized_rows_exclude_shadow_and_mirrored_settlements() {
+        use super::is_v0_realized_kind;
+        assert!(!is_v0_realized_kind("variant_pnl"), "shadow P&L must never count as V0's");
+        assert!(!is_v0_realized_kind("pnl_recorder_recorded"));
+        assert!(!is_v0_realized_kind("pnl_recorded_at_redeem"));
+        assert!(is_v0_realized_kind("paper_close"), "V0's own closes still count");
+        assert!(is_v0_realized_kind("live_close_posted"));
+        // Non-P&L variant telemetry is excluded by the pnl-field check, not this
+        // list — adding it here would be wrong.
+        assert!(is_v0_realized_kind("v2_intent_open"));
+    }
+
     /// or the burst/tick-age tiers pin flat (the trap that neutered them 3×).
     #[test]
     fn sizing_clip_guard() {
