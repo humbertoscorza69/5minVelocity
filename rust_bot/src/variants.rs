@@ -195,9 +195,17 @@ pub struct Candidate {
     pub up: bool,
     pub ask: f64,
     pub ttl_s: i64,
-    /// True when V0's full gate stack went on to admit this candidate. The union
-    /// arms read it rather than re-deriving V0's verdict.
+    /// True when V0's full gate stack went on to admit this candidate AND V0 acted on
+    /// it. The arms read this for ENTRIES rather than re-deriving V0's verdict.
     pub v0_admitted: bool,
+    /// True when the candidate cleared the whole strategy gate stack (ask band,
+    /// floors, z/edge/vol/dvr) — REGARDLESS of whether V0 went on to take it.
+    ///
+    /// These two are different facts and conflating them made the FLIP impossible:
+    /// V0 declines a market it already holds, so `v0_admitted` is false for exactly
+    /// the opposite-side signals the flip triggers on. Order #21 defines the trigger
+    /// as a FULLY-GATED opposite signal, which is this flag, not that one.
+    pub fully_gated: bool,
 }
 
 /// Outcome of modelling a fill-or-kill at the real observed latency.

@@ -651,14 +651,10 @@ pub fn process_kline_v2(
                 ask,
                 ttl_s: ttl,
                 v0_admitted: false,
+                fully_gated: false,
             });
             v.len() - 1
         });
-        // V0's one-entry-per-market rule, applied AFTER the candidate is recorded so
-        // the arms can still see a signal V0 declines to act on.
-        if v0_holds_market {
-            continue;
-        }
         // Ask-BAND gate: max-ask quality cap (15m: 0.70; 5m: none) + Order #9 B
         // min-ask floor (0.30 both) — keep entries inside the validated [0.30,0.97]
         // envelope; extreme-ask books are where the curve is maximally wrong.
@@ -745,8 +741,19 @@ pub fn process_kline_v2(
             exit_ts_s,
             now_ms,
         };
-        // ORDER #16: the full stack admitted this one — record V0's verdict on the
-        // candidate so the union arms consume it instead of re-deriving it.
+        // ORDER #21: the candidate cleared the ENTIRE gate stack. Stamp that BEFORE
+        // V0's one-entry-per-market rule, because a market V0 already holds is exactly
+        // where the flip lives — the signal is fully gated even though V0 declines it.
+        if let (Some(v), Some(i)) = (candidates.as_mut(), cand_idx) {
+            v[i].fully_gated = true;
+        }
+        // V0's one-entry-per-market rule. Applied here, after the (side-effect-free)
+        // gates, so the arms can still see a fully-gated signal V0 will not act on.
+        if v0_holds_market {
+            continue;
+        }
+        // ORDER #16: V0 is actually taking it — record that separately from
+        // `fully_gated`, since the arms use this one for ENTRIES.
         if let (Some(v), Some(i)) = (candidates.as_mut(), cand_idx) {
             v[i].v0_admitted = true;
         }
@@ -1700,12 +1707,6 @@ pub async fn run_decision_task(
                             }));
                         }
                         for (v, sb) in shadows.iter_mut() {
-                            if !crate::variants::admits(*v, &variant_cfg, cand.v0_admitted, burst, cand.ask) {
-                                continue;
-                            }
-                            let mkey = crate::shadow::ShadowBook::market_key(
-                                &cand.asset, &cand.interval, cand.epoch,
-                            );
                             // ORDER #21 — FLIP. A fully-gated signal for the OPPOSITE
                             // side of a market this arm already holds: close the
                             // original at the bid, open the opposite. The gate fires on
@@ -1714,7 +1715,8 @@ pub async fn run_decision_task(
                             // "Keep A, add B" is deliberately not an option — it lost in
                             // two independent tests; the original must be CLOSED.
                             let resolution_s = cand.epoch + interval_secs(&cand.interval).max(1);
-                            if crate::variants::arm_policy(*v).0
+                            if cand.fully_gated
+                                && crate::variants::arm_policy(*v).0
                                 && let Some(old) = sb
                                     .opposite_open(&cand.asset, &cand.interval, resolution_s, cand.up)
                                     .cloned()
@@ -1768,6 +1770,16 @@ pub async fn run_decision_task(
                                     continue; // the flip IS this candidate's action
                                 }
                             }
+                            // ENTRIES follow V0 exactly. The flip above is evaluated
+                            // FIRST and on `fully_gated`, because its trigger is a
+                            // market V0 declines — where v0_admitted is false by
+                            // definition, so gating the flip on it made it impossible.
+                            if !crate::variants::admits(*v, &variant_cfg, cand.v0_admitted, burst, cand.ask) {
+                                continue;
+                            }
+                            let mkey = crate::shadow::ShadowBook::market_key(
+                                &cand.asset, &cand.interval, cand.epoch,
+                            );
                             // ADMISSIBILITY FIRST, then the kill model. A variant
                             // re-qualifies on a market it already holds on nearly
                             // every tick; counting those as killed ATTEMPTS would
@@ -3557,7 +3569,8 @@ mod tests {
     fn order21_fok_queue_retains_young_candidates_and_never_drops_any() {
         let mk = |tok: &str| crate::variants::Candidate {
             asset: "BTC".into(), interval: "5m".into(), epoch: 100,
-            token_id: tok.into(), up: true, ask: 0.60, ttl_s: 200, v0_admitted: true,
+            token_id: tok.into(), up: true, ask: 0.60, ttl_s: 200,
+            v0_admitted: true, fully_gated: true,
         };
         let now = 10_000i64;
         let mut q = vec![
@@ -3584,6 +3597,71 @@ mod tests {
         let none_due = partition_due(&mut q2, now + 20, 200);
         assert!(none_due.is_empty());
         assert_eq!(q2.len(), 3, "a fast second tick must not destroy the queue");
+    }
+
+    /// ORDER #21 — THE FLIP TRIGGER. A market V0 already HOLDS must still produce a
+    /// `fully_gated` candidate, while V0 itself emits nothing.
+    ///
+    /// This is the condition the flip fires on, and it was impossible three times over:
+    /// first no candidate was emitted at all, then the candidate was destroyed by the
+    /// FOK queue, then it was gated on `v0_admitted` — which is false by definition for
+    /// a market V0 declines. Splitting `fully_gated` from `v0_admitted` is what makes
+    /// the trigger reachable, and moving V0's hold-check after the (side-effect-free)
+    /// gates is what lets us know the signal cleared them.
+    #[test]
+    fn order21_held_market_yields_fully_gated_candidate_but_no_v0_command() {
+        let secs = 300i64;
+        let base = 1_784_000_000i64 / secs * secs;
+        let mut cat = HashMap::new();
+        cat.insert(("BTC".to_string(), "5m".to_string(), base), mref("up_tok", "down_tok"));
+        let catalog = TestCat(cat);
+        let mut bk = HashMap::new();
+        for t in ["up_tok", "down_tok"] {
+            bk.insert(t.to_string(), EventBbo {
+                best_ask: Some(0.60), best_bid: Some(0.58), ts_ms: (base + 400) * 1000,
+            });
+        }
+        let book = TestBook(bk);
+        let mut vcfg = crate::config::V2Config::default();
+        vcfg.enabled = true;
+        let mut s5 = vcfg.strat_5m(0.0);
+        s5.base_usd = 1.05; s5.max_pos_usd = 3.15; s5.vol_cap = 1_000.0;
+        let mut strats = std::collections::HashMap::new();
+        strats.insert("5m", s5);
+
+        let events: Vec<(i64, f64)> = (0..120)
+            .map(|i| (base + 60 + i, 100.0 + 0.03 * i as f64 + 0.05 * ((i as f64) * 1.7).sin()))
+            .collect();
+
+        // A V0 position already open on the UP side of this market.
+        let held = vec![OpenPosition {
+            token_id: "up_tok".into(), asset: "BTC".into(), side: Outcome::Up,
+            entry_price: rust_decimal_macros::dec!(0.60), shares: rust_decimal_macros::dec!(1.75),
+            opened_at_ms: base * 1000, signal_id: "s".into(), interval: "5m".into(),
+            exit_ts_s: base + secs + 300, entry_ts_ms: 0, running_max_bid: 0.0,
+            ts_max_bid_ms: 0, status: OrderStatus::Confirmed, order_id: None,
+            ack_at_ms: None, confirmed_at_ms: None, confirmation_source: None, maker_exit: None,
+        }];
+
+        let mut history = crate::v2::PriceHistory::new(4096);
+        history.push("BTC", base - 1, 100.0);
+        let mut sink: Vec<crate::variants::Candidate> = Vec::new();
+        let mut cmds_total = 0;
+        for (t, px) in &events {
+            let k = kl("BTC", *t, *px, *t * 1000);
+            cmds_total += process_kline_v2(
+                &mut history, &k, &catalog, &book, &strats,
+                &held, (*t + 1) * 1000, &[], Some(&mut sink),
+            ).len();
+        }
+
+        assert_eq!(cmds_total, 0, "V0 must emit NOTHING for a market it already holds");
+        let gated = sink.iter().filter(|c| c.fully_gated).count();
+        assert!(gated > 0, "…but a fully-gated candidate MUST still reach the arms — that is the flip trigger");
+        assert!(
+            sink.iter().all(|c| !c.v0_admitted),
+            "v0_admitted must stay false: V0 did not take these"
+        );
     }
 
     /// ORDER #16, DECISION 5 — THE ISOLATION PROOF.
