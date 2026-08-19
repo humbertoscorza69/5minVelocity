@@ -31,7 +31,15 @@ base_usdc = 1.05
 # push a single stake to base*3, so max_position (the exposure guard + burst clamp)
 # MUST accommodate it or high-burst trades get throttled. The dashboard "max" input
 # overrides this live; set it to >= 3.15 there too (per-interval) for tiers to size.
-max_position_usdc = 3.15
+# LIVE ($100 bankroll, 2026-08-20). max_position = base = FLAT $1.05. Every guard
+# cap derives from this one line (main.rs overrides the legacy stake_cap when v2 is on):
+#   stake_cap          = 1.05    single order
+#   per_token_cap      = 1.05    one entry per market
+#   total_exposure_cap = 1.05 * max_open_positions = $21  (21% of bankroll)
+#   daily_loss_cap     = stake_cap * 12 = $12.60  <- the registered -$13 kill line
+# At 3.15 those were $3.15 / $63 / $37.80 — 63% of the bankroll live at once and a
+# daily stop ~3x the registered line. Do NOT raise this without recomputing all four.
+max_position_usdc = 1.05
 max_open_positions = 20
 paper_initial_usdc = 1000.0
 
@@ -115,6 +123,10 @@ z_min = 0.45
 tick_driven = false
 # min ms between tick-driven evaluations (throttle the aggTrade firehose).
 tick_throttle_ms = 200
+# LIVE: sizing tiers OFF. Burst/tick-age multipliers (Order #5) can push a stake to 3x
+# base; on $100 that is not a size validated live. 1.0 = flat $1.05. Also keeps the
+# Order #13 A clip WARN quiet, since it fires on max_pos < base * stake_mult_cap.
+stake_mult_cap = 1.0
 vol_cap = 1.0
 dvr_floor = 0.2
 edge_ref = 0.08
