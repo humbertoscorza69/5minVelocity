@@ -1158,14 +1158,42 @@ pub async fn run_decision_task(
                         if now_s < resolution + 2 {
                             continue; // wait for the close (resolution-1) bar to land
                         }
-                        let (Some(op), Some(fin)) = (
+                        let (Some(op), Some((fin, twap_n))) = (
                             history.close_at(&p.asset, epoch - 1),
-                            history.twap(&p.asset, resolution - SETTLE_TWAP_SECS, resolution - 1, SETTLE_TWAP_MIN_SAMPLES),
+                            history.twap_n(&p.asset, resolution - SETTLE_TWAP_SECS, resolution - 1, SETTLE_TWAP_MIN_SAMPLES),
                         ) else {
                             continue; // ring doesn't have both ends (e.g. post-restart)
                         };
                         let up = matches!(p.side, Outcome::Up);
                         let won = up == (fin >= op); // tie (fin==op) => Up wins
+                        // LOG THE SETTLEMENT INPUTS, not just the verdict.
+                        //
+                        // On the first live night five positions booked as WINS and paid
+                        // ZERO on-chain — one-directional, so systematic, not noise. It
+                        // could not be diagnosed because `pnl_recorder_recorded` carries
+                        // only the conclusion (`resolved_price`), never the op/fin that
+                        // produced it. That is the Order #15 A0 principle (log inputs,
+                        // not conclusions) violated in the one place it costs real money.
+                        //
+                        // `won_close` is the counterfactual under the PRE-Order-#20 rule
+                        // (raw close at resolution-1). Logging both labels turns the open
+                        // question — did the 30s TWAP change break the label? — into a
+                        // measurement: if corrections cluster where twap and close
+                        // disagree, the TWAP is the cause; if they disagree with BOTH,
+                        // the problem is Binance-vs-Chainlink, not our statistic.
+                        let fin_close = history.close_at(&p.asset, resolution - 1);
+                        oplog.sys("v2_settle", serde_json::json!({
+                            "token_id": p.token_id, "asset": p.asset, "interval": p.interval,
+                            "epoch": epoch, "resolution": resolution, "up": up,
+                            "op": op, "fin_twap": fin, "twap_samples": twap_n,
+                            "twap_window_s": SETTLE_TWAP_SECS,
+                            "fin_close": fin_close,
+                            "disp_twap_bps": if op > 0.0 { (fin / op - 1.0) * 1e4 } else { 0.0 },
+                            "disp_close_bps": fin_close.map(|c| if op > 0.0 { (c / op - 1.0) * 1e4 } else { 0.0 }),
+                            "won": won,
+                            "won_close": fin_close.map(|c| up == (c >= op)),
+                            "label_disagrees": fin_close.map(|c| (up == (c >= op)) != won),
+                        }));
                         // Photo-finish: |close-open| < PHOTO_FINISH_BPS -> the Binance
                         // label is unreliable (flips ~20% vs Chainlink). Flag so the
                         // recal AND the canary skip it, and Order #8 A defers the P&L

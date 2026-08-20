@@ -457,6 +457,21 @@ impl PriceHistory {
         Some(closes.iter().sum::<f64>() / closes.len() as f64)
     }
 
+    /// Same as [`Self::twap`] but also returns the SAMPLE COUNT it averaged.
+    ///
+    /// The count is a settlement input, not decoration: a TWAP over 15 of 30 seconds
+    /// is a different statistic from one over 30, and when a booked label later
+    /// disagrees with the on-chain payout the first question is how much of the window
+    /// we actually saw.
+    #[must_use]
+    pub fn twap_n(&self, asset: &str, from_sec: i64, to_sec: i64, min_samples: usize) -> Option<(f64, usize)> {
+        let closes = self.closes_in(asset, from_sec, to_sec);
+        if closes.len() < min_samples.max(1) {
+            return None;
+        }
+        Some((closes.iter().sum::<f64>() / closes.len() as f64, closes.len()))
+    }
+
     /// Rolling vol (bps/s) over the last `lookback_s` seconds ending at `now_sec`.
     #[must_use]
     pub fn vol_bps(&self, asset: &str, now_sec: i64, lookback_s: i64) -> Option<f64> {
