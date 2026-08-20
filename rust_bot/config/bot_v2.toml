@@ -41,6 +41,11 @@ base_usdc = 1.05
 # daily stop ~3x the registered line. Do NOT raise this without recomputing all four.
 max_position_usdc = 1.05
 max_open_positions = 20
+# ABSOLUTE daily-loss stop (USD). Overrides the derived stake-multiple, which at flat
+# $1.05 gives $12.60 — inside one bad day's noise (daily sd ~$5-7), so the bot could
+# disarm on ordinary variance instead of on a real problem. $20 = 20% of the $100
+# bankroll and ~3 sd, which reads as "something is wrong" rather than "today was bad".
+daily_loss_cap_usdc = 20.0
 paper_initial_usdc = 1000.0
 
 [filters]

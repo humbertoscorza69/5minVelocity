@@ -646,6 +646,16 @@ pub struct StakesConfig {
     /// Default = usize::MAX (no cap) for paper / shadow. Counted on close.
     #[serde(default = "default_max_trades_per_session")]
     pub max_trades_per_session: usize,
+    /// ABSOLUTE daily-loss stop in USD. When set, this is the figure the guard uses
+    /// and the derived `stake_cap * daily_loss_stop_stakes` is ignored.
+    ///
+    /// The derived value is a stake-MULTIPLE (12 stakes), so at a flat $1.05 it lands
+    /// on $12.60 — which is inside one bad day's noise (daily sd ~$5-7), meaning the
+    /// bot could disarm itself on ordinary variance rather than on something being
+    /// wrong. Reasoning about live risk in absolute dollars is the right frame, so
+    /// this exists to say it directly. Unset = fall back to the stake-multiple.
+    #[serde(default)]
+    pub daily_loss_cap_usdc: Option<f64>,
 }
 
 fn default_max_trades_per_session() -> usize {

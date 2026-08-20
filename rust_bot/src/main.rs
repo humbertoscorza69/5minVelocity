@@ -920,7 +920,14 @@ async fn main() -> anyhow::Result<()> {
             guard_cfg.per_token_cap = maxp; // one entry per market → per-token = one lot
             guard_cfg.total_exposure_cap = total; // max_open_positions * max_position
             guard_cfg.hard_cap = total.max(guard_cfg.hard_cap);
-            guard_cfg.daily_loss_cap_usdc = None; // derive from stake_cap*stakes (paper-generous)
+            // Absolute daily-loss stop when configured, else the stake-multiple.
+            // At flat $1.05 the derived figure is $12.60, which sits inside one bad
+            // day's noise; an explicit dollar figure is the honest way to express a
+            // live risk budget.
+            guard_cfg.daily_loss_cap_usdc = config
+                .stakes
+                .daily_loss_cap_usdc
+                .and_then(|v| rust_decimal::Decimal::try_from(v).ok());
             info!(stake_cap = %guard_cfg.stake_cap, per_token_cap = %guard_cfg.per_token_cap,
                 total_cap = %guard_cfg.total_exposure_cap, hard_cap = %guard_cfg.hard_cap,
                 daily_loss_cap = %guard_cfg.daily_loss_cap(),
