@@ -102,12 +102,21 @@ pub const OPLOG_MAX_BYTES: u64 = 128 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct OpLog {
     path: PathBuf,
+    /// Rotation threshold. Overridable so the rotation test does not have to write
+    /// 128 MB to disk (which made it slow and flaky under IO pressure).
+    max_bytes: u64,
 }
 
 impl OpLog {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self { path: path.into(), max_bytes: OPLOG_MAX_BYTES }
+    }
+
+    /// Same, with an explicit rotation threshold (tests).
+    #[must_use]
+    pub fn with_max_bytes(path: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        Self { path: path.into(), max_bytes }
     }
 
     /// The default `data/live/oplog.jsonl` logger.
@@ -141,7 +150,7 @@ impl OpLog {
     /// is atomic, so a race between threads costs at most one redundant rename.
     fn rotate_if_large(&self) {
         let Ok(md) = std::fs::metadata(&self.path) else { return };
-        if md.len() < OPLOG_MAX_BYTES {
+        if md.len() < self.max_bytes {
             return;
         }
         let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("oplog").to_string();
@@ -201,21 +210,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("oplog.jsonl");
-        let log = OpLog::new(&path);
+        let log = OpLog::with_max_bytes(&path, 4096);
 
-        // Write past the cap. Each row carries a fat payload so this stays quick.
-        let blob = "x".repeat(64 * 1024);
-        let mut wrote = 0u64;
-        while wrote < OPLOG_MAX_BYTES + (1 << 20) {
-            log.event("filler", json!({ "b": blob }));
-            wrote += blob.len() as u64;
+        for i in 0..200 {
+            log.event("filler", json!({ "i": i, "b": "x".repeat(256) }));
         }
 
-        // The live file must have been cut back down...
         let live = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        assert!(live < OPLOG_MAX_BYTES, "live segment not rotated: {live} bytes");
+        assert!(live < 4096, "live segment not rotated: {live} bytes");
 
-        // ...and the rotated segment must still be on disk, not deleted.
         let rotated: Vec<_> = std::fs::read_dir(&dir).unwrap()
             .filter_map(Result::ok)
             .filter(|e| {

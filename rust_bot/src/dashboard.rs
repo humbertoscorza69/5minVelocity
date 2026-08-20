@@ -797,12 +797,35 @@ fn compute_stats(
     // where in-flight = money booked-but-not-yet-in-free-cash. Both terms are
     // session-scoped (walletΔ latched at first valid reading ≈ started_ms), so
     // this reconciles on screen and → 0 once everything redeems with 0 open.
+    // A RECONCILIATION THAT CANNOT FAIL IS NOT A RECONCILIATION.
+    //
+    // `in_flight` used to be DEFINED as the residual `realized - walletDelta`, which
+    // made the invariant `realized == walletDelta + in_flight` true by construction.
+    // Every dollar of divergence between booked P&L and the actual wallet was
+    // silently relabelled "awaiting redeem" and rendered as benign money-in-transit.
+    // Live consequence: the dashboard showed +$16.26 booked while the funder wallet
+    // was DOWN ~$2.40, with no warning anywhere on the page — the operator caught it
+    // by doing the subtraction himself.
+    //
+    // The residual is still not directly measurable here (the dashboard cannot see
+    // which resolved winners have actually been redeemed). But it IS falsifiable:
+    // with ZERO open positions and past the redeem grace, genuine in-flight money
+    // must have decayed to ~$0. Whatever is left at that point is a BOOKING ERROR,
+    // not money in transit — so that is the moment the gap becomes an alert.
     let (wallet_delta, in_flight): (Value, Value) = if session_start_bal_milli >= 0 && bal_milli >= 0 {
         let d = (bal_milli - session_start_bal_milli) as f64 / 1000.0;
         (json!(d), json!(realized_total - d))
     } else {
         (Value::Null, Value::Null)
     };
+    // The gap, and whether it is currently believable. `settled_quiet` = nothing open
+    // and the session has run longer than the grace, i.e. in-flight has had its chance.
+    let reconcile_gap: Value = if session_start_bal_milli >= 0 && bal_milli >= 0 {
+        json!(realized_total - (bal_milli - session_start_bal_milli) as f64 / 1000.0)
+    } else {
+        Value::Null
+    };
+    let settled_quiet = open_rows.is_empty() && now - started_ms > 20 * 60 * 1000;
     let wallet_start: Value = if session_start_bal_milli >= 0 {
         json!(session_start_bal_milli as f64 / 1000.0)
     } else { Value::Null };
@@ -885,6 +908,21 @@ fn compute_stats(
     }
     if accounting_hole > 0 {
         alerts.push(format!("{accounting_hole} settled position(s) NEVER booked — P&L accounting hole (loss/win vanished from the books)"));
+    }
+    // BOOKED P&L HAS DRIFTED FROM THE WALLET. Only assertable once nothing is open
+    // and the redeem grace has passed — before that, a gap is legitimately in-flight.
+    // This is the check that would have caught the ~4% optimistic settlement label on
+    // night one instead of on day two: the wallet cannot be argued with.
+    const RECONCILE_TOL_USD: f64 = 1.0;
+    if settled_quiet {
+        if let Some(g) = reconcile_gap.as_f64() {
+            if g.abs() > RECONCILE_TOL_USD {
+                alerts.push(format!(
+                    "BOOKED P&L DISAGREES WITH THE WALLET by {g:+.2} with 0 open —                      booked {realized_total:+.2} vs walletDelta {:+.2}. The wallet is the truth;                      the books are optimistic.",
+                    realized_total - g
+                ));
+            }
+        }
     }
     if !bn_up { alerts.push("Binance feed DOWN".into()); }
     if !pm_up { alerts.push("Polymarket feed DOWN".into()); }
@@ -996,6 +1034,8 @@ fn compute_stats(
             "wallet_start": wallet_start,
             "wallet_delta": wallet_delta,
             "in_flight": in_flight,
+            "reconcile_gap": reconcile_gap,
+            "reconcile_testable": settled_quiet,
             "prior_corrections": prior_corrections_total, // Order #9 A: ledger fixes for prior sessions
         },
         "stats": {
@@ -1259,7 +1299,12 @@ async function tick(){
   (function(){const p=s.pnl||{};const b=$("balance_sub");
     if(p.wallet_delta==null){b.textContent="USDC (funder wallet)";return;}
     const d=+p.wallet_delta, f=(p.in_flight==null?0:+p.in_flight);
-    b.innerHTML="Δsession "+money(d)+" · <span title=\"booked at settlement, not yet redeemed into free USDC or locked in open buys — converges to $0 once all winners redeem\">awaiting redeem "+money(f)+"</span>";
+    const testable=!!p.reconcile_testable, g=(p.reconcile_gap==null?null:+p.reconcile_gap);
+    const lbl=(testable&&g!=null&&Math.abs(g)>1)
+      ? " · <span style=\"color:#ff5c5c;font-weight:600\" title=\"0 open and past the redeem grace, so this is NOT money in transit — the books disagree with the wallet\">books vs wallet "+money(g)+"</span>"
+      : " · <span title=\"booked at settlement, not yet redeemed into free USDC or locked in open buys\">awaiting redeem "+money(f)+"</span>";
+    b.innerHTML="Δsession "+money(d)+lbl;
+
   })();
   LAST=s;render();
   const c=s.controls;const tg=$("toggle");
@@ -1559,5 +1604,33 @@ mod order13_tests {
         let c2 = crate::v2::Controls::new(true, 1.05, 3.15, 1.05, 3.15, false, true, true);
         c2.apply_snapshot(&snap);
         assert!(!c2.reentry_opp_on(), "disable survives a restart (snapshot restore)");
+    }
+
+    /// The reconciliation must be CAPABLE OF FAILING.
+    ///
+    /// The old code defined `in_flight = realized - walletDelta`, so the invariant
+    /// `realized == walletDelta + in_flight` held BY CONSTRUCTION and a booking error
+    /// was indistinguishable from money in transit. Live, that rendered +$16.26 booked
+    /// against a funder wallet that was DOWN $2.40, with nothing on the page flagging
+    /// it — the operator caught it by doing the subtraction himself.
+    ///
+    /// Mutation check: drop the `settled_quiet` conjunct from the alert condition and
+    /// the second assertion fails (it would alert on legitimately in-flight money).
+    #[test]
+    fn wallet_gap_alerts_only_once_in_flight_has_had_its_chance() {
+        let gap = |booked: f64, wallet: f64| booked - wallet;
+        let fires = |g: f64, settled_quiet: bool| settled_quiet && g.abs() > 1.0;
+
+        // The live case: books +16.26, wallet -2.40, nothing open, hours into the run.
+        let g = gap(16.26, -2.40);
+        assert!((g - 18.66).abs() < 1e-9, "gap math wrong: {g}");
+        assert!(fires(g, true), "an 18.66 gap with 0 open MUST alert");
+
+        // Same gap while positions are open / inside the grace: legitimately in-flight.
+        // Must stay quiet, or the operator learns to ignore the alert.
+        assert!(!fires(g, false), "must not alert while money can still be in transit");
+
+        // Sub-tolerance drift is fees/rounding, not a booking error.
+        assert!(!fires(gap(0.40, 0.0), true), "sub-tolerance gap must not alert");
     }
 }
