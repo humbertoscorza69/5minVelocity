@@ -59,6 +59,15 @@ pub async fn run_dashboard(
     // walletΔ + in-flight (money booked at settlement but not yet redeemed into
     // free USDC, or cash currently locked in open buys). -1 = not yet latched.
     let mut session_start_bal_milli: i64 = -1;
+    // Collapse repeated polls onto one computation.
+    //
+    // `compute_stats` re-reads and JSON-parses the ENTIRE oplog plus the entire P&L
+    // log on every call, and it runs INLINE in this accept loop (no spawn) — so one
+    // slow computation blocks every other connection. With the browser polling every
+    // ~2s that cost was being paid over and over. Rotation (OPLOG_MAX_BYTES) bounds
+    // how big a single scan can get; this bounds how OFTEN we pay for it.
+    const STATS_TTL_MS: i64 = 1500;
+    let mut stats_cache: Option<(i64, String)> = None;
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -101,12 +110,20 @@ pub async fn run_dashboard(
                     if session_start_bal_milli < 0 && cur_bal >= 0 {
                         session_start_bal_milli = cur_bal;
                     }
-                    let body = compute_stats(
-                        &state, &store_state, &recal, &controls,
-                        &mode, &live_armed_path, &kill_switch_path,
-                        &oplog_path, started_ms, session_start_bal_milli,
-                        stake_mult_cap, &controls_path, &config_controls,
-                    ).to_string();
+                    let now = crate::state::now_ms();
+                    let body = match &stats_cache {
+                        Some((at, cached)) if now.saturating_sub(*at) < STATS_TTL_MS => cached.clone(),
+                        _ => {
+                            let fresh = compute_stats(
+                                &state, &store_state, &recal, &controls,
+                                &mode, &live_armed_path, &kill_switch_path,
+                                &oplog_path, started_ms, session_start_bal_milli,
+                                stake_mult_cap, &controls_path, &config_controls,
+                            ).to_string();
+                            stats_cache = Some((now, fresh.clone()));
+                            fresh
+                        }
+                    };
                     http_resp("200 OK", "application/json", body.as_bytes())
                 } else if path == "/" || path.starts_with("/?") || path.starts_with("/index") {
                     http_resp("200 OK", "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes())

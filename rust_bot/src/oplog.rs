@@ -82,6 +82,20 @@ use crate::state::now_ms;
 /// Default operational-log path (gitignored, like execution_log).
 pub const OPLOG_PATH: &str = "data/live/oplog.jsonl";
 
+/// Rotate the oplog once it exceeds this many bytes.
+///
+/// The header below claims oplog writes are "infrequent vs market data". Over a
+/// multi-day live run that assumption failed badly: the file reached 1.3 GB. An
+/// unbounded append-only file is not free, because the dashboard re-reads and
+/// JSON-parses the WHOLE thing on every `/api/stats` request — so 1.3 GB turned a
+/// 20 KB response into 28 seconds, saturated a tokio worker, and wedged the accept
+/// loop (5 connections stuck unaccepted). Trading was unaffected, but the operator
+/// lost all visibility into a live-money run.
+///
+/// Bounding the writer bounds every reader. Rotated segments are KEPT (renamed, not
+/// deleted) — they are the raw evidence for settlement forensics.
+pub const OPLOG_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Append-only operational logger. Cheap to clone (just a path); safe to share. Writes
 /// are infrequent vs market data (API calls / decisions / orders, not every tick), so
 /// a per-event file append is fine — and crash-safe (each line flushed independently).
@@ -115,8 +129,25 @@ impl OpLog {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        self.rotate_if_large();
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(f, "{}", serde_json::to_string(row).unwrap_or_default())
+    }
+
+    /// Rename the current segment aside once it passes [`OPLOG_MAX_BYTES`].
+    ///
+    /// Best-effort by design: a rotation failure must never break trading, so every
+    /// error is swallowed and the write proceeds against the existing file. `rename`
+    /// is atomic, so a race between threads costs at most one redundant rename.
+    fn rotate_if_large(&self) {
+        let Ok(md) = std::fs::metadata(&self.path) else { return };
+        if md.len() < OPLOG_MAX_BYTES {
+            return;
+        }
+        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("oplog").to_string();
+        let mut rotated = self.path.clone();
+        rotated.set_file_name(format!("{stem}.{}.jsonl", now_ms()));
+        let _ = std::fs::rename(&self.path, &rotated);
     }
 
     // ---- typed helpers (the common operational cases) ----
@@ -161,6 +192,44 @@ impl OpLog {
 
 #[cfg(test)]
 mod tests {
+    /// Rotation must fire on size, and must PRESERVE the old segment — those bytes
+    /// are the settlement-forensics evidence. Mutation check: drop the
+    /// `rotate_if_large()` call from `append_line` and this fails on `rotated == 0`.
+    #[test]
+    fn oplog_rotates_on_size_and_keeps_the_old_segment() {
+        let dir = std::env::temp_dir().join(format!("rb_rot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oplog.jsonl");
+        let log = OpLog::new(&path);
+
+        // Write past the cap. Each row carries a fat payload so this stays quick.
+        let blob = "x".repeat(64 * 1024);
+        let mut wrote = 0u64;
+        while wrote < OPLOG_MAX_BYTES + (1 << 20) {
+            log.event("filler", json!({ "b": blob }));
+            wrote += blob.len() as u64;
+        }
+
+        // The live file must have been cut back down...
+        let live = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(live < OPLOG_MAX_BYTES, "live segment not rotated: {live} bytes");
+
+        // ...and the rotated segment must still be on disk, not deleted.
+        let rotated: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("oplog.") && n != "oplog.jsonl"
+            })
+            .collect();
+        assert!(!rotated.is_empty(), "rotation deleted the old segment instead of keeping it");
+        let kept: u64 = rotated.iter().map(|e| e.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+        assert!(kept > 0, "rotated segment is empty");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
