@@ -218,6 +218,14 @@ pub struct FillEngine {
     /// Net SHORT shares from fills. Selling an ask means we sold a YES share, so this
     /// only grows in one direction for an ask-only strategy.
     inventory_shares: f64,
+    /// Inventory attributed to each token, so settlement can RELEASE it.
+    ///
+    /// Without this the ask-only inventory is monotonic (it is only ever added to on
+    /// fill) and `exposure()` ratchets until the cap binds permanently: at S=50
+    /// against a 150-share cap the engine stops quoting after three fills and every
+    /// later post is rejected InventoryCap. Fine for a single-window test, fatal for
+    /// a multi-day run over markets that settle every five minutes.
+    inv_by_token: std::collections::HashMap<String, f64>,
     next_order_id: u64,
     seq: u64,
 }
@@ -242,6 +250,7 @@ impl FillEngine {
             resting: Vec::new(),
             level_state: std::collections::HashMap::new(),
             inventory_shares: 0.0,
+            inv_by_token: std::collections::HashMap::new(),
             next_order_id: 1,
             seq: 0,
         }
@@ -260,6 +269,30 @@ impl FillEngine {
     #[must_use]
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Settle one token: its market resolved, so the short is closed and the capacity
+    /// it consumed is released. Returns `(shares_settled, orders_dropped)`.
+    ///
+    /// Call this once per token after its market resolves. Resting orders on a
+    /// resolved market can never fill again, so leaving them would hold capacity
+    /// against the cap forever.
+    pub fn settle_token(&mut self, token: &str) -> (f64, usize) {
+        let shares = self.inv_by_token.remove(token).unwrap_or(0.0);
+        self.inventory_shares -= shares;
+        if self.inventory_shares.abs() < 1e-9 {
+            self.inventory_shares = 0.0;   // keep float drift out of the cap check
+        }
+        let before = self.resting.len();
+        self.resting.retain(|o| o.token != token);
+        self.level_state.retain(|(t, _), _| t != token);
+        (shares, before - self.resting.len())
+    }
+
+    /// Inventory currently attributed to one token.
+    #[must_use]
+    pub fn inventory_of(&self, token: &str) -> f64 {
+        self.inv_by_token.get(token).copied().unwrap_or(0.0)
     }
 
     /// Total shares that could still become inventory: what we already hold plus
@@ -466,6 +499,7 @@ impl FillEngine {
                 self.resting[i].size_remaining -= filled;
                 remaining_print -= filled;
                 self.inventory_shares += filled;
+                *self.inv_by_token.entry(token.to_string()).or_insert(0.0) += filled;
                 let o = &self.resting[i];
                 fills.push(Fill {
                     order_id: o.order_id,
@@ -832,5 +866,72 @@ mod tests {
         let b = modeled_rebate_per_share(0.80, 0.035, 0.20);
         assert!((a - b).abs() < 1e-12, "fee curve is symmetric about 0.5");
         assert!(a < r, "tails earn less rebate than the middle");
+    }
+
+    /// Ask-only inventory is monotonic: `apply` only ever ADDS on fill. Over a
+    /// multi-day run against markets that settle every five minutes, that ratchets
+    /// `exposure()` until the cap binds permanently -- at S=50 against a 150-share cap
+    /// the engine stops quoting after three fills and every later post is rejected
+    /// InventoryCap. A paper run in that state measures nothing at all.
+    ///
+    /// Mutation check: delete the `self.inventory_shares -= shares` line in
+    /// `settle_token` and the post after settlement fails with InventoryCap.
+    #[test]
+    fn settlement_releases_capacity_so_the_engine_keeps_quoting() {
+        let cfg = MakerConfig {
+            price_min: 0.10, price_max: 0.90, size_shares: 50.0,
+            max_net_inventory_shares: 150.0,
+        };
+        let mut e = FillEngine::new(cfg);
+
+        // Fill three markets to the cap, one after another.
+        for i in 0..3 {
+            let tok = format!("M{i}");
+            e.apply(&MarketEvent::Snapshot {
+                ts_ms: 1000 * i, token: tok.clone(),
+                asks: vec![Level { price: 0.50, size: 0.0 }],
+                bids: vec![Level { price: 0.49, size: 10.0 }],
+            });
+            e.try_post(1000 * i, &tok, 0.50, 50.0).expect("should post below the cap");
+            e.apply(&MarketEvent::Trade {
+                ts_ms: 1000 * i + 1, token: tok, price: 0.50, size: 50.0,
+            });
+        }
+        assert!((e.inventory() - 150.0).abs() < 1e-9, "inventory {}", e.inventory());
+
+        // At the cap, a fresh market is refused -- correct, and the reason A2 exists.
+        e.apply(&MarketEvent::Snapshot {
+            ts_ms: 9_000, token: "M9".into(),
+            asks: vec![Level { price: 0.50, size: 0.0 }],
+            bids: vec![Level { price: 0.49, size: 10.0 }],
+        });
+        assert_eq!(e.try_post(9_000, "M9", 0.50, 50.0), Err(PostReject::InventoryCap));
+
+        // Settle the finished markets: capacity must come back.
+        for i in 0..3 {
+            let (shares, _) = e.settle_token(&format!("M{i}"));
+            assert!((shares - 50.0).abs() < 1e-9, "released {shares}");
+        }
+        assert_eq!(e.inventory(), 0.0, "settlement must clear inventory");
+        e.try_post(9_100, "M9", 0.50, 50.0)
+            .expect("after settlement the engine must quote again");
+    }
+
+    /// Settling must also drop that token's resting orders: a resolved market can
+    /// never fill again, so leaving them holds capacity against the cap forever.
+    #[test]
+    fn settlement_drops_resting_orders_on_the_resolved_market() {
+        let mut e = FillEngine::new(MakerConfig::default());
+        e.apply(&MarketEvent::Snapshot {
+            ts_ms: 1, token: "A".into(),
+            asks: vec![Level { price: 0.40, size: 5.0 }],
+            bids: vec![Level { price: 0.39, size: 5.0 }],
+        });
+        e.try_post(1, "A", 0.40, 50.0).unwrap();
+        assert_eq!(e.resting_orders().len(), 1);
+        let (_, dropped) = e.settle_token("A");
+        assert_eq!(dropped, 1, "resting order on a resolved market must be dropped");
+        assert!(e.resting_orders().is_empty());
+        assert_eq!(e.exposure(), 0.0);
     }
 }
